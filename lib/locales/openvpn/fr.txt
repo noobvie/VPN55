@@ -1,0 +1,63 @@
+@@ main
+VPN55 — instructions d'installation
+===================================
+
+Identifiant : {cred}
+Délivré à   : {user}
+Serveur     : {endpoint} ({transport}/{port})
+Votre adresse à l'intérieur du tunnel : {ip}
+
+Le fichier placé à côté de celui-ci, vpn55-{cred}.ovpn, constitue à lui seul
+votre identifiant. Il contient une clé privée. Quiconque en détient une copie
+peut utiliser votre accès : transmettez-le comme vous transmettriez un mot de
+passe, et effacez-le partout où il n'a pas besoin de rester. Le serveur n'en
+conserve aucune copie — s'il est perdu, la réponse est un nouvel identifiant,
+jamais un renvoi.
+
+Windows
+  1. Installez OpenVPN GUI depuis openvpn.net (le client communautaire
+     « OpenVPN Connect » fonctionne également).
+  2. Importez vpn55-{cred}.ovpn via la fonction d'import du client.
+  3. Connectez-vous.
+
+macOS
+  1. Tunnelblick (gratuit, libre) ou OpenVPN Connect.
+  2. Ouvrez vpn55-{cred}.ovpn avec l'application, ou faites-y glisser le fichier.
+  3. Connectez-vous.
+
+Android
+  1. OpenVPN for Android (libre) ou OpenVPN Connect.
+  2. Importez le fichier .ovpn depuis vos téléchargements.
+  3. Connectez-vous.
+
+iOS / iPadOS
+  1. OpenVPN Connect depuis l'App Store.
+  2. Partagez le fichier .ovpn vers l'application, ou ouvrez-le depuis Fichiers.
+  3. Connectez-vous.
+
+Linux
+  1. Le paquet openvpn de votre distribution.
+  2. sudo openvpn --config vpn55-{cred}.ovpn
+     — ou importez-le dans NetworkManager si vous préférez un interrupteur.
+
+Remarques
+  - Un seul appareil à la fois peut utiliser cet identifiant. Connecter un
+    deuxième appareil déconnecte le premier. Demandez un identifiant par
+    appareil.
+  - L'IPv6 ne passe pas par ce tunnel. Si le serveur est assez récent, il
+    demande à votre appareil de cesser d'utiliser l'IPv6 pendant la connexion ;
+    sinon, un appareil double pile conserve sa propre route IPv6 et ce trafic ne
+    passe pas par le tunnel.
+  - Le DNS du tunnel est fixé par le serveur. Ce résolveur voit chaque nom de
+    domaine que vous consultez pendant la connexion.
+
+@@ transport.tcp
+  - Ce serveur fonctionne en TCP, le mode qui continue de fonctionner sur les
+    réseaux qui bloquent ou suppriment l'UDP. Il est plus lent que l'UDP, et
+    l'écart se creuse sur une liaison avec pertes — c'est inhérent au transport
+    de TCP dans TCP, et non un réglage que l'on pourrait corriger.
+
+@@ transport.udp
+  - Ce serveur fonctionne en UDP, le mode le plus rapide. Un réseau qui bloque
+    l'UDP le bloque entièrement ; si la connexion échoue sur un réseau
+    particulier, c'est la raison la plus probable.

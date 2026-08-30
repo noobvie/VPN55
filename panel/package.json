@@ -1,0 +1,22 @@
+{
+  "name": "vpn55-panel",
+  "version": "0.8.0-phase8",
+  "private": true,
+  "description": "VPN55 admin panel and self-serve portal",
+  "license": "MIT",
+  "type": "commonjs",
+  "main": "server.js",
+  "engines": {
+    "node": ">=20.6.0"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "check": "node --check server.js && node --check lib/*.js",
+    "admin": "node scripts/admin.js",
+    "portal": "node scripts/portal.js",
+    "selftest": "node scripts/portal-selftest.js"
+  },
+  "dependencies": {
+    "express": "4.21.2"
+  }
+}

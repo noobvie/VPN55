@@ -1,0 +1,659 @@
+/* ============================================================================
+   panel.css — the admin panel's own layer, on top of the vendored theme.
+   ============================================================================
+
+   LOADED SECOND, AND THAT IS THE WHOLE MECHANISM. vendor/office-tools.css is a
+   pinned copy and is never edited; everything specific to this panel lives here
+   and wins by cascade. When the tools site is restyled, the vendored file is
+   re-pinned deliberately and this file is unaffected.
+
+   ── One rule, and it is the one that breaks themes ──────────────────────────
+
+   EVERY COLOUR COMES FROM A TOKEN. Not one hex value below. The vendored file
+   defines --bg, --text, --primary and the rest four times over — once at :root
+   and once per [data-theme] — so a rule written against the tokens is correct in
+   all four themes for free, and a rule written against a hex value is correct in
+   exactly one of them and unreadable in the others.
+
+   The corollary, which is the part that actually gets missed: WHEREVER A RULE
+   SETS `background`, IT SETS `color` TOO, and the other way round. A quiet
+   element that overrides only its background inherits ink chosen for a different
+   surface, and in a light theme that is dark-on-dark. Resolve the pair together,
+   per element, every time. (The four themes here range from a near-white page to
+   a near-black one, so this is not a hypothetical.)
+
+   ── Layout is sized against French ──────────────────────────────────────────
+   French runs 15-25% longer than English and Vietnamese has taller diacritics.
+   Nothing below is a fixed width sized to an English word: labels wrap, table
+   columns are content-sized, and buttons are padded rather than measured.
+   ============================================================================ */
+
+/* ============================================================================
+   VIETNAMESE-SAFE FONT STACKS — the first rules in this file, deliberately.
+   ============================================================================
+
+   Vietnamese is the DEFAULT locale. It stacks two marks on one vowel — ế ộ ữ ậ
+   ề ợ — and those live in Latin Extended Additional (U+1EA0–U+1EF9), a block
+   plenty of respectable faces do not carry. A browser does not fail on a
+   missing glyph: it substitutes PER CHARACTER, so a word renders half in the
+   chosen face and half in something else. It reads as a fault on the reader's
+   machine rather than a fault in this page, which is why it survives review.
+
+   The vendored theme's own stacks have two holes, and neither is visible on the
+   machine most likely to be used for development:
+
+     matrix  'Courier New', Courier, monospace
+             A macOS or Linux reader without Windows-vintage Courier New lands
+             on Courier — URW Nimbus Mono or Apple's Courier — and neither
+             carries the block.
+     anime   'Segoe UI', 'Helvetica Neue', Arial, sans-serif
+             Segoe UI is Windows-only, so a macOS reader lands on Helvetica
+             Neue, whose Latin Extended Additional coverage is incomplete.
+
+   vendor/office-tools.css is PINNED and is never edited, so the fix is here:
+   panel.css loads second and the token is redefined for every selector the
+   vendored file defines it in. Each theme keeps its character — the matrix
+   theme is still monospaced, the anime theme is still a soft humanist sans —
+   what changes is that every stack now names a face measured to carry the whole
+   repertoire before it reaches anything that does not.
+
+   Measured, not assumed. `.github/scripts/check-fonts.mjs --probe <dir>` parses
+   a real font file's cmap and prints its coverage; the same script, run without
+   arguments, refuses a stack that leans on a family known to lack the block.
+   ============================================================================ */
+
+:root {
+  /* Arial is the anchor: shipped on Windows, macOS and most Linux desktops via
+     Liberation Sans metrics, and measured full. Noto Sans catches the Linux
+     boxes that have neither. */
+  --font: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto,
+          'Noto Sans', Arial, sans-serif;
+}
+
+[data-theme="dark"] {
+  --font: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto,
+          'Noto Sans', Arial, sans-serif;
+}
+
+[data-theme="matrix"] {
+  /* Still monospaced. ui-monospace resolves to SF Mono on Apple and Cascadia
+     Mono on Windows; Consolas is the measured Windows fallback and DejaVu Sans
+     Mono the Linux one. Courier is NOT in this list — it is the family the
+     vendored stack fell through to, and it is the one that breaks. */
+  --font: ui-monospace, 'Cascadia Mono', Consolas, 'DejaVu Sans Mono',
+          Menlo, 'Courier New', monospace;
+}
+
+[data-theme="anime"] {
+  /* Still a soft humanist sans. Helvetica Neue is dropped rather than reordered:
+     listing it after a covering family only helps on a machine that HAS the
+     covering family, and on macOS — the only place Helvetica Neue exists — the
+     family in front of it, Segoe UI, is exactly what is missing. */
+  --font: 'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto,
+          'Noto Sans', Arial, sans-serif;
+}
+
+.app {
+  max-width: 1400px;
+  margin: 0 auto;
+  padding: 1.25rem 1rem 3rem;
+}
+
+/* ---------- Top bar ---------- */
+.topbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: .75rem 1.25rem;
+  margin-bottom: 1rem;
+}
+
+.topbar__title {
+  font-size: 1.35rem;
+  font-weight: 700;
+  color: var(--text);
+  margin-right: auto;
+}
+
+.topbar__meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: .35rem 1rem;
+  font-size: .85rem;
+}
+
+.topbar__controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: .35rem;
+}
+
+/* A quiet button. Sets colour AND background together — see the header. */
+.chip {
+  padding: .35rem .7rem;
+  border: 1.5px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-card);
+  color: var(--text-muted);
+  font-family: var(--font);
+  font-size: .8rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: color var(--transition), background var(--transition),
+              border-color var(--transition);
+}
+.chip:hover {
+  background: var(--bg-secondary);
+  color: var(--text);
+  border-color: var(--text-light);
+}
+.chip--on,
+.chip[aria-pressed="true"] {
+  background: var(--primary);
+  /* Ink on a filled accent must come from the page background token, not from
+     --text: --text is the ink for --bg, and on a saturated fill in a light theme
+     it is dark-on-dark. */
+  color: var(--bg);
+  border-color: var(--primary);
+}
+
+/* ---------- Layout ---------- */
+.main { min-height: 12rem; }
+
+.stack { display: flex; flex-direction: column; gap: 1rem; }
+
+.muted { color: var(--text-muted); }
+
+.empty {
+  padding: 2.5rem 1rem;
+  text-align: center;
+  color: var(--text-muted);
+  background: var(--bg-secondary);
+  border: 1px dashed var(--border);
+  border-radius: var(--radius);
+}
+
+/* ---------- Cards ---------- */
+/* .card itself is vendored (and themed per data-theme); only the inside is ours. */
+.card__head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: .5rem .75rem;
+  margin-bottom: .9rem;
+}
+
+.card__title {
+  font-size: 1.05rem;
+  font-weight: 700;
+  color: var(--text);
+  margin-right: auto;
+}
+
+.card--alert { border-color: var(--danger); }
+
+/* ---------- Fact list ---------- */
+.facts {
+  display: grid;
+  /* auto-fit rather than a fixed column count: a French label is longer and gets
+     the room without a media query. */
+  grid-template-columns: repeat(auto-fit, minmax(13rem, 1fr));
+  gap: .5rem 1.5rem;
+  margin-bottom: .9rem;
+}
+.facts dt {
+  font-size: .72rem;
+  font-weight: 700;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+.facts dd {
+  font-size: .95rem;
+  color: var(--text);
+  word-break: break-word;
+}
+
+/* ---------- Badges ---------- */
+.badge {
+  display: inline-block;
+  padding: .12rem .5rem;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  font-size: .74rem;
+  font-weight: 700;
+  white-space: nowrap;
+  vertical-align: baseline;
+}
+/* Each badge names both halves of the pair; the *-dim tokens are already
+   theme-aware backgrounds, and the solid token is the ink that belongs on them. */
+.badge--ok      { background: var(--success-dim); color: var(--success); border-color: var(--success); }
+.badge--warn    { background: var(--warning-dim); color: var(--warning); border-color: var(--warning); }
+.badge--crit    { background: var(--danger-dim);  color: var(--danger);  border-color: var(--danger); }
+.badge--info    { background: var(--primary-dim); color: var(--primary); border-color: var(--primary); }
+.badge--idle    { background: var(--bg-secondary); color: var(--text-muted); border-color: var(--border); }
+.badge--unknown { background: var(--bg-secondary); color: var(--text-light); border-color: var(--border); }
+
+/* ---------- Disclosures (filtering, custody, revoke, restart) ---------- */
+.disclosure {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: .4rem .6rem;
+  padding: .6rem .8rem;
+  margin-top: .5rem;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  border-left-width: 3px;
+  background: var(--bg-secondary);
+  color: var(--text);
+}
+.disclosure__label {
+  font-size: .72rem;
+  font-weight: 700;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+.disclosure__warn {
+  flex-basis: 100%;
+  font-size: .85rem;
+  color: var(--warning);
+}
+
+/* The filtering answer is the one an operator acts on, so its border carries the
+   level. Colour is never the only signal — the badge beside it says the same
+   thing in words, for anyone who cannot separate these hues. */
+.disclosure--ok      { border-left-color: var(--success); }
+.disclosure--warn    { border-left-color: var(--warning); }
+.disclosure--crit    { border-left-color: var(--danger); }
+.disclosure--info    { border-left-color: var(--primary); }
+.disclosure--unknown { border-left-color: var(--text-light); }
+
+/* ---------- Text an adapter wrote ---------- */
+/* Visibly a quotation from elsewhere: this is the one text on the page that
+   stays in the language the service wrote it in, and it should look like it came
+   from somewhere else rather than like a translation that failed. */
+.from-service {
+  flex-basis: 100%;
+  margin-top: .3rem;
+  padding-left: .7rem;
+  border-left: 2px solid var(--border);
+  font-size: .88rem;
+  line-height: 1.5;
+  color: var(--text-muted);
+}
+.from-service__mark {
+  display: block;
+  font-size: .68rem;
+  font-weight: 700;
+  letter-spacing: .05em;
+  text-transform: uppercase;
+  color: var(--text-light);
+}
+
+/* ---------- Notes ---------- */
+.note {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: .4rem .6rem;
+  padding: .6rem .8rem;
+  margin-top: .5rem;
+  border-radius: var(--radius);
+  background: var(--bg-secondary);
+  color: var(--text);
+  border: 1px solid var(--border);
+}
+.note--warn { border-color: var(--warning); }
+.note--crit { border-color: var(--danger); }
+
+/* ---------- Banners ---------- */
+.banner {
+  padding: .9rem 1.1rem;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--bg-secondary);
+  color: var(--text);
+  margin-bottom: 1rem;
+}
+/* The severity is a modifier, not baked into the base — the base is what a
+   future non-alarming banner uses, and a banner that is red by default is one
+   that stops meaning red. */
+.banner--crit { border-color: var(--danger); background: var(--danger-dim); color: var(--text); }
+.banner--warn { border-color: var(--warning); background: var(--warning-dim); color: var(--text); }
+.banner--info { border-color: var(--primary); background: var(--primary-dim); color: var(--text); }
+.banner strong { display: block; margin-bottom: .3rem; color: var(--text); }
+.banner__why { margin-top: .4rem; font-weight: 600; }
+
+/* Diagnostic text from this process — not a translated string, and it should not
+   pretend to be one. Monospace, scrollable, never widening the page. */
+.diag {
+  margin-top: .5rem;
+  padding: .5rem .6rem;
+  border-radius: var(--radius);
+  background: var(--bg);
+  color: var(--text-muted);
+  border: 1px solid var(--border);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: .78rem;
+  white-space: pre-wrap;
+  overflow-x: auto;
+}
+
+/* ---------- Tables ---------- */
+/* A wide table scrolls inside its own box. The page body must never scroll
+   sideways — on a phone that hides the first column, which is the name. */
+.grid {
+  display: block;
+  width: 100%;
+  overflow-x: auto;
+  border-collapse: collapse;
+  background: var(--bg-card);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  font-size: .9rem;
+}
+.grid thead { background: var(--bg-secondary); }
+.grid th {
+  padding: .55rem .7rem;
+  text-align: left;
+  font-size: .72rem;
+  font-weight: 700;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+.grid td {
+  padding: .5rem .7rem;
+  border-bottom: 1px solid var(--border);
+  color: var(--text);
+  vertical-align: baseline;
+}
+.grid tbody tr:last-child td { border-bottom: none; }
+.grid tbody tr:hover td { background: var(--bg-secondary); }
+
+/* A value that is absent, not zero. Dimmed and dashed rather than blank, so an
+   empty-looking cell always has a reason attached to it. */
+.is-unset {
+  color: var(--text-light);
+  font-style: italic;
+}
+
+/* A name, an id, an address — copy-and-paste material, so monospace. */
+.ident {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: .85em;
+  word-break: break-all;
+}
+
+.pair { white-space: nowrap; }
+
+/* ---------- Events ---------- */
+.events {
+  list-style: none;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-card);
+  color: var(--text);
+  overflow: hidden;
+}
+.event {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: .3rem .9rem;
+  padding: .55rem .8rem;
+  border-bottom: 1px solid var(--border);
+}
+.event:last-child { border-bottom: none; }
+.event__when {
+  flex: 0 0 auto;
+  min-width: 9rem;
+  font-size: .8rem;
+  color: var(--text-muted);
+}
+.event__type { flex: 1 1 20rem; color: var(--text); }
+.event .from-service { flex-basis: 100%; }
+
+/* ---------- Footer ---------- */
+.footer {
+  margin-top: 2rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--border);
+  font-size: .82rem;
+  color: var(--text-muted);
+}
+.footer p + p { margin-top: .3rem; }
+
+/* ---------- Narrow screens ---------- */
+@media (max-width: 640px) {
+  .app { padding: .75rem .6rem 2rem; }
+  .topbar { gap: .5rem; }
+  .topbar__title { font-size: 1.15rem; flex-basis: 100%; }
+  .event__when { min-width: 100%; }
+}
+
+/* ============================================================================
+   PHASE 6 — the controls that change something
+   ============================================================================
+   Every colour below is a token, and every rule that sets a background also
+   sets a colour. Read the header: the four themes run from a near-white page to
+   a near-black one, so a control that overrides only its background inherits ink
+   chosen for the other end of that range and comes out unreadable in half of
+   them. That is the failure this file exists to prevent, and buttons — small,
+   quiet, easy to eyeball as "fine" — are exactly where it hides.
+   ============================================================================ */
+
+/* ---------- Buttons ---------- */
+.btn {
+  display: inline-block;
+  padding: .45rem .9rem;
+  border: 1.5px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-card);
+  color: var(--text);
+  font-family: var(--font);
+  font-size: .85rem;
+  line-height: 1.3;
+  cursor: pointer;
+  transition: color var(--transition), background var(--transition),
+              border-color var(--transition);
+}
+.btn:hover:not(:disabled),
+.btn:focus-visible {
+  background: var(--bg-secondary);
+  color: var(--text);
+  border-color: var(--text-light);
+}
+.btn:disabled {
+  cursor: default;
+  opacity: .55;
+}
+
+/* Ink on an accent fill is the page background, not --text: --text is chosen to
+   sit on the page, and on a saturated fill it is the pairing that fails first. */
+.btn--primary {
+  background: var(--primary);
+  color: var(--bg);
+  border-color: var(--primary);
+}
+.btn--primary:hover:not(:disabled),
+.btn--primary:focus-visible {
+  background: var(--primary);
+  color: var(--bg);
+  border-color: var(--text);
+}
+
+/* The two irreversible actions. Outlined rather than filled: a solid red button
+   next to two quiet ones is the one a hand lands on by accident. */
+.btn--danger {
+  background: var(--bg-card);
+  color: var(--danger, var(--text));
+  border-color: var(--danger, var(--border));
+}
+.btn--danger:hover:not(:disabled),
+.btn--danger:focus-visible {
+  background: var(--danger, var(--bg-secondary));
+  color: var(--bg);
+  border-color: var(--danger, var(--text-light));
+}
+
+.btn--row {
+  padding: .25rem .6rem;
+  font-size: .78rem;
+}
+
+/* Wrap rather than measure: a row of three buttons is wider in French than in
+   English, and a fixed cell width would clip the third one there and only there. */
+td.actions,
+.card__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: .35rem;
+  align-items: center;
+}
+.card__actions { margin-top: .9rem; }
+
+/* ---------- Forms ---------- */
+.field {
+  width: 100%;
+  max-width: 26rem;
+  padding: .45rem .6rem;
+  border: 1.5px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font);
+  font-size: .9rem;
+}
+.field:focus-visible {
+  border-color: var(--primary);
+  outline: none;
+}
+.form { display: block; margin-top: .8rem; }
+.formrow { margin-bottom: .9rem; }
+.formrow label {
+  display: block;
+  margin-bottom: .25rem;
+  font-size: .85rem;
+  color: var(--text);
+}
+.formrow .muted { margin: .25rem 0 .35rem; font-size: .78rem; }
+
+/* ---------- Sign-in, and the issue dialog ---------- */
+.signin {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1rem;
+  /* A token, not rgba(0,0,0,.6): a fixed black wash over a near-black theme is
+     invisible, and over a near-white one it is a different design. */
+  background: var(--bg);
+  color: var(--text);
+  overflow-y: auto;
+}
+.signin__form {
+  width: 100%;
+  max-width: 26rem;
+  padding: 1.5rem;
+  border: 1.5px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-card);
+  color: var(--text);
+}
+.signin__title { margin: 0 0 1rem; font-size: 1.15rem; }
+.signin__form label {
+  display: block;
+  margin: .8rem 0 .25rem;
+  font-size: .85rem;
+}
+.signin__form input { width: 100%; padding: .5rem .6rem;
+  border: 1.5px solid var(--border); border-radius: var(--radius);
+  background: var(--bg); color: var(--text); font-family: var(--font); font-size: .95rem; }
+.signin__form .btn { margin-top: 1.1rem; width: 100%; }
+.signin__form .modal__buttons .btn { width: auto; }
+.signin__problem {
+  margin: .8rem 0 0;
+  min-height: 1.2em;
+  font-size: .85rem;
+  color: var(--danger, var(--text));
+}
+
+/* ---------- Confirmation ---------- */
+.modal {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1rem;
+  background: var(--bg);
+  color: var(--text);
+}
+.modal__box {
+  width: 100%;
+  max-width: 30rem;
+  padding: 1.4rem;
+  border: 1.5px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-card);
+  color: var(--text);
+}
+.modal__text { margin: 0 0 1.2rem; line-height: 1.5; }
+.modal__buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: .6rem;
+  justify-content: flex-end;
+}
+
+/* ---------- What just happened ---------- */
+.flash {
+  position: fixed;
+  right: 1rem;
+  bottom: 1rem;
+  z-index: 40;
+  display: flex;
+  flex-direction: column;
+  gap: .5rem;
+  max-width: min(32rem, calc(100vw - 2rem));
+}
+.flash__item {
+  padding: .7rem .9rem;
+  border: 1.5px solid var(--border);
+  border-left-width: 4px;
+  border-radius: var(--radius);
+  background: var(--bg-card);
+  color: var(--text);
+  font-size: .85rem;
+  line-height: 1.45;
+}
+.flash__item--ok { border-left-color: var(--success, var(--primary)); }
+.flash__item--error { border-left-color: var(--danger, var(--text-light)); }
+/* Adapter-authored text, quoted and attributed — the same treatment a note and a
+   filtering explanation get, and for the same reason: this side did not write it
+   and cannot translate it without learning which service did. */
+.flash__from {
+  margin-top: .4rem;
+  font-size: .8rem;
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+@media (max-width: 640px) {
+  .flash { left: 1rem; right: 1rem; max-width: none; }
+  td.actions { flex-direction: column; align-items: stretch; }
+}
+
+/* ---------- Motion ---------- */
+@media (prefers-reduced-motion: reduce) {
+  * { transition: none !important; animation: none !important; }
+}

@@ -1,0 +1,458 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  shell:
+    name: Shell — bash -n + shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Every shell file in the repo, whatever its extension. lib/ files have no
+      # shebang (they are sourced), so they are found by path, not by `file`.
+      - name: Collect shell files
+        id: collect
+        run: |
+          set -euo pipefail
+          {
+            echo 'files<<SHFILES'
+            {
+              find . -path ./.git -prune -o -name '*.sh' -print
+              # Extensionless scripts that are still bash.
+              printf '%s\n' ./helper/vpnctl
+            } | sort -u | while read -r f; do
+              # `if`-form, not `[ -f "$f" ] && printf`: a false test on the last
+              # iteration makes the loop return 1 and errexit kills the step.
+              if [ -f "$f" ]; then printf '%s\n' "$f"; fi
+            done
+            echo 'SHFILES'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: bash -n
+        run: |
+          set -euo pipefail
+          rc=0
+          while read -r f; do
+            [ -n "$f" ] || continue
+            if bash -n "$f"; then
+              echo "  ok      $f"
+            else
+              echo "  SYNTAX  $f"
+              rc=1
+            fi
+          done <<< '${{ steps.collect.outputs.files }}'
+          exit "$rc"
+
+      - name: Install shellcheck
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+
+      - name: shellcheck
+        run: |
+          set -euo pipefail
+          mapfile -t files < <(printf '%s\n' '${{ steps.collect.outputs.files }}' | sed '/^$/d')
+          # lib/ files carry `# shellcheck shell=bash` on line 1 because they have
+          # no shebang; -S style keeps informational notes visible without failing.
+          shellcheck --color=always --severity=warning --external-sources "${files[@]}"
+
+  locales:
+    name: Locales — key parity across vi / en / fr
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # Keyed catalogs, never phrase maps. Fails when the key sets diverge, when a
+      # value is blank, or when a catalog does not parse. vi.json is the default
+      # locale — a missing key there is what most users see.
+      - name: Check locale key parity
+        run: node .github/scripts/check-locales.mjs
+
+      # The other direction, which key parity cannot see: a key the panel LOOKS
+      # UP and nobody ever authored. All three catalogs agree perfectly, this
+      # job goes green, and the page renders the literal text `auth.signed_in`.
+      # That is not hypothetical — it is what this check found on its first run.
+      - name: Every key the panel asks for exists
+        run: node .github/scripts/check-i18n-usage.mjs
+
+      # The shell side's translated text: setup instructions and client-config
+      # comments, in lib/locales/<tag>/<locale>.txt. Same rule as the JSON
+      # catalogs, different file format — and one failure the JSON check has no
+      # equivalent of: a translator who drops {endpoint} has removed the server
+      # address from a page whose whole job is to carry it, and the sentence
+      # still reads perfectly.
+      - name: Shell-side locale text parity
+        run: node .github/scripts/check-locale-text.mjs
+
+      # Vietnamese is the DEFAULT locale and it stacks two marks on one vowel.
+      # A face without Latin Extended Additional does not fail — the browser
+      # substitutes per character, so a word renders half in one font and half
+      # in another, and it reads as a fault on the reader's machine. Two of the
+      # vendored theme's four stacks had that hole; panel.css overrides them and
+      # this check is what stops the override being dropped.
+      - name: Font stacks carry Vietnamese
+        run: node .github/scripts/check-fonts.mjs
+
+      # French runs ~18% longer than English here and Vietnamese longer still
+      # for anything technical. Of the strings that sit in a box which cannot
+      # wrap, English is the longest for ten of eighty-four. Laying out against
+      # it is laying out against the wrong language.
+      - name: Expansion budget for the longest locale
+        run: node .github/scripts/check-expansion.mjs
+
+  hygiene:
+    name: Hygiene — no protocol leakage, no shebang in lib/
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The adapter contract: nothing outside lib/proto_*.sh may know which
+      # protocol it is talking to. Comments and docs are exempt; code is not.
+      #
+      # The pattern grew in Phase 3. `ipsec`, `ikev2` and `mobileconfig` were
+      # missing, which meant the whole second adapter could have leaked its
+      # vocabulary into vpn55.sh with this check still green. A hygiene check
+      # that does not know about the newest protocol is a check that passes
+      # exactly when it matters — so it is extended in the same commit as every
+      # adapter, and the artifact FORMAT name belongs in it too: an installer
+      # that says "mobileconfig" has learned which protocol it is talking to
+      # just as surely as one that says "strongSwan".
+      #
+      # Phase 2's obfuscation mode added `amnezia`, `amneziawg` and `awg`. A MODE of
+      # an existing adapter leaks exactly as a new adapter would: an installer that
+      # names `awg-quick` has learned which protocol it is driving. The rule is about
+      # the contract, not about how many files the work happened to touch.
+      #
+      # Phase 4 added `ovpn`, `tls-crypt` and `easy-rsa` for the same reason —
+      # the file extension is this protocol's `mobileconfig`, and the other two
+      # are the names an installer would reach for if it started making the
+      # adapter's decisions for it. `charon` closes a Phase 3 gap noticed while
+      # doing it.
+      - name: No protocol names outside lib/proto_*.sh
+        run: |
+          set -uo pipefail
+          hits=$(
+            grep -rniE '\b(wireguard|amnezia|amneziawg|awg|openvpn|ovpn|strongswan|swanctl|charon|ipsec|ikev2|mobileconfig|tls-?crypt|easy-?rsa)\b' \
+              --include='*.sh' --include='*.js' --include='*.mjs' \
+              . \
+              | grep -v '^\./lib/proto_' \
+              | grep -vE ':[0-9]+:[[:space:]]*(#|//|\*)' \
+              || true
+          )
+          if [ -n "$hits" ]; then
+            echo "Contract defect — protocol name outside lib/proto_*.sh:"
+            echo "$hits"
+            exit 1
+          fi
+          echo "  ok  no protocol leakage"
+
+      # A NUL byte makes grep treat a file as BINARY: it prints "Binary file X
+      # matches" instead of the matching line, so the leak check above emits
+      # nothing this job can act on. A check that can be silently blinded is not
+      # a check — and it has already happened here: two panel modules used a
+      # literal NUL as a composite-key separator and were invisible to that
+      # sweep for as long as they existed.
+      #
+      # The fix in source is the escape (\u0000 in JavaScript), which has the
+      # identical runtime value and leaves the file greppable. This step stops
+      # anyone reintroducing the literal.
+      #
+      # Detection is by tr/cmp rather than by grep, deliberately: a grep for a
+      # NUL needs a NUL in its own pattern, which would put one in THIS file and
+      # blind the very check it implements.
+      - name: No NUL bytes in source files
+        run: |
+          set -uo pipefail
+          hits=""
+          while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            # Strip NULs and compare with the original. Identical means there
+            # were none to strip.
+            if ! LC_ALL=C tr -d '\000' < "$f" | cmp -s - "$f"; then
+              hits="$hits$f
+"
+            fi
+          done <<< "$(find . -path ./.git -prune -o -type f \( -name '*.sh' -o -name '*.js' -o -name '*.mjs' -o -name '*.json' -o -name '*.yml' \) -print)"
+          if [ -n "$hits" ]; then
+            echo "NUL byte in a source file. grep treats such a file as binary, so"
+            echo "every content check in this job silently skips it. Use an escape."
+            printf %s "$hits"
+            exit 1
+          fi
+          echo "  ok  no NUL bytes"
+
+      # lib/ files are sourced, not executed.
+      - name: No shebang in lib/
+        run: |
+          set -uo pipefail
+          rc=0
+          for f in lib/*.sh; do
+            [ -f "$f" ] || continue
+            if head -n1 "$f" | grep -q '^#!'; then
+              echo "  SHEBANG  $f — lib files are sourced, not executed"
+              rc=1
+            fi
+          done
+          [ "$rc" -eq 0 ] && echo "  ok  no shebangs in lib/"
+          exit "$rc"
+
+      # errexit is disabled inside any ||-guarded function body, so a bare
+      # create/copy/move/delete in lib/ is a silent failure that ships.
+      - name: Unguarded cp/mv/mkdir/rm in lib/
+        run: |
+          set -uo pipefail
+          hits=$(
+            grep -rnE '^[[:space:]]*(cp|mv|mkdir|rm|ln|install)[[:space:]]' lib/ \
+              | grep -vE '(\|\||&&)' \
+              || true
+          )
+          if [ -n "$hits" ]; then
+            echo "Unguarded filesystem command in lib/ — each needs its own"
+            echo '|| { error "..."; return 1; }  (errexit does not cover lib bodies)'
+            echo "$hits"
+            exit 1
+          fi
+          echo "  ok  every filesystem command in lib/ is guarded"
+
+  privilege:
+    name: Privilege — the helper's surface, checked
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # ── The acceptance criterion, run rather than asserted ─────────────────
+      #
+      # `vpnctl --self-test` exercises every argument validator against a table
+      # of malformed inputs — path traversal, command substitution, a leading
+      # dash that would be read as an option, a newline that would forge a log
+      # record — and the well-formed ones that must still be accepted. It sources
+      # nothing, writes nothing and needs no root, which is what lets it run here
+      # on every push.
+      #
+      # A validator that is only checked by reading it is a validator that
+      # regresses silently, and this one stands between an unprivileged web
+      # process and root.
+      - name: vpnctl rejects malformed arguments
+        run: bash helper/vpnctl --self-test
+
+      # The verb list exists twice — in the helper and mirrored in
+      # panel/lib/privileged.js so the panel can refuse early. Two copies of
+      # "what may run as root" is a thing that drifts, and the drift would be a
+      # verb the panel can reach that nobody reviewed. So they are compared.
+      - name: The verb list is the same in both copies
+        run: |
+          set -euo pipefail
+          bash helper/vpnctl --verbs | sort > /tmp/verbs-helper
+          node -e "console.log(require('./panel/lib/privileged').VERBS.join('\n'))" \
+            | sort > /tmp/verbs-panel
+          if ! diff -u /tmp/verbs-helper /tmp/verbs-panel; then
+            echo "helper/vpnctl and panel/lib/privileged.js disagree about the verb list"
+            exit 1
+          fi
+          count=$(wc -l < /tmp/verbs-helper)
+          if [ "$count" -ne 8 ]; then
+            echo "the helper exposes ${count} verbs, not 8."
+            echo "Eight is the number docs/security-model.md §3 publishes as the whole"
+            echo "privileged surface: seven that change the host, plus cred-config,"
+            echo "which reads one credential's own configuration back for the portal."
+            echo "Adding another is a security-model change: update §3 and §6F, the"
+            echo "sudoers comment and this check together, deliberately."
+            exit 1
+          fi
+          # Seven of the eight change the host, and that is the number the
+          # security model's one-line summary turns on. Checked separately so
+          # that a WRITE verb arriving cannot hide inside a count that also
+          # covers the read.
+          writes=$(grep -vc '^cred-config$' /tmp/verbs-helper)
+          if [ "$writes" -ne 7 ]; then
+            echo "the helper exposes ${writes} verbs that change the host, not 7."
+            exit 1
+          fi
+          echo "  ok  eight verbs (seven writes + cred-config), identical in both copies"
+
+      # ── No shell, anywhere on the privileged path ──────────────────────────
+      #
+      # Caller data reaches a program as separate argv words and never as text a
+      # shell will parse. This is the property that is easiest to lose in a hurry
+      # — one `shell: true` added to make a quoting problem go away — and hardest
+      # to notice afterwards, because everything keeps working.
+      - name: No shell evaluation on the privileged path
+        run: |
+          set -uo pipefail
+          rc=0
+
+          hits=$(grep -nE '(^|[^[:alnum:]_])(eval|source)[[:space:]]|\b(sh|bash|zsh)[[:space:]]+-c' \
+                   helper/vpnctl | grep -vE '^[0-9]+:[[:space:]]*#' || true)
+          if [ -n "$hits" ]; then
+            echo "helper/vpnctl evaluates a string as shell:"
+            echo "$hits"
+            rc=1
+          fi
+
+          # panel/portal is in this list because it is code on the socket that
+          # faces the internet. It has no reason to run a command at all, and the
+          # check that would notice it acquiring one has to know it exists.
+          hits=$(grep -rnE "shell:[[:space:]]*true|child_process.*exec\(|execSync" \
+                   panel/lib panel/server.js panel/scripts panel/portal 2>/dev/null \
+                   | grep -vE ':[0-9]+:[[:space:]]*(//|\*)' || true)
+          if [ -n "$hits" ]; then
+            echo "the panel runs a command through a shell, or builds one as a string:"
+            echo "$hits"
+            rc=1
+          fi
+
+          [ "$rc" -eq 0 ] && echo "  ok  no shell evaluation on the privileged path"
+          exit "$rc"
+
+      # ── One caller, and only one ───────────────────────────────────────────
+      #
+      # "What can a compromised panel do?" is only a short question while the
+      # answer lives in one file. A second module that spawns a process is a
+      # second answer, and it would not be in the security model.
+      - name: privileged.js and status-read.js are the only modules that spawn
+        run: |
+          set -uo pipefail
+          offenders=$(
+            grep -rln "require('node:child_process')\|require(\"node:child_process\")\|require('child_process')" \
+              panel/ 2>/dev/null \
+              | grep -vE '^panel/lib/(privileged|status-read)\.js$' \
+              || true
+          )
+          if [ -n "$offenders" ]; then
+            echo "these modules can start a process, and only two are allowed to:"
+            echo "$offenders"
+            echo
+            echo "panel/lib/privileged.js is the only caller of the root helper and"
+            echo "panel/lib/status-read.js is the only caller of the status read."
+            echo "See docs/security-model.md §3."
+            exit 1
+          fi
+          echo "  ok  one write caller, one read caller"
+
+      # ── Phase 8's acceptance criteria, run rather than asserted ────────────
+      #
+      # Two claims were made about the self-serve portal: that a portal token
+      # cannot reach an admin route, and that a user cannot read another user's
+      # configuration by changing an id in a URL. Both are checked here, along
+      # with the QR encoder's tables — which are pinned to published values,
+      # because a QR nobody can scan is the one failure in that file that looks
+      # exactly like success.
+      #
+      # It needs no express and no node_modules, which is what lets it run on
+      # every push beside the shell self-test rather than only before a release.
+      - name: The portal cannot reach the panel, and no id crosses users
+        run: node panel/scripts/portal-selftest.js
+
+      # A parse error in the panel is a panel that does not start, and the units
+      # restart it every ten seconds forever. Cheap to catch here.
+      - name: node --check every panel file
+        run: |
+          set -euo pipefail
+          find panel .github/scripts -name '*.js' -o -name '*.mjs' \
+            | grep -v node_modules \
+            | while read -r f; do node --check "$f" && echo "  ok      $f"; done
+
+  distribution:
+    name: Distribution — the website is never in the critical path
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # docs/distribution.md §1 is a constraint on CODE, not a launch chore: a
+      # user who already has the install command must never need the website
+      # for anything. The moment vpn55.sh acquires a version ping or a mirror
+      # list pointing at the site, a DNS block stops being a marketing problem
+      # and starts being an outage.
+      #
+      # Comments may name the site — that is where the reasoning is written.
+      - name: No dependency on the project website
+        run: |
+          set -uo pipefail
+          hits=$(
+            grep -rniE 'vpn55\.org' vpn55.sh lib/ helper/ panel/ tools/ tests/ \
+              | grep -vE ':[0-9]+:[[:space:]]*(#|//|\*)' \
+              || true
+          )
+          if [ -n "$hits" ]; then
+            echo "The installer or the panel now depends on the project website:"
+            echo "$hits"
+            echo
+            echo "See docs/distribution.md §1. The canonical source is the code host."
+            exit 1
+          fi
+          echo "  ok  nothing outside a comment names the website"
+
+      # The manifest is what a mirror install fetches and what src_revision
+      # hashes, so a stale one means two different failures at once: files that
+      # never reach a server, and a self-update that reports "already current"
+      # after downloading new code.
+      - name: MANIFEST.sha256 is current
+        run: ./tools/manifest.sh --check
+
+      # ── The escape hatch, exercised rather than asserted ───────────────────
+      #
+      # "VPN55_MIRROR overrides the base URL" was true as a variable expansion
+      # long before anything fetched with it. This serves the checkout over
+      # plain HTTP, points VPN55_MIRROR at it, and installs a whole tree from
+      # it — which is exactly what an operator does when the usual host is
+      # blocked. If this step passes, the sentence in the README is a fact.
+      - name: VPN55_MIRROR installs a complete tree
+        run: |
+          set -euo pipefail
+          python3 -m http.server 8899 --bind 127.0.0.1 --directory . >/dev/null 2>&1 &
+          server=$!
+          trap 'kill "$server" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 40); do
+            curl -fsS http://127.0.0.1:8899/MANIFEST.sha256 >/dev/null 2>&1 && break
+            sleep 0.25
+          done
+
+          dest="$(mktemp -d)/tree"
+          # shellcheck source=lib/core_source.sh
+          VPN55_MIRROR=http://127.0.0.1:8899 bash -c '
+            set -euo pipefail
+            . lib/core_source.sh
+            src_fetch "'"$dest"'"
+            src_manifest_verify "'"$dest"'"
+            test -x "'"$dest"'/vpn55.sh"
+            test -x "'"$dest"'/helper/vpnctl"
+          '
+          echo "  ok  a complete, verified tree installed from an arbitrary base URL"
+
+      # ── The README's install command, checked ─────────────────────────────
+      #
+      # `bash <(curl …)` runs vpn55.sh from /dev/fd/63, whose dirname is
+      # /dev/fd — so every `. lib/…` resolves to a path that cannot exist. That
+      # broke the ONE command the README advertises, and it broke silently in
+      # the sense that nobody running from a checkout would ever see it.
+      #
+      # This asserts the bootstrap is reached: with no directory beside it the
+      # script must ask for root, not report a missing library.
+      - name: The one-line install reaches the bootstrap
+        run: |
+          set -uo pipefail
+          out="$(bash <(cat vpn55.sh) --help 2>&1 || true)"
+          printf '%s\n' "$out" | sed 's/^/      /'
+          case "$out" in
+            *"lib/ui.sh"*|*"No such file"*)
+              echo "The advertised install command cannot source its own libraries."
+              exit 1 ;;
+            *"as root"*)
+              echo "  ok  reaches the bootstrap and asks for root" ;;
+            *)
+              echo "Unexpected output from a directory-less run."
+              exit 1 ;;
+          esac

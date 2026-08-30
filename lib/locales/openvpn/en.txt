@@ -1,0 +1,61 @@
+@@ main
+VPN55 — setup instructions
+==========================
+
+Credential : {cred}
+For        : {user}
+Server     : {endpoint} ({transport}/{port})
+Your address inside the tunnel : {ip}
+
+The file beside this one, vpn55-{cred}.ovpn, is your whole credential. It holds
+a private key. Anyone who has a copy of it can use your access, so send it the
+way you would send a password and delete it from anywhere it does not need to
+stay. The server does not keep a copy — if it is lost, the answer is a new
+credential, never a resend.
+
+Windows
+  1. Install the OpenVPN GUI from openvpn.net (the community "OpenVPN Connect"
+     client also works).
+  2. Import vpn55-{cred}.ovpn through the client's import option.
+  3. Connect.
+
+macOS
+  1. Tunnelblick (free, open source) or OpenVPN Connect.
+  2. Open vpn55-{cred}.ovpn with it, or drag the file onto the app.
+  3. Connect.
+
+Android
+  1. OpenVPN for Android (open source) or OpenVPN Connect.
+  2. Import the .ovpn file from your downloads.
+  3. Connect.
+
+iOS / iPadOS
+  1. OpenVPN Connect from the App Store.
+  2. Share the .ovpn file into the app, or open it from Files.
+  3. Connect.
+
+Linux
+  1. Your distribution's openvpn package.
+  2. sudo openvpn --config vpn55-{cred}.ovpn
+     — or import it into NetworkManager if you prefer a desktop toggle.
+
+Notes
+  - Only one device at a time may use this credential. Connecting a second
+    device disconnects the first. Ask for another credential per device.
+  - IPv6 does not travel through this tunnel. Where the server is new enough it
+    tells your device to stop using IPv6 while connected; where it is not, a
+    dual-stack device keeps its own IPv6 path and that traffic does not go
+    through the tunnel.
+  - The tunnel's DNS is set by the server. That resolver sees every hostname you
+    look up while connected.
+
+@@ transport.tcp
+  - This server runs over TCP, which is the mode that keeps working on networks
+    that block or drop UDP. It is slower than UDP, and the gap widens on a lossy
+    connection — that is inherent to carrying TCP inside TCP, not a setting
+    anyone can tune away.
+
+@@ transport.udp
+  - This server runs over UDP, which is the faster mode. A network that blocks
+    UDP blocks it outright; if you find it will not connect on a particular
+    network, that is the likely reason.

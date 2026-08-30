@@ -1,0 +1,92 @@
+@@ main
+VPN55 — Cài đặt IKEv2
+=====================
+
+  Máy chủ            {endpoint}
+  Định danh máy chủ  {endpoint}
+  Chứng danh         {cred}   (cấp cho {user})
+  Đơn vị cấp         {ca_cn}
+  Mật khẩu gói       {pass}
+
+Mật khẩu ở trên dùng để mở tệp vpn55-{cred}.p12. Nó chỉ hiện một lần. Máy chủ
+này không giữ bản sao khoá riêng của bạn, nên nếu mất gói thì cách giải quyết
+là cấp một chứng danh mới, không bao giờ là gửi lại.
+
+Tất cả phần bên dưới là cùng một định danh, đóng gói theo ba cách. Hãy dùng
+cách dành cho thiết bị của bạn; bạn không cần những cách còn lại.
+
+
+iOS và macOS
+------------
+  1. Đưa tệp vpn55-{cred}.mobileconfig vào thiết bị — qua AirDrop, tự gửi email
+     cho mình, hoặc một liên kết tải về. Mở nó từ tin nhắn là đủ.
+  2. iOS:   Cài đặt > Đã tải hồ sơ về > Cài đặt.
+     macOS: Cài đặt hệ thống > Cài đặt chung > VPN & Quản lý thiết bị > Cài đặt.
+  3. Kết nối từ Cài đặt > VPN.
+
+  Hồ sơ đã mang sẵn chứng chỉ của đơn vị cấp và định danh của bạn, nên không
+  còn gì phải nhập thêm và không phải gõ mật khẩu nào.
+
+
+Windows 10 và 11
+----------------
+Mở PowerShell VỚI QUYỀN QUẢN TRỊ, trong thư mục chứa vpn55-ca.crt và
+vpn55-{cred}.p12.
+
+  # 1. Tin cậy đơn vị cấp.
+  Import-Certificate -FilePath .\vpn55-ca.crt `
+      -CertStoreLocation Cert:\LocalMachine\Root
+
+  # 2. Cài định danh của thiết bị này.
+  $p = ConvertTo-SecureString -String '{pass}' -AsPlainText -Force
+  Import-PfxCertificate -FilePath .\vpn55-{cred}.p12 `
+      -CertStoreLocation Cert:\LocalMachine\My -Password $p
+
+  # 3. Tạo kết nối.
+  Add-VpnConnection -Name 'VPN55' -ServerAddress '{endpoint}' `
+      -TunnelType Ikev2 -AuthenticationMethod MachineCertificate `
+      -EncryptionLevel Required -SplitTunneling $false -RememberCredential
+
+  # 4. BẮT BUỘC — không phải tuỳ chọn, cũng không phải một bước tăng cường.
+  #    Windows mặc định đề nghị Diffie-Hellman 1024 bit và SHA-1. Máy chủ này
+  #    không chấp nhận cả hai, nên nếu thiếu bước này thì kết nối sẽ hỏng kèm
+  #    một thông báo lỗi chính sách khó hiểu. Lệnh này là thứ làm nó chạy được.
+  Set-VpnConnectionIPsecConfiguration -ConnectionName 'VPN55' `
+      -AuthenticationTransformConstants GCMAES256 `
+      -CipherTransformConstants GCMAES256 `
+      -EncryptionMethod AES256 -IntegrityCheckMethod SHA256 `
+      -DHGroup Group14 -PfsGroup PFS2048 -Force
+
+Sau đó kết nối từ Cài đặt > Mạng & Internet > VPN.
+
+
+Android
+-------
+  1. Cài "strongSwan VPN Client" từ Play Store hoặc F-Droid.
+  2. Chép tệp vpn55-{cred}.p12 vào thiết bị.
+  3. Trong ứng dụng: CA certificates > menu > Import certificate — chọn tệp .p12
+     và nhập mật khẩu ở trên.
+  4. Thêm một hồ sơ VPN:
+       Server         {endpoint}
+       VPN Type       IKEv2 Certificate
+       User certificate   chứng chỉ bạn vừa nhập
+       CA certificate     Select automatically
+  5. Kết nối.
+
+
+Linux
+-----
+  Nhập gói bằng plugin IKEv2 của NetworkManager, hoặc trỏ swanctl thẳng vào nó.
+  Định danh trong chứng chỉ là "{cred}" và định danh máy chủ là "{endpoint}".
+
+
+Những gì đường hầm này KHÔNG làm
+--------------------------------
+  IPv6 không đi qua nó. Giao thức này chỉ cấp một địa chỉ IPv4, nên một thiết bị
+  đang có IPv6 hoạt động vẫn tiếp tục dùng IPv6 trực tiếp cho mọi trang web hỗ
+  trợ — lưu lượng đó không vào đường hầm và không được nó bảo vệ. Máy chủ không
+  thể thay đổi điều này: lưu lượng đó không bao giờ đến được máy chủ.
+
+  Nếu điều đó quan trọng với việc bạn đang làm, hãy tắt IPv6 trên thiết bị, hoặc
+  xin người vận hành một chứng danh WireGuard — loại đó bắt IPv6 và bỏ đi, tức
+  là hỏng theo hướng an toàn chứ không rò rỉ.

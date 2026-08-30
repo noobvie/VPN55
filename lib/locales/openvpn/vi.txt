@@ -1,0 +1,60 @@
+@@ main
+VPN55 — Hướng dẫn cài đặt
+=========================
+
+Chứng danh : {cred}
+Cấp cho    : {user}
+Máy chủ    : {endpoint} ({transport}/{port})
+Địa chỉ của bạn bên trong đường hầm : {ip}
+
+Tệp nằm cạnh tệp này, vpn55-{cred}.ovpn, chính là toàn bộ chứng danh của bạn.
+Bên trong có một khoá riêng. Bất kỳ ai giữ một bản sao của nó đều dùng được
+quyền truy cập của bạn, vì vậy hãy gửi nó như gửi một mật khẩu, và xoá nó khỏi
+mọi nơi không cần thiết. Máy chủ không giữ bản sao nào — nếu tệp bị mất thì
+cách giải quyết là cấp một chứng danh mới, không bao giờ là gửi lại.
+
+Windows
+  1. Cài OpenVPN GUI từ openvpn.net (ứng dụng "OpenVPN Connect" của cộng đồng
+     cũng dùng được).
+  2. Nhập tệp vpn55-{cred}.ovpn bằng chức năng import của ứng dụng.
+  3. Kết nối.
+
+macOS
+  1. Tunnelblick (miễn phí, mã nguồn mở) hoặc OpenVPN Connect.
+  2. Mở tệp vpn55-{cred}.ovpn bằng ứng dụng đó, hoặc kéo tệp thả vào ứng dụng.
+  3. Kết nối.
+
+Android
+  1. OpenVPN for Android (mã nguồn mở) hoặc OpenVPN Connect.
+  2. Nhập tệp .ovpn từ thư mục tải về.
+  3. Kết nối.
+
+iOS / iPadOS
+  1. OpenVPN Connect trên App Store.
+  2. Chia sẻ tệp .ovpn vào ứng dụng, hoặc mở nó từ ứng dụng Files.
+  3. Kết nối.
+
+Linux
+  1. Gói openvpn của bản phân phối bạn đang dùng.
+  2. sudo openvpn --config vpn55-{cred}.ovpn
+     — hoặc nhập nó vào NetworkManager nếu bạn muốn có nút bật/tắt trên desktop.
+
+Lưu ý
+  - Mỗi lúc chỉ một thiết bị được dùng chứng danh này. Kết nối thiết bị thứ hai
+    sẽ ngắt thiết bị thứ nhất. Hãy xin thêm một chứng danh riêng cho mỗi thiết bị.
+  - IPv6 không đi qua đường hầm này. Nếu máy chủ đủ mới, nó sẽ báo thiết bị của
+    bạn ngừng dùng IPv6 trong lúc kết nối; nếu không, một thiết bị hai ngăn xếp
+    vẫn giữ đường IPv6 riêng và lưu lượng đó không đi qua đường hầm.
+  - DNS của đường hầm do máy chủ đặt. Máy chủ phân giải đó nhìn thấy mọi tên
+    miền bạn tra cứu trong lúc kết nối.
+
+@@ transport.tcp
+  - Máy chủ này chạy trên TCP, là chế độ vẫn hoạt động được trên những mạng
+    chặn hoặc bỏ gói UDP. Nó chậm hơn UDP, và khoảng cách càng lớn khi đường
+    truyền hay mất gói — đó là bản chất của việc chở TCP bên trong TCP, không
+    phải một thiết lập nào có thể chỉnh cho hết.
+
+@@ transport.udp
+  - Máy chủ này chạy trên UDP, là chế độ nhanh hơn. Một mạng chặn UDP thì chặn
+    hẳn; nếu bạn thấy không kết nối được ở một mạng cụ thể nào đó, nhiều khả
+    năng đây là lý do.

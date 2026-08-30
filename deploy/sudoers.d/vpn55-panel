@@ -1,0 +1,104 @@
+# =============================================================================
+# /etc/sudoers.d/vpn55-panel — the panel's only route to root.
+#
+#   install:  install -o root -g root -m 0440 vpn55-panel /etc/sudoers.d/vpn55-panel
+#   verify:   visudo -c -f /etc/sudoers.d/vpn55-panel
+#
+# Mode 0440 and root-owned, or sudo ignores the file entirely and the panel
+# fails with "a password is required" — which reads like a broken panel rather
+# than a mode bit.
+# =============================================================================
+#
+# ── THE ARGUMENT IS THE CONTROL, NOT THE PATH ────────────────────────────────
+#
+# Read this before changing anything below.
+#
+#     /usr/local/lib/vpn55/vpn55.sh              → the interactive installer.
+#                                                    Unrestricted root: it builds
+#                                                    servers, writes keys, and
+#                                                    can remove them.
+#     /usr/local/lib/vpn55/vpn55.sh --status     → prints what is running and
+#                                                    changes no configuration.
+#
+# They are the same file. A rule written against the path alone —
+#
+#     vpn55-panel ALL=(root) NOPASSWD: /usr/local/lib/vpn55/vpn55.sh
+#
+# — grants BOTH, because sudo treats a command with no arguments listed as
+# "this command with any arguments at all". That single omission turns a
+# read-only panel into full root on the host, and nothing about it looks wrong:
+# the panel works identically either way, so no test catches it and no log
+# mentions it.
+#
+# The rules below pin the whole command line. Keep them that way.
+#
+# ── The other half of the control ────────────────────────────────────────────
+#
+# A pinned rule is only worth anything if the pinned file cannot be rewritten by
+# the user the rule is written for. /usr/local/lib/vpn55/ and everything in it
+# must be root-owned and not group- or world-writable, and so must every
+# directory above it. The panel refuses to start if it can write EITHER file it is
+# about to ask root to run — panel/lib/privileged-path.js, shared by the status
+# reader and the write helper — but that check is a backstop for a
+# deployment mistake, not a substitute for getting the ownership right:
+#
+#     chown -R root:root /usr/local/lib/vpn55
+#     chmod -R go-w      /usr/local/lib/vpn55
+#
+# ── Not a login shell ────────────────────────────────────────────────────────
+# The panel user owns no interactive session. Give it /usr/sbin/nologin and no
+# password, so this sudo rule is the entire extent of what it can do.
+# =============================================================================
+
+Cmnd_Alias VPN55_STATUS = /usr/local/lib/vpn55/vpn55.sh --status
+Cmnd_Alias VPN55_CTL    = /usr/local/lib/vpn55/helper/vpnctl
+
+# Two SEPARATE programs behind two SEPARATE aliases, deliberately: the read is
+# needed by every build and the writes are not, so a deployment that wants a
+# read-only panel installs the first rule and simply omits the second.
+#
+# ── Why vpnctl's arguments are NOT pinned, when the installer's are ──────────
+#
+# Because vpnctl has no dangerous argument to pin against. It takes eight verbs
+# and refuses everything else; no verb accepts a command, a path or a shell
+# fragment; and every argument is validated inside the helper, which never trusts
+# the caller. `vpnctl` with no argument prints usage and exits.
+#
+# Seven of those verbs change the host, and that number has not moved since
+# Phase 0. Phase 8 added an eighth, `cred-config`, which READS one credential's
+# own configuration back so the self-serve portal can hand somebody their own
+# file. It needed no change to the rule below, and that is the property this
+# comment is really about: because the rule pins the PROGRAM, the narrowness
+# lives in one reviewable file rather than in a line of sudoers that would have
+# needed a wildcard to express "the same verb with a different credential id".
+#
+# `cred-config` is also the narrowest verb in the helper. It takes the user AND
+# the credential and refuses unless the register says that person holds it —
+# the only verb that does not trust the panel about who is allowed to ask,
+# because the portal is reached by the people being served rather than by the
+# operator. docs/security-model.md §6F.
+#
+# The installer is the opposite: the same file is a read-only status dump with
+# one argument and an unrestricted interactive root shell with none. There, the
+# argument IS the control. Here, the program is.
+#
+# So do not "improve" this by pinning verbs — a sudoers rule cannot express
+# "user-add followed by a name matching this pattern", and an attempt would
+# either be a wildcard that grants more than it looks like it does, or seven
+# rules that go stale the day an argument's shape changes. The narrowness lives
+# in one reviewable file: helper/vpnctl. See docs/security-model.md §3.
+
+vpn55-panel ALL=(root) NOPASSWD: VPN55_STATUS
+vpn55-panel ALL=(root) NOPASSWD: VPN55_CTL
+
+# The panel calls sudo with -n and no terminal at all. Without this, a default
+# of `requiretty` on some distributions makes every call fail with a message
+# about needing a tty, which is a confusing way to say "your sudoers has a
+# default you did not know about".
+Defaults:vpn55-panel !requiretty
+
+# Do not carry the panel's environment into root's process. The panel already
+# passes a fixed minimal env, so this is the same rule enforced from the other
+# side — belt and braces, at the cost of one line.
+Defaults:vpn55-panel env_reset
+Defaults:vpn55-panel secure_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"

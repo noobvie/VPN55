@@ -1,0 +1,219 @@
+# =============================================================================
+# /etc/vpn55/panel.conf — settings for the admin panel.
+#
+#   install:  install -o root -g vpn55-panel -m 0640 panel.conf.example \
+#                     /etc/vpn55/panel.conf
+#
+# Root-owned and readable by the panel's group, not writable by it. The panel
+# only ever reads this file.
+#
+# FORMAT: key=value, one per line, `#` comments. No quoting, no interpolation,
+# no shell. It is deliberately not sourced as shell — a settings file that is
+# sourced executes whatever gets written into it, and this one sits on a host
+# holding private keys.
+#
+# Every setting below is shown with its BUILT-IN DEFAULT. Deleting a line
+# restores that default; it does not unset the setting.
+#
+# ⚠ A value this file cannot parse is a REFUSAL, not a warning: the panel prints
+# which line it could not read and does not start. A settings file that quietly
+# ignored a typo would let `enforce_quota_revoke=flase` read as "off" while
+# looking like it says "false" — and a security switch that silently takes a
+# default is worse than one that fails loudly.
+# =============================================================================
+
+# ── Where it listens ────────────────────────────────────────────────────────
+#
+# ⚠ A wildcard (0.0.0.0 or ::) is REFUSED, not warned about. The whole security
+# model rests on the panel not being reachable from the internet, and an IP
+# allowlist is not the same control: a stranger's packet still arrives, still
+# completes the TLS handshake, and is still parsed before any rule is checked.
+# Binding to one address means the packet is never accepted at all.
+#
+# Two supported arrangements:
+#
+#   1. BEHIND THE nginx VHOST (recommended, and what deploy/nginx/ assumes).
+#      Leave this at loopback. nginx listens on the tunnel address, terminates
+#      TLS, and is then the only thing that can reach the panel at all — not
+#      even another host on the tunnel can.
+#
+#   2. DIRECTLY ON THE TUNNEL, no nginx. Set this to this host's tunnel address,
+#      e.g. 10.55.0.1. There is then no TLS, so only do this if the tunnel is
+#      the only path and you accept that the panel's traffic is protected by the
+#      tunnel's encryption alone.
+#
+# The panel checks the address is actually assigned to an interface here and
+# refuses to start if it is not — which, on a tunnel that has not come up yet,
+# is a readable sentence instead of an EADDRNOTAVAIL a moment later. The systemd
+# unit restarts every 10s, so it comes up on its own once the tunnel does.
+bind=127.0.0.1
+port=8055
+
+# Believe X-Forwarded-For from the reverse proxy.
+#
+# ⚠ OFF by default, and that default is load-bearing rather than cautious. From
+# Phase 6 the login lockout is keyed on the client IP, so a caller who can set
+# this header freely has an unlimited supply of "different" clients and is never
+# locked out. Turn it on only in arrangement 1 above, where the panel is on
+# loopback and the vhost is the only thing that can reach it.
+trust_proxy=0
+
+# Phase 5 has NO SIGN-IN AT ALL. Everyone who can reach the bind address can
+# read every user name, quota and traffic total on this host. Nothing here can
+# change anything, but reading it is not nothing — so the panel refuses to start
+# until this is set deliberately.
+#
+# ⚠ In Phase 6 this same setting means the OPPOSITE: sign-in exists there, and
+# setting this to 1 turns it OFF. Set it back to 0 when you upgrade.
+allow_unauthenticated=0
+
+# ── State ───────────────────────────────────────────────────────────────────
+#
+# ⚠ state_dir holds the accumulated traffic totals, and they are DURABLE STATE,
+# not a cache. Every service resets its own counters, so this directory is the
+# only place a lifetime usage figure exists. Losing it zeroes every user's usage
+# and nothing on this host can rebuild it. Back it up.
+state_dir=/var/lib/vpn55/panel
+
+# Where the user register lives. The register is the list of who exists; the
+# services are the list of what is running. The panel reads both and reports any
+# credential that appears in the second but not the first.
+user_dir=/etc/vpn55/users
+
+# How often to read the services, in seconds. Every read is one subprocess, so
+# this is not free on a small host; every read is also the freshness of every
+# number on screen. 15s is a reasonable middle. Minimum 5, maximum 3600.
+poll_seconds=15
+
+# How many events to keep. They are held in state.json and are what the Events
+# view shows. Minimum 10, maximum 100000.
+event_limit=500
+
+# error, warn, info or debug.
+log_level=info
+
+# ── Reading the services ────────────────────────────────────────────────────
+#
+# The read-only status command. It must be the INSTALLED copy, at the exact path
+# the sudoers rule names — not a path into a source tree.
+#
+# ⚠ The same file with NO argument is the interactive installer, which is
+# unrestricted root. The sudo rule must pin the `--status` argument, or it grants
+# that too. See deploy/sudoers.d/vpn55-panel; that one line is the whole control.
+installer=/usr/local/lib/vpn55/vpn55.sh
+status_timeout_ms=20000
+
+# ── The privileged helper (Phase 6; unused by a read-only build) ────────────
+# A separate program from the installer above, behind a separate sudo rule, so a
+# read-only deployment can simply not install the second rule.
+helper=/usr/local/lib/vpn55/helper/vpnctl
+use_sudo=1
+helper_timeout_ms=60000
+
+# ── Language ────────────────────────────────────────────────────────────────
+# First in the list is not the default; default_locale is. English is the
+# fallback for any key a catalog is missing, and the language keys are authored
+# in.
+locales=vi,en,fr
+default_locale=vi
+
+# ── Sessions (Phase 6) ──────────────────────────────────────────────────────
+# An absolute lifetime and a separate idle timeout. A session token cannot be
+# withdrawn from the client's side, so "log in once, stay in forever" would be a
+# credential with no expiry wearing a session's name.
+session_ttl_minutes=720
+session_idle_minutes=30
+
+# ── Login throttling (Phase 6) ──────────────────────────────────────────────
+login_window_ms=900000
+login_max_failures=5
+login_lock_ms=900000
+login_ip_max=30
+
+# ── Quota and expiry enforcement (Phase 6) ─────────────────────────────────
+enforce_enabled=1
+enforce_interval_seconds=300
+
+# ⚠ Both default OFF, and the cost of that is stated rather than hidden.
+# Disabling a user is a reversible policy flag; REVOKING A CREDENTIAL IS NOT —
+# the client key is gone and that person needs a new configuration. An automated
+# job that revoked on a monthly quota would burn every user's config every month.
+#
+# The cost of leaving them off: someone already connected when they cross their
+# quota stays connected, because none of these services can suspend a credential
+# and later restore it. The enforcement run reports that rather than reporting an
+# enforcement that did not happen.
+enforce_quota_revoke=0
+enforce_expiry_revoke=0
+
+# ── The self-serve portal (Phase 8) ─────────────────────────────────────────
+#
+# The people using VPN55 are not the people running it. The portal is where they
+# see their own usage and expiry, fetch their own configuration, show a QR for a
+# phone and replace their own credential. Nothing else.
+#
+# ⚠ IT IS A SECOND LISTENER, NOT A PATH ON THE ONE ABOVE, and that is the whole
+# security control. The panel and the portal are two separate applications in
+# one process: the admin routes are not registered on the portal's socket at
+# all, so no token, session or header can reach one from there. A role flag on
+# shared routes is exactly how a user reaches an admin endpoint, and there are
+# no shared routes. docs/security-model.md §6F.
+#
+# ON by default, and it is inert until somebody is issued a code: with no codes,
+# every request to it is one 401. Set it to 0 for a pure self-host deployment
+# where the operator is the only user.
+portal_enabled=1
+
+# Where the portal listens. Unlike the panel's, this address is ALLOWED to be
+# public — being reachable is the point of it, since a user fetching their first
+# configuration is by definition not on the tunnel yet.
+#
+# The supported arrangement, and what deploy/nginx/vpn55-portal.conf assumes:
+# leave this on loopback, and let nginx hold the public address and terminate
+# TLS. A wildcard is refused here for the same reason it is above — name one
+# address.
+portal_bind=127.0.0.1
+portal_port=8056
+
+# Believe X-Forwarded-For on the portal.
+#
+# ⚠ ON by default here, and it is REFUSED unless portal_bind is a loopback
+# address. That pairing is the rule: the header is only worth believing when
+# nothing but a proxy on this host can reach the socket, and only a loopback
+# bind guarantees that. On a reachable address it is caller-controlled, so every
+# rate limit keyed on the client address would have an endless supply of
+# identities. The panel refuses to start on the dangerous combination rather
+# than warning about it.
+#
+# Setting it to 0 while nginx is in front is safe but blunt: every portal client
+# then counts as 127.0.0.1, so the rate limit becomes one shared bucket for
+# everybody. That fails closed, and it throttles real users.
+portal_trust_proxy=1
+
+# Portal sessions. Shorter than the panel's: this is a page somebody opens on a
+# phone to fetch a file, not a console left open on a desk. The absolute
+# lifetime is capped at 24h in code, which configuration cannot raise.
+portal_session_ttl_minutes=120
+portal_session_idle_minutes=20
+
+# Redeeming an access code, per client address per window. This is NOT a
+# guessing control — a code is 256 bits from a CSPRNG, so exhausting it is not a
+# rate to be limited. It is here so an open portal cannot be used to make this
+# host do work on demand.
+portal_window_ms=900000
+portal_ip_max=60
+
+# Fetching a configuration, per ACCOUNT per window. This is the only portal
+# route that costs a subprocess, and being signed in does nothing to stop an
+# authenticated caller in a loop making this host fork on demand. Generous: a
+# real person switching between four files on three credentials never meets it.
+portal_config_max=60
+
+# Replacing a credential, per ACCOUNT per window — not per address. Rotation
+# issues a credential before it revokes the old one, so an unbounded caller
+# could fill the address pool from a phone; and the person doing it is
+# identified, so the limit belongs on them rather than on wherever they happen
+# to be standing. Someone on a train changing networks must not get a fresh
+# budget.
+portal_rotate_window_ms=3600000
+portal_rotate_max=3

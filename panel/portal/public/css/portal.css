@@ -1,0 +1,368 @@
+/* ============================================================================
+   portal.css — the self-serve portal's own layer.
+   ============================================================================
+
+   Loaded second, after the pinned vendor/office-tools.css, and it is the ONLY
+   stylesheet the portal loads besides that one. panel.css is deliberately not
+   in the page: that file is the admin console's layer, laid out for a wide
+   screen full of tables, and the portal is one column on a phone.
+
+   ── One rule, and it is the one that breaks themes ──────────────────────────
+
+   EVERY COLOUR COMES FROM A TOKEN. There is not one hex value below except
+   inside the QR code, which is a photograph target rather than a design (see
+   the note there). The vendored file defines --bg, --text, --primary and the
+   rest once at :root and once per [data-theme], so a rule written against the
+   tokens is correct in all four themes for free and a rule written against a
+   hex value is correct in exactly one.
+
+   The corollary is the part that gets missed: WHEREVER A RULE SETS
+   `background`, IT SETS `color` TOO, and the other way round. A quiet element
+   that overrides only its background inherits ink chosen for a different
+   surface, and across four themes ranging from near-white to near-black that is
+   dark-on-dark for at least one of them.
+
+   ── The --font overrides are copied here on purpose ─────────────────────────
+
+   Vietnamese is the DEFAULT locale and this page is what most users see. Two of
+   the four vendored stacks lack Latin Extended Additional, where the stacked
+   diacritics live, so a browser substitutes per character and a word renders
+   half in one face and half in another — which reads as a fault on the reader's
+   machine rather than on the page.
+
+   panel.css fixes that for the admin console. The portal does not load
+   panel.css, so it carries the same four overrides itself rather than depending
+   on a stylesheet it does not use. That is a real duplication and it is the
+   right one: the alternative is the portal being one forgotten `<link>` away
+   from the exact failure the override exists to prevent, on the surface where
+   it matters most. .github/scripts/check-fonts.mjs checks this file too.
+
+   ── Laid out against the longest locale ─────────────────────────────────────
+
+   French runs ~18% longer than English across this catalog and Vietnamese
+   longer still for anything technical. Nothing below is a fixed width sized to
+   an English word: labels wrap, buttons pad rather than measure, and the
+   credential cards stack rather than sitting in fixed columns.
+   ============================================================================ */
+
+:root {
+  --font: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto,
+          'Noto Sans', Arial, sans-serif;
+}
+
+[data-theme="dark"] {
+  --font: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto,
+          'Noto Sans', Arial, sans-serif;
+}
+
+[data-theme="matrix"] {
+  --font: ui-monospace, 'Cascadia Mono', Consolas, 'DejaVu Sans Mono',
+          Menlo, 'Courier New', monospace;
+}
+
+[data-theme="anime"] {
+  --font: 'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto,
+          'Noto Sans', Arial, sans-serif;
+}
+
+/* ---------- Frame ---------- */
+.portal {
+  max-width: 46rem;
+  margin: 0 auto;
+  padding: 1rem .9rem 4rem;
+}
+
+.pbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: .5rem .9rem;
+  margin-bottom: 1.1rem;
+  padding-bottom: .8rem;
+  border-bottom: 1.5px solid var(--border);
+}
+
+.pbar__title {
+  font-size: 1.2rem;
+  font-weight: 700;
+  color: var(--text);
+  margin-right: auto;
+}
+
+.pbar__who {
+  font-size: .85rem;
+  color: var(--text-muted);
+}
+
+.pbar__controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: .4rem;
+}
+
+.chip {
+  padding: .3rem .6rem;
+  border: 1.5px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-secondary);
+  color: var(--text-muted);
+  font-family: var(--font);
+  font-size: .78rem;
+  cursor: pointer;
+}
+.chip:hover, .chip:focus-visible { border-color: var(--primary); color: var(--text); }
+
+/* ---------- Cards ---------- */
+.card {
+  border: 1.5px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-card);
+  color: var(--text);
+  padding: 1rem;
+  margin-bottom: .9rem;
+}
+.card__title {
+  margin: 0 0 .2rem;
+  font-size: 1rem;
+  font-weight: 700;
+  color: var(--text);
+}
+.card__sub {
+  margin: 0 0 .7rem;
+  font-size: .8rem;
+  color: var(--text-muted);
+}
+.card--alert { border-color: var(--danger); }
+
+.stack { display: flex; flex-direction: column; gap: .9rem; }
+.muted { color: var(--text-muted); }
+.small { font-size: .8rem; }
+
+/* ---------- Facts ---------- */
+.facts {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: .35rem .9rem;
+  margin: .6rem 0 0;
+  font-size: .85rem;
+}
+.facts dt { color: var(--text-muted); }
+.facts dd { margin: 0; color: var(--text); }
+/* Tabular figures so a column of byte counts lines up: 1.07 GiB above
+   11.4 MiB should not shift the decimal point sideways. */
+.facts dd.num { font-variant-numeric: tabular-nums; }
+
+/* A value the service had no reading for. It renders as an em dash, and this is
+   what stops that dash reading as a design flourish rather than as an answer. */
+.is-unset { color: var(--text-light); }
+
+/* ---------- Badges ---------- */
+.badge {
+  display: inline-block;
+  padding: .12rem .45rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-secondary);
+  color: var(--text-muted);
+  font-size: .72rem;
+  font-weight: 700;
+  white-space: nowrap;
+}
+.badge--ok      { background: var(--success-dim); color: var(--success); border-color: var(--success); }
+.badge--warn    { background: var(--warning-dim); color: var(--warning); border-color: var(--warning); }
+.badge--crit    { background: var(--danger-dim);  color: var(--danger);  border-color: var(--danger); }
+.badge--info    { background: var(--primary-dim); color: var(--primary); border-color: var(--primary); }
+.badge--idle    { background: var(--bg-secondary); color: var(--text-muted); border-color: var(--border); }
+.badge--unknown { background: var(--bg-secondary); color: var(--text-light); border-color: var(--border); }
+
+/* ---------- The quota meter ---------- */
+.meter {
+  height: .5rem;
+  margin: .5rem 0 .3rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-secondary);
+  overflow: hidden;
+}
+.meter__fill {
+  height: 100%;
+  background: var(--primary);
+  /* The bar is not the only signal. A person who cannot distinguish the fill
+     colour from the track still has the figure beside it and the badge above
+     it, because colour on its own is not an accessible way to say "nearly
+     out". */
+  transition: width var(--transition, .2s);
+}
+.meter__fill--warn { background: var(--warning); }
+.meter__fill--crit { background: var(--danger); }
+
+/* ---------- Buttons ---------- */
+.btn {
+  display: inline-block;
+  padding: .5rem .85rem;
+  border: 1.5px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-secondary);
+  color: var(--text);
+  font-family: var(--font);
+  font-size: .87rem;
+  font-weight: 600;
+  cursor: pointer;
+  /* Sized against the longest locale: padding, never a width. A French or
+     Vietnamese caption is simply a wider button. */
+  min-height: 2.4rem;
+}
+.btn:hover:not(:disabled), .btn:focus-visible { border-color: var(--primary); }
+.btn:disabled { opacity: .55; cursor: not-allowed; }
+.btn--primary { background: var(--primary); color: var(--bg); border-color: var(--primary); }
+.btn--danger  { background: var(--danger-dim); color: var(--danger); border-color: var(--danger); }
+.btn--wide { width: 100%; }
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: .5rem;
+  margin-top: .8rem;
+}
+
+/* ---------- Sign in ---------- */
+.signin { max-width: 26rem; margin: 3rem auto 0; }
+.signin label { display: block; margin: .8rem 0 .3rem; font-size: .85rem; color: var(--text); }
+.field {
+  width: 100%;
+  padding: .6rem;
+  border: 1.5px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font);
+  font-size: .95rem;
+}
+/* The access code is one long opaque string. Monospace so a person reading it
+   off a phone screen can tell an l from a 1, and word-break so it wraps in the
+   box instead of scrolling sideways out of view. */
+.field--code { font-family: ui-monospace, 'Cascadia Mono', Consolas, 'DejaVu Sans Mono', monospace; }
+.problem { margin: .7rem 0 0; min-height: 1.2em; font-size: .85rem; color: var(--danger); }
+
+/* ---------- The configuration panel ---------- */
+.config { margin-top: .9rem; padding-top: .9rem; border-top: 1.5px solid var(--border); }
+.config__note { margin: 0 0 .6rem; font-size: .82rem; color: var(--text-muted); }
+.config__body {
+  max-height: 18rem;
+  overflow: auto;
+  margin: .6rem 0;
+  padding: .6rem;
+  border: 1.5px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-secondary);
+  color: var(--text);
+  font-family: ui-monospace, 'Cascadia Mono', Consolas, 'DejaVu Sans Mono', monospace;
+  font-size: .74rem;
+  line-height: 1.45;
+  white-space: pre;
+}
+
+.qr {
+  max-width: 15rem;
+  margin: .8rem auto;
+  padding: .5rem;
+  border: 1.5px solid var(--border);
+  border-radius: var(--radius);
+  /* WHITE, from a token that is white in every theme? There is no such token,
+     so this is the one place the page leaves the theme system — see the note in
+     qr.js. A QR is read by a camera, and a code drawn in theme colours is a
+     code that does not scan in at least two of the four. */
+  background: #ffffff;
+  color: #000000;
+}
+
+/* ---------- Adapter-authored text ---------- */
+/* A service's own sentence about itself — how it fares on a filtered network,
+   what a file is for. Quoted and attributed rather than blended in, because
+   this side did not write it and cannot translate it without learning which
+   protocol did. It is the only text on the page that may not be in the
+   viewer's language, and the label says so. */
+.from-service {
+  margin: .5rem 0 0;
+  padding-left: .6rem;
+  border-left: 3px solid var(--border);
+  font-size: .8rem;
+  color: var(--text-muted);
+}
+.from-service__mark {
+  display: block;
+  font-size: .7rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  color: var(--text-light);
+}
+
+/* ---------- Banners and flashes ---------- */
+.banner {
+  padding: .7rem .9rem;
+  margin-bottom: .9rem;
+  border: 1.5px solid var(--border);
+  border-left-width: 4px;
+  border-radius: var(--radius);
+  background: var(--bg-card);
+  color: var(--text);
+  font-size: .85rem;
+  line-height: 1.5;
+}
+.banner strong { display: block; margin-bottom: .25rem; color: var(--text); }
+.banner--crit { border-left-color: var(--danger); background: var(--danger-dim); }
+.banner--warn { border-left-color: var(--warning); background: var(--warning-dim); }
+.banner--info { border-left-color: var(--primary); background: var(--primary-dim); }
+
+.flash {
+  position: fixed;
+  left: .8rem;
+  right: .8rem;
+  bottom: .8rem;
+  z-index: 40;
+  display: flex;
+  flex-direction: column;
+  gap: .5rem;
+}
+.flash__item {
+  padding: .7rem .9rem;
+  border: 1.5px solid var(--border);
+  border-left-width: 4px;
+  border-radius: var(--radius);
+  background: var(--bg-card);
+  color: var(--text);
+  font-size: .85rem;
+  line-height: 1.45;
+}
+.flash__item--ok { border-left-color: var(--success); }
+.flash__item--error { border-left-color: var(--danger); }
+
+/* ---------- Confirmation ---------- */
+.modal {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1rem;
+  background: var(--bg);
+  color: var(--text);
+}
+.modal__box {
+  width: 100%;
+  max-width: 28rem;
+  padding: 1.2rem;
+  border: 1.5px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-card);
+  color: var(--text);
+}
+.modal__text { margin: 0 0 1.1rem; line-height: 1.5; }
+.modal__buttons { display: flex; flex-wrap: wrap; gap: .6rem; justify-content: flex-end; }
+
+/* ---------- Motion ---------- */
+@media (prefers-reduced-motion: reduce) {
+  * { transition: none !important; animation: none !important; }
+}

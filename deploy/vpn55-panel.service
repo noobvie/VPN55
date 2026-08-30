@@ -1,0 +1,130 @@
+# =============================================================================
+# /etc/systemd/system/vpn55-panel.service
+#
+#   install:  install -o root -g root -m 0644 vpn55-panel.service \
+#                     /etc/systemd/system/vpn55-panel.service
+#             systemctl daemon-reload && systemctl enable --now vpn55-panel
+#
+# Its own unit, its own port, its own user. It shares a process with nothing
+# public-facing, so a flaw in a public site is not a flaw in the panel and the
+# other way round.
+# =============================================================================
+
+[Unit]
+Description=VPN55 admin panel
+Documentation=file:/usr/local/lib/vpn55/panel/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=vpn55-panel
+Group=vpn55-panel
+
+WorkingDirectory=/usr/local/lib/vpn55/panel
+ExecStart=/usr/bin/node /usr/local/lib/vpn55/panel/server.js
+Environment=NODE_ENV=production
+UMask=0027
+
+# ── Restarting, and why the delay is not the default ────────────────────────
+# The panel binds to the tunnel interface's address, which does not exist until
+# the tunnel is up. systemd cannot express "after that interface has an address"
+# — network-online.target does not wait for a tunnel a later unit brings up — so
+# the honest arrangement is to let it fail and come back. config.js checks that
+# the address is actually assigned and says so plainly, which turns those first
+# few restarts into a readable log line rather than a bare EADDRNOTAVAIL.
+Restart=on-failure
+RestartSec=10s
+# Do not give up. A tunnel down for a maintenance hour must not leave the panel
+# permanently dead once it comes back.
+StartLimitIntervalSec=0
+
+# ── The state directory ─────────────────────────────────────────────────────
+# ⚠ /var/lib/vpn55/panel/state.json holds the accumulated traffic totals, and
+# they are DURABLE STATE, not a cache. Every service on this host resets its own
+# counters, so losing this file sets every user's lifetime usage back to zero and
+# nothing on the machine can rebuild it. It belongs in the backup.
+StateDirectory=vpn55/panel
+StateDirectoryMode=0750
+
+# =============================================================================
+# ⚠⚠ HARDENING — READ THIS BEFORE ADDING ANY OF THE USUAL OPTIONS ⚠⚠
+# =============================================================================
+#
+# This service reaches root through TWO sudo rules and nothing else. sudo is
+# setuid, and a
+# setuid binary cannot raise privileges once the kernel's no_new_privs bit is
+# set on the process.
+#
+# systemd sets that bit for you, WITHOUT BEING ASKED, whenever certain options
+# are present. It is not a default you can override by writing
+# NoNewPrivileges=no: the implication is applied after the unit is parsed, so an
+# explicit `no` beside one of these options loses. Every one of the following
+# turns it on, and this is why none of them appears in this file:
+#
+#     PrivateDevices=            ProtectKernelTunables=
+#     ProtectClock=              ProtectKernelModules=
+#     ProtectHostname=           ProtectKernelLogs=
+#     RestrictRealtime=          RestrictSUIDSGID=
+#     LockPersonality=           MemoryDenyWriteExecute=
+#     SystemCallFilter=          RestrictNamespaces=
+#
+# The failure mode is what makes this worth a screen of comment. sudo does not
+# say "no_new_privs is set". It says:
+#
+#     sudo: effective uid is not 0, is /usr/bin/sudo on a file system with the
+#     'nosuid' option set or an NFS file system without root privileges?
+#
+# — which sends whoever is debugging it to look at mount options and filesystem
+# permissions, neither of which is the problem, while the panel reports every
+# service as unreadable.
+#
+# ── Two of them are worth naming separately ─────────────────────────────────
+#
+#   MemoryDenyWriteExecute=  would break this service even without the sudo
+#       problem: V8 compiles JavaScript at runtime and needs pages that are both
+#       writable and executable. The process dies at startup and nothing in the
+#       message names this option.
+#
+#   SystemCallFilter=  is the one a hardening guide will most want to add. It is
+#       also the one that most reliably breaks this unit, for the reason above.
+#
+# ── Verify rather than trust this comment ───────────────────────────────────
+# After any change to this file:
+#
+#     systemctl show -p NoNewPrivileges vpn55-panel     # must print "no"
+#     systemd-analyze security vpn55-panel              # for the rest
+#
+# If the first prints "yes", something in this unit turned it on and the status
+# read will fail with the misleading message above. Find it and remove it — do
+# not work around it by giving the panel user broader privileges.
+#
+# ── What IS safe here ───────────────────────────────────────────────────────
+# The mount- and namespace-based protections below restrict what the process can
+# SEE rather than what it can call, and none of them touches no_new_privs. They
+# are the ones that matter most for this service anyway: it reads a fixed set of
+# files and writes exactly one.
+# =============================================================================
+
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectProc=invisible
+ProcSubset=pid
+
+# The panel needs no capabilities of its own — everything privileged happens in
+# a separate process that sudo gives its own. Emptying the bounding set does not
+# prevent sudo from working: sudo's transition is by setuid, and the bounding
+# set is re-established for the new process.
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# ── Logging ─────────────────────────────────────────────────────────────────
+# stdout and stderr are the log; the panel opens no log file of its own and
+# rotates nothing. `journalctl -u vpn55-panel` is the whole story.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=vpn55-panel
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,28 @@
+@@ header
+Configuration client VPN55
+Identifiant {cred}  ·  utilisateur {user}
+
+@@ custody.client
+GARDE DE LA CLÉ : générée par le client. Ce serveur n'a jamais détenu la
+  clé privée de cet identifiant et ne peut pas en produire une. Inscrivez
+  votre propre clé sur la ligne PrivateKey ci-dessous.
+
+@@ custody.server
+GARDE DE LA CLÉ : générée par le serveur. Ce serveur a créé la clé privée
+  ci-dessous et l'a conservée jusqu'à {ttl_hours} heures après émission,
+  puis l'a effacée.
+  Enregistrez ce fichier maintenant — il ne pourra plus être reproduit.
+
+@@ routing
+
+Tout le trafic passe par le tunnel. L'IPv6 est capturé puis supprimé
+  plutôt que routé : la défaillance est fermée, et rien ne sort en clair.
+
+@@ transport.awg
+
+TRANSPORT : AmneziaWG. Il faut un client qui le prenne en charge —
+  l'application WireGuard standard rejettera les lignes Jc/S1/H1
+  ci-dessous, et les supprimer ne revient pas à WireGuard : la connexion
+  cesse simplement de s'établir.
+  Ces valeurs appartiennent à ce serveur et doivent être reportées
+  exactement telles quelles ; elles ne sont ni secrètes ni réglables.

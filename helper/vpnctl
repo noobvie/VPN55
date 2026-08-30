@@ -1,0 +1,1168 @@
+#!/usr/bin/env bash
+#
+# helper/vpnctl — the narrow root helper. Phase 6, extended once in Phase 8.
+#
+# This is the ONLY thing in VPN55 that runs as root on behalf of the panel. It
+# accepts a FIXED verb list and nothing else:
+#
+#   WRITE  user-add  user-remove  user-enable  user-disable  cred-add
+#          cred-revoke  service-restart
+#   READ   cred-config
+#
+# The panel's service user may invoke this and nothing else — no blanket sudo,
+# no sudoers wildcard, no "run this command as root" endpoint. A panel
+# compromise therefore costs exactly those eight verbs, never arbitrary root.
+# docs/security-model.md §3 is the decision; this file is the implementation.
+#
+# ── The eighth verb, and why it was added rather than worked around ──────────
+#
+# Seven was the published number from Phase 0 to Phase 7, and adding to it is a
+# security-model change made deliberately in Phase 8 — §3 and §6F, the sudoers
+# comment and the CI count were all updated in the same commit as this file.
+#
+# `cred-config` exists because the self-serve portal has to hand a person their
+# own configuration file, and a client configuration is root-only on disk: it
+# lives in an adapter's spool at mode 0600 because it carries a private key.
+# The two alternatives were both worse. Letting the panel's user READ the spool
+# directly hands it every user's key with no gate at all, permanently. Adding a
+# second argument-pinned sudo rule on `vpn55.sh` would need a sudoers wildcard
+# on the argument — the exact "wildcard that grants more than it looks like it
+# does" that the sudoers comment warns against — and would run the interactive
+# installer with caller-influenced argv.
+#
+# It is also the NARROWEST verb here, and the only one that is narrow in this
+# particular way: it takes the user AND the credential and refuses unless the
+# registry says that person holds that credential. Every other verb trusts the
+# panel to have decided who may ask. This one does not, because the portal is
+# reached by the people being served rather than by the operator, and "the panel
+# checked" is not a claim worth making about the one call that returns a key.
+#
+# ── Four rules that make the narrowness real rather than decorative ───────────
+#
+#  1. NO VERB TAKES A COMMAND, A PATH OR A SHELL FRAGMENT. Every argument is an
+#     identifier from a closed alphabet, or a value from a closed vocabulary.
+#     Adding a verb that took a path would be a redesign, not a feature — it
+#     would hand the caller the filesystem, which is most of root. Even the
+#     service to restart is named by an ADAPTER TAG, checked against the tags
+#     adapters actually registered, never by a unit name or a binary.
+#
+#  2. EVERY ARGUMENT IS VALIDATED HERE, before anything is sourced and long
+#     before anything is done. The libraries validate too, and that is not
+#     redundancy worth removing: this file has to be correct on its own, because
+#     it is the only thing between an unprivileged process and root. Validation
+#     in panel/lib/privileged.js is a convenience for error messages and is
+#     NEVER the control.
+#
+#  3. THE ENVIRONMENT IS NOT INPUT. Every VPN55_* variable that redirects a path
+#     is pinned below, before the libraries are sourced. sudo's env_reset already
+#     scrubs the environment, but a helper whose safety depends on the caller
+#     having configured sudo correctly is a helper that is safe by luck. An
+#     unpinned VPN55_ETC would let the caller point the registry at a directory
+#     it controls and have root read its configuration out of it.
+#
+#  4. NO eval, NO `sh -c`, NO CALLER DATA REACHING A SHELL AS TEXT. Caller
+#     strings reach a program only as separate argv words. CI asserts this by
+#     grep, because it is the property that is easiest to lose in a hurry and
+#     hardest to notice afterwards.
+#
+# ── Output ────────────────────────────────────────────────────────────────────
+# Machine-readable on stdout, in the project's record shape — the first field is
+# the record type, so a reader never guesses from the field count:
+#
+#   result  <ok|error>  <verb>  <target>  <code>  <message>
+#   detail  <key>  <value>
+#
+# Exactly one `result` record is emitted per invocation, always, including on an
+# unexpected failure. Human logging goes to stderr (lib/ui.sh sends it there), so
+# a caller parsing stdout is never poisoned by a log line. The exit status is 0
+# on success and one of the E_* codes otherwise; the same code appears in the
+# result record, so a caller that captured only stdout still knows what happened.
+#
+# ── Self-test ─────────────────────────────────────────────────────────────────
+# `vpnctl --self-test` exercises the argument validators against a table of
+# malformed and well-formed inputs. It needs no root, touches nothing, sources
+# nothing, and runs in CI — which is how "a malformed argument is rejected by the
+# helper itself" stays a demonstrated fact rather than a claim in a comment.
+#
+set -euo pipefail
+
+VPNCTL_VERSION="0.8.0-phase8"
+
+# ─── The environment is not input ─────────────────────────────────────────────
+# Pinned BEFORE the libraries are sourced, because each of them reads these with
+# `: "${VAR:=default}"` and would otherwise adopt whatever the caller set. PATH
+# is pinned for the same reason: a helper that resolves `systemctl` through a
+# caller-supplied PATH is a helper that runs a caller-supplied systemctl.
+VPN55_ETC=/etc/vpn55
+VPN55_USER_DIR=/etc/vpn55/users
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export VPN55_ETC VPN55_USER_DIR PATH
+
+# There is no operator on the other end of a call from the panel, so nothing may
+# prompt. VPN55_ASSUME_YES stays 0 — ui.sh's ask_proceed declines rather than
+# blocking when there is no terminal, and declining is the correct answer here.
+VPN55_ASSUME_YES=0
+VPN55_NO_COLOR=1
+export VPN55_ASSUME_YES VPN55_NO_COLOR
+
+unset -v VPN55_DEBUG VPN55_MIRROR IFS CDPATH BASH_ENV ENV 2>/dev/null || true
+
+# Where the libraries live: resolved from this file's own location so the helper
+# works from a checkout and from its installed path alike — and NOT from an
+# environment variable, which would be rule 3 with extra steps.
+VPNCTL_SELF="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+VPN55_ROOT="$(cd -- "${VPNCTL_SELF}/.." && pwd)"
+readonly VPNCTL_VERSION VPNCTL_SELF VPN55_ROOT
+
+# ─── Exit codes ───────────────────────────────────────────────────────────────
+# A caller distinguishes "you asked wrong" from "it went wrong": the first is a
+# bug in the panel, the second is a condition on the server, and they want
+# different responses.
+readonly E_OK=0
+readonly E_USAGE=2        # unknown verb, wrong argument count
+readonly E_ARG=3          # an argument failed validation
+readonly E_PRIV=4         # not running as root
+readonly E_TARGET=5       # the named user, credential or service is unknown
+readonly E_FAILED=6       # the action was attempted and did not succeed
+
+# ─── The verb list ────────────────────────────────────────────────────────────
+# Eight, written down once. The dispatch case and the usage text both derive
+# from this list, so what is reachable cannot drift from what is documented.
+#
+# Seven of them change the host. `cred-config` reads one, and it is listed last
+# rather than beside `cred-add` so that the shape of this list still answers
+# "what can a compromised panel CHANGE?" by reading the first seven lines.
+readonly -a VPNCTL_VERBS=(
+    user-add
+    user-remove
+    user-enable
+    user-disable
+    cred-add
+    cred-revoke
+    service-restart
+    cred-config
+)
+
+# ─── Records ──────────────────────────────────────────────────────────────────
+# A tab or a newline inside a field would split one record into two on the
+# reader's side, so they are folded to spaces rather than escaped. Nothing that
+# legitimately reaches here contains either — identifiers cannot, and messages
+# are ours — but "cannot" is the assumption that log injection is made of.
+_ctl_clean() {
+    local s="${1:-}"
+    s="${s//$'\t'/ }"
+    s="${s//$'\n'/ }"
+    s="${s//$'\r'/ }"
+    printf '%s' "$s"
+}
+
+# Set once the result record has been printed, so the EXIT trap does not print a
+# second one. Exactly one result per invocation is a contract the caller relies
+# on to know when it has the whole answer.
+VPNCTL_RESULT_DONE=0
+VPNCTL_VERB="-"
+VPNCTL_TARGET="-"
+VPNCTL_ACTOR="-"
+
+ctl_result() {
+    local status="${1:-error}" code="${2:-1}" message="${3:-}"
+    VPNCTL_RESULT_DONE=1
+    printf 'result\t%s\t%s\t%s\t%s\t%s\n' \
+        "$(_ctl_clean "$status")" \
+        "$(_ctl_clean "$VPNCTL_VERB")" \
+        "$(_ctl_clean "${VPNCTL_TARGET:--}")" \
+        "$(_ctl_clean "$code")" \
+        "$(_ctl_clean "$message")"
+    _ctl_audit "$status" "$code" "$message"
+}
+
+ctl_detail() {
+    printf 'detail\t%s\t%s\n' "$(_ctl_clean "${1:-}")" "$(_ctl_clean "${2:-}")"
+}
+
+# Emit the result and exit with the matching code, in one place so no path can
+# report one thing and exit with another.
+ctl_fail() {
+    local code="${1:-1}" message="${2:-}"
+    ctl_result error "$code" "$message"
+    exit "$code"
+}
+
+ctl_ok() {
+    local message="${1:-}"
+    ctl_result ok "$E_OK" "$message"
+    exit "$E_OK"
+}
+
+# An unexpected exit still gets exactly one result record. Without this a bug in
+# a library would produce silence on stdout, and a caller waiting for a result
+# would have to guess whether the write happened.
+_ctl_on_exit() {
+    local rc=$?
+    if [[ "$VPNCTL_RESULT_DONE" -eq 0 ]]; then
+        VPNCTL_RESULT_DONE=1
+        printf 'result\terror\t%s\t%s\t%s\t%s\n' \
+            "$(_ctl_clean "$VPNCTL_VERB")" \
+            "$(_ctl_clean "${VPNCTL_TARGET:--}")" \
+            "$E_FAILED" \
+            "the helper exited unexpectedly (status ${rc})"
+        _ctl_audit error "$E_FAILED" "the helper exited unexpectedly (status ${rc})"
+    fi
+}
+
+# ─── Audit ────────────────────────────────────────────────────────────────────
+# Root-side, append-only, root-only. The panel keeps its own audit log for the
+# UI, and that one is written by the process an attacker would already own —
+# which makes it a record of what the panel BELIEVES happened, not of what root
+# was actually asked to do. This file is the second half, and it is the half a
+# panel compromise cannot rewrite.
+#
+# Two names for who is asking, and they are different facts:
+#
+#   actor    what the panel SAYS the logged-in administrator is called. Caller
+#            text. It grants nothing, and it is recorded because a log with no
+#            name in it cannot answer the only question anyone asks afterwards.
+#   caller   the uid sudo recorded for the invoking process. Not caller text —
+#            sudo sets it and the caller cannot forge it through an env var,
+#            because env_reset drops what the caller set and sudo writes its own.
+#
+# Trusting the first as identity would be a mistake. Omitting it would be worse.
+VPNCTL_AUDIT_DIR=/var/log/vpn55
+VPNCTL_AUDIT_FILE="${VPNCTL_AUDIT_DIR}/vpnctl.log"
+readonly VPNCTL_AUDIT_DIR VPNCTL_AUDIT_FILE
+
+_ctl_audit() {
+    local status="${1:-}" code="${2:-}" message="${3:-}"
+
+    # Never fatal. An unwritable log must not stop a revocation — the write is
+    # the thing being audited, and refusing it to protect the audit trail gets
+    # the priority backwards for a security control whose job is cutting access.
+    if [[ ! -d "$VPNCTL_AUDIT_DIR" ]]; then
+        mkdir -p "$VPNCTL_AUDIT_DIR" 2>/dev/null || return 0
+    fi
+    chmod 0700 "$VPNCTL_AUDIT_DIR" 2>/dev/null || true
+
+    local caller="${SUDO_UID:-}"
+    if [[ -z "$caller" ]]; then
+        caller="$(id -u 2>/dev/null || printf -- '-')"
+    fi
+
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        "$(_ctl_clean "$VPNCTL_ACTOR")" \
+        "$(_ctl_clean "uid:${caller}")" \
+        "$(_ctl_clean "$VPNCTL_VERB")" \
+        "$(_ctl_clean "${VPNCTL_TARGET:--}")" \
+        "$(_ctl_clean "$status")" \
+        "$(_ctl_clean "$code")" \
+        "$(_ctl_clean "$message")" \
+        >> "$VPNCTL_AUDIT_FILE" 2>/dev/null || return 0
+
+    chmod 0600 "$VPNCTL_AUDIT_FILE" 2>/dev/null || true
+    return 0
+}
+
+# ─── Validators ───────────────────────────────────────────────────────────────
+# Strict whitelists, all of them: describe what is allowed and refuse everything
+# else, rather than listing what is dangerous and missing one. Same discipline as
+# the Office Tools spawn() host sanitizer.
+#
+# Each returns 0 or 1 and prints nothing. They are pure — no filesystem, no
+# process, no state — which is what lets --self-test exercise them exhaustively
+# with no root and no side effects.
+
+# A user name. Lowercase letter first, then lowercase letters, digits, `_` and
+# `-`; 2 to 32 characters. Deliberately NARROWER than a POSIX login name,
+# because this string becomes a filename in the registry directory: no name
+# matching this can be `.` or `..`, contain a slash, start with a dash and be
+# read as an option, or collide with the `.conf` / `.creds` suffixes.
+ctl_valid_user() {
+    local v="${1-}"
+    [[ "$v" =~ ^[a-z][a-z0-9_-]{1,31}$ ]]
+}
+
+# A credential id. Wider than a user name because adapters mint these, but still
+# closed: it starts alphanumeric so it can never be read as an option, and it may
+# contain no slash, no `..`, and nothing a shell would look at twice.
+ctl_valid_cred() {
+    local v="${1-}"
+    [[ "$v" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] || return 1
+    [[ "$v" != *".."* ]]
+}
+
+# An adapter tag. This is the only place a caller names a service, and it names
+# it by the tag an adapter registered — never a unit, a binary or a path. The
+# shape check is here; the check that MATTERS is at dispatch, where the tag must
+# match one an adapter actually claimed. A well-formed tag for a service VPN55
+# does not manage is refused there, which is what stops `service-restart` from
+# becoming "restart any unit on this box".
+ctl_valid_tag() {
+    local v="${1-}"
+    [[ "$v" =~ ^[a-z][a-z0-9_]{0,31}$ ]]
+}
+
+# The actor: who the caller says is asking. Recorded in the audit log and used
+# for nothing else — it grants nothing, so it is not a trust decision, but it IS
+# caller-controlled text heading for a log file, which is the exact shape log
+# injection is made of. Same alphabet as a user name.
+ctl_valid_actor() {
+    local v="${1-}"
+    [[ "$v" =~ ^[a-z][a-z0-9_-]{1,31}$ ]]
+}
+
+# A registry field assignment, `key=value`.
+#
+# The key comes from a closed list — the registry's nullable policy fields and
+# nothing else — so a caller cannot set `name` or `created`, and cannot invent a
+# field. The value is checked per key, and an EMPTY value is legal and
+# meaningful: it is the null that means unlimited / never. A validator that
+# rejected the empty string would make it impossible to clear a quota, which is
+# how an "unlimited" account becomes unreachable.
+#
+# `enabled` is deliberately NOT settable here. It has two verbs of its own, and
+# a field assignment that quietly did the same thing would be a second way to
+# reach the same state with a different audit record.
+ctl_valid_field() {
+    local pair="${1-}"
+    [[ "$pair" == *=* ]] || return 1
+
+    local key="${pair%%=*}" value="${pair#*=}"
+    case "$key" in
+        quota_bytes)  [[ -z "$value" || "$value" =~ ^[0-9]+$ ]] ;;
+        conn_limit)   [[ -z "$value" || "$value" =~ ^[1-9][0-9]{0,4}$ ]] ;;
+        expires_at)   [[ -z "$value" || "$value" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}(T[0-9]{2}:[0-9]{2}:[0-9]{2}Z)?$ ]] ;;
+        quota_reset)  [[ -z "$value" || "$value" == "daily" || "$value" == "weekly" || "$value" == "monthly" ]] ;;
+        *)            return 1 ;;
+    esac
+}
+
+# An artifact id — the name of one of the files an adapter offers for a
+# credential. The adapters mint these and a caller names one back, so the shape
+# is the same closed identifier a tag uses. Whether the id is one this
+# credential actually HAS is not answerable here: it is checked against the
+# adapter's own `_artifacts` output at dispatch, which is the only place the
+# question has an answer.
+ctl_valid_artifact() {
+    local v="${1-}"
+    [[ "$v" =~ ^[a-z][a-z0-9_]{0,31}$ ]]
+}
+
+# A locale tag, for the language the handed-over files are written in.
+#
+# It reaches an adapter, which passes it to i18n_render, which builds a PATH
+# from it — `lib/locales/<tag>/<locale>.txt`. So this validator is the thing
+# standing between caller text and an arbitrary file being read as translation
+# text, and it is written as a closed whitelist for that reason rather than as
+# "a reasonable-looking language code".
+#
+# i18n_resolve narrows an unknown tag to the default, so a well-formed tag that
+# ships no catalog is safe rather than an error — but a MALFORMED one never gets
+# that far.
+ctl_valid_locale() {
+    local v="${1-}"
+    [[ "$v" =~ ^[a-z]{2,3}(-[a-z0-9]{2,8})?$ ]] || return 1
+    [[ "$v" != *".."* ]]
+}
+
+# An adapter option, `key=value`, passed through to the adapter's _cred_add.
+#
+# The KEY is validated here. The VALUE cannot be, because this file must not know
+# what any adapter's options mean — that is the contract. What it can guarantee,
+# and does, is that the value is a single argv word of printable text with no
+# tab, newline or control character, so it can never become anything but one
+# argument to one function. The adapter refuses an option it did not declare,
+# which is where "is this value sane" is actually answerable.
+ctl_valid_option() {
+    local pair="${1-}"
+    [[ "$pair" == *=* ]] || return 1
+
+    local key="${pair%%=*}" value="${pair#*=}"
+    [[ "$key" =~ ^[a-z][a-z0-9_]{0,31}$ ]] || return 1
+    (( ${#value} <= 4096 )) || return 1
+    [[ ! "$value" =~ [[:cntrl:]] ]]
+}
+
+# ─── Self-test ────────────────────────────────────────────────────────────────
+# The acceptance evidence for "a malformed argument is rejected by the helper
+# itself". Every rejected case below is an argument a compromised panel could
+# send; every accepted case is one it must still be able to send, because a
+# validator that only rejects is a validator nobody notices has broken the
+# product.
+#
+# Validators only. Nothing is sourced, nothing is written, no root is needed —
+# which is what lets CI run it on every push. A validator checked only by reading
+# it is a validator that regresses silently.
+VPNCTL_TEST_PASS=0
+VPNCTL_TEST_FAIL=0
+
+_ctl_expect() {
+    local fn="${1}" want="${2}" input="${3-}" label="${4:-}"
+    [[ -n "$label" ]] || label="'${input}'"
+
+    local got=0
+    "$fn" "$input" || got=1
+
+    if [[ "$got" == "$want" ]]; then
+        VPNCTL_TEST_PASS=$(( VPNCTL_TEST_PASS + 1 ))
+        return 0
+    fi
+    VPNCTL_TEST_FAIL=$(( VPNCTL_TEST_FAIL + 1 ))
+    local wanted="reject"
+    [[ "$want" == "0" ]] && wanted="accept"
+    printf '  FAIL  %-18s should %s  %s\n' "$fn" "$wanted" "$label" >&2
+    return 0
+}
+
+ctl_self_test() {
+    printf '\n  vpnctl %s — argument validation\n\n' "$VPNCTL_VERSION" >&2
+
+    # ── user names ────────────────────────────────────────────────────────────
+    _ctl_expect ctl_valid_user 0 'anh'
+    _ctl_expect ctl_valid_user 0 'nguyen_van_a'
+    _ctl_expect ctl_valid_user 0 'user-01'
+    _ctl_expect ctl_valid_user 0 'a1'
+    _ctl_expect ctl_valid_user 0 'abcdefghijabcdefghijabcdefghijab' '32 characters — the limit'
+
+    _ctl_expect ctl_valid_user 1 ''    '(empty)'
+    _ctl_expect ctl_valid_user 1 'a'   'a single character'
+    _ctl_expect ctl_valid_user 1 'abcdefghijabcdefghijabcdefghijabc' '33 characters'
+    _ctl_expect ctl_valid_user 1 'Anh'              'uppercase'
+    _ctl_expect ctl_valid_user 1 '1abc'             'a leading digit'
+    _ctl_expect ctl_valid_user 1 '-abc'             'a leading dash — reads as an option'
+    _ctl_expect ctl_valid_user 1 '_abc'             'a leading underscore'
+    _ctl_expect ctl_valid_user 1 '.'                'the current directory'
+    _ctl_expect ctl_valid_user 1 '..'               'the parent directory'
+    _ctl_expect ctl_valid_user 1 '../../etc/passwd' 'path traversal'
+    _ctl_expect ctl_valid_user 1 'a/b'              'a slash'
+    _ctl_expect ctl_valid_user 1 'a b'              'a space'
+    _ctl_expect ctl_valid_user 1 'a;id'             'a command separator'
+    _ctl_expect ctl_valid_user 1 'a$(id)'           'command substitution'
+    _ctl_expect ctl_valid_user 1 'a|id'             'a pipe'
+    _ctl_expect ctl_valid_user 1 'a&id'             'a background operator'
+    _ctl_expect ctl_valid_user 1 'a>b'              'a redirection'
+    _ctl_expect ctl_valid_user 1 'a*'               'a glob'
+    _ctl_expect ctl_valid_user 1 'a?'               'a glob'
+    _ctl_expect ctl_valid_user 1 'a['               'a glob'
+    _ctl_expect ctl_valid_user 1 '~root'            'tilde expansion'
+    _ctl_expect ctl_valid_user 1 '/etc/passwd'      'an absolute path'
+    _ctl_expect ctl_valid_user 1 'a.conf'           'a dot — would collide with the registry suffix'
+    _ctl_expect ctl_valid_user 1 $'a\nb'            'an embedded newline'
+    _ctl_expect ctl_valid_user 1 $'a\tb'            'an embedded tab'
+    _ctl_expect ctl_valid_user 1 'anh '             'a trailing space'
+    _ctl_expect ctl_valid_user 1 ' anh'             'a leading space'
+    _ctl_expect ctl_valid_user 1 'nguyễn'           'non-ASCII'
+
+    # ── credential ids ────────────────────────────────────────────────────────
+    _ctl_expect ctl_valid_cred 0 'x-a1b2c3'
+    _ctl_expect ctl_valid_cred 0 'A1'
+    _ctl_expect ctl_valid_cred 0 'cred.2026-08-29_01'
+    _ctl_expect ctl_valid_cred 0 '9'
+
+    _ctl_expect ctl_valid_cred 1 ''                '(empty)'
+    _ctl_expect ctl_valid_cred 1 '-rf'             'a leading dash — reads as an option'
+    _ctl_expect ctl_valid_cred 1 '.hidden'         'a leading dot'
+    _ctl_expect ctl_valid_cred 1 'a..b'            'dot-dot inside an otherwise legal id'
+    _ctl_expect ctl_valid_cred 1 '../../root/.ssh' 'path traversal'
+    _ctl_expect ctl_valid_cred 1 'a/b'             'a slash'
+    _ctl_expect ctl_valid_cred 1 'a b'             'a space'
+    _ctl_expect ctl_valid_cred 1 'a;id'            'a command separator'
+    _ctl_expect ctl_valid_cred 1 'a$(id)'          'command substitution'
+    _ctl_expect ctl_valid_cred 1 "$(printf 'a%.0s' {1..65})" '65 characters'
+
+    # ── adapter tags ──────────────────────────────────────────────────────────
+    # A well-formed tag that no adapter registered is refused at DISPATCH, not
+    # here — that check needs the adapters loaded, so it cannot be a pure
+    # validator. `alpha` passing this test is not `alpha` being restartable.
+    _ctl_expect ctl_valid_tag 0 'alpha'
+    _ctl_expect ctl_valid_tag 0 'a_tag_2'
+
+    _ctl_expect ctl_valid_tag 1 ''               '(empty)'
+    _ctl_expect ctl_valid_tag 1 'Alpha'          'uppercase'
+    _ctl_expect ctl_valid_tag 1 'a-b'            'a dash — tags are identifiers'
+    _ctl_expect ctl_valid_tag 1 'nginx.service'  'a unit name, not a tag'
+    _ctl_expect ctl_valid_tag 1 '/bin/sh'        'a path'
+    _ctl_expect ctl_valid_tag 1 'a;systemctl'    'a command separator'
+    _ctl_expect ctl_valid_tag 1 '--now'          'an option'
+
+    # ── actors ────────────────────────────────────────────────────────────────
+    _ctl_expect ctl_valid_actor 0 'admin'
+    _ctl_expect ctl_valid_actor 1 ''    '(empty)'
+    _ctl_expect ctl_valid_actor 1 $'admin\nresult\tok\t-\t0\tdone' 'log injection — a forged record line'
+    _ctl_expect ctl_valid_actor 1 'admin;id' 'a command separator'
+
+    # ── registry fields ───────────────────────────────────────────────────────
+    _ctl_expect ctl_valid_field 0 'quota_bytes=107374182400'
+    _ctl_expect ctl_valid_field 0 'quota_bytes='  'the null that means unlimited'
+    _ctl_expect ctl_valid_field 0 'quota_bytes=0' 'zero bytes is a real policy, not a null'
+    _ctl_expect ctl_valid_field 0 'expires_at=2026-12-31'
+    _ctl_expect ctl_valid_field 0 'expires_at=2026-12-31T23:59:59Z'
+    _ctl_expect ctl_valid_field 0 'expires_at='   'the null that means never'
+    _ctl_expect ctl_valid_field 0 'conn_limit=3'
+    _ctl_expect ctl_valid_field 0 'conn_limit='
+    _ctl_expect ctl_valid_field 0 'quota_reset=monthly'
+    _ctl_expect ctl_valid_field 0 'quota_reset='
+
+    _ctl_expect ctl_valid_field 1 'name=root'          'an immutable field'
+    _ctl_expect ctl_valid_field 1 'created=2026-01-01' 'an immutable field'
+    _ctl_expect ctl_valid_field 1 'enabled=1'          'has verbs of its own; not settable as a field'
+    _ctl_expect ctl_valid_field 1 'anything=1'         'an unknown field'
+    _ctl_expect ctl_valid_field 1 'quota_bytes'        'no equals sign'
+    _ctl_expect ctl_valid_field 1 'quota_bytes=-1'     'negative'
+    _ctl_expect ctl_valid_field 1 'quota_bytes=1e9'    'not a whole number'
+    _ctl_expect ctl_valid_field 1 'quota_bytes=1 000'  'a space'
+    _ctl_expect ctl_valid_field 1 'conn_limit=0'       'zero devices is a lockout, not a limit'
+    _ctl_expect ctl_valid_field 1 'expires_at=yesterday'        'free text'
+    _ctl_expect ctl_valid_field 1 'expires_at=2026-12-31 23:59' 'a space instead of T'
+    _ctl_expect ctl_valid_field 1 'quota_reset=hourly'          'outside the vocabulary'
+    _ctl_expect ctl_valid_field 1 $'quota_bytes=1\nname=root'   'a second field smuggled in on a newline'
+
+    # ── adapter options ───────────────────────────────────────────────────────
+    _ctl_expect ctl_valid_option 0 'pubkey=abcDEF123+/=' 'opaque to this file, by contract'
+    _ctl_expect ctl_valid_option 0 'note=a b c'          'spaces are fine inside one argv word'
+    _ctl_expect ctl_valid_option 0 'x='                  'an empty value is a value'
+
+    _ctl_expect ctl_valid_option 1 'pubkey'   'no equals sign'
+    _ctl_expect ctl_valid_option 1 'Pub=x'    'an uppercase key'
+    _ctl_expect ctl_valid_option 1 '1key=x'   'a leading digit in the key'
+    _ctl_expect ctl_valid_option 1 'a-b=x'    'a dash in the key'
+    _ctl_expect ctl_valid_option 1 $'k=a\nb'  'a newline in the value'
+    _ctl_expect ctl_valid_option 1 $'k=a\tb'  'a tab in the value'
+    _ctl_expect ctl_valid_option 1 "k=$(printf 'a%.0s' {1..4097})" 'over the length cap'
+
+    # ── artifact ids ──────────────────────────
+    # Whether the credential HAS this artifact is checked at dispatch against
+    # the adapter's own list. This is only the shape.
+    _ctl_expect ctl_valid_artifact 0 'conf'
+    _ctl_expect ctl_valid_artifact 0 'instructions'
+    _ctl_expect ctl_valid_artifact 0 'ca'
+
+    _ctl_expect ctl_valid_artifact 1 ''            '(empty)'
+    _ctl_expect ctl_valid_artifact 1 'Conf'        'uppercase'
+    _ctl_expect ctl_valid_artifact 1 '../../etc/shadow' 'path traversal'
+    _ctl_expect ctl_valid_artifact 1 'a-b'         'a dash — artifact ids are identifiers'
+    _ctl_expect ctl_valid_artifact 1 'a.b'         'a dot'
+    _ctl_expect ctl_valid_artifact 1 '-x'          'a leading dash — reads as an option'
+    _ctl_expect ctl_valid_artifact 1 'a;id'        'a command separator'
+
+    # ── locale tags ───────────────────────────
+    # This one becomes part of a PATH inside i18n_render, so the traversal cases
+    # matter more here than the shape does.
+    _ctl_expect ctl_valid_locale 0 'vi'
+    _ctl_expect ctl_valid_locale 0 'en'
+    _ctl_expect ctl_valid_locale 0 'fr'
+    _ctl_expect ctl_valid_locale 0 'vi-vn'  'a region is narrowed by i18n_resolve, not refused'
+    _ctl_expect ctl_valid_locale 0 'zzz'    'a tag we ship no catalog for resolves to the default'
+
+    _ctl_expect ctl_valid_locale 1 ''           '(empty)'
+    _ctl_expect ctl_valid_locale 1 '..'         'the parent directory'
+    _ctl_expect ctl_valid_locale 1 '../../../etc/passwd' 'path traversal'
+    _ctl_expect ctl_valid_locale 1 'vi/../../en' 'traversal that ends somewhere legal'
+    _ctl_expect ctl_valid_locale 1 'e'          'one letter'
+    _ctl_expect ctl_valid_locale 1 'EN'         'uppercase'
+    _ctl_expect ctl_valid_locale 1 'en_US'      'an underscore — POSIX form, not BCP 47'
+    _ctl_expect ctl_valid_locale 1 'en.UTF-8'   'a codeset suffix'
+
+    printf '\n  %s passed, %s failed\n' "$VPNCTL_TEST_PASS" "$VPNCTL_TEST_FAIL" >&2
+    if [[ "$VPNCTL_TEST_FAIL" -gt 0 ]]; then
+        printf '  A malformed argument is NOT being rejected by the helper.\n\n' >&2
+        return 1
+    fi
+    printf '  Every malformed argument above was rejected by the helper itself.\n\n' >&2
+    return 0
+}
+
+# ─── Libraries ────────────────────────────────────────────────────────────────
+# Loaded only once a verb has been accepted and its arguments have passed. Doing
+# the cheap, pure checks before sourcing anything means a malformed argument
+# never reaches a single line of library code.
+#
+# Every library call below is made in a ||-guarded form, which is the shape they
+# are written for: errexit is disabled inside a ||-guarded function body, and the
+# libs guard their own filesystem commands accordingly. Calling them with errexit
+# live would be the unusual case, not the safe one.
+_ctl_load_libs() {
+    # shellcheck source=../lib/ui.sh
+    . "$VPN55_ROOT/lib/ui.sh"           || return 1
+    # shellcheck source=../lib/core_fs.sh
+    . "$VPN55_ROOT/lib/core_fs.sh"      || return 1
+    # shellcheck source=../lib/core_i18n.sh
+    . "$VPN55_ROOT/lib/core_i18n.sh"    || return 1
+    # shellcheck source=../lib/core_distro.sh
+    . "$VPN55_ROOT/lib/core_distro.sh"  || return 1
+    # shellcheck source=../lib/core_net.sh
+    . "$VPN55_ROOT/lib/core_net.sh"     || return 1
+    # shellcheck source=../lib/core_users.sh
+    . "$VPN55_ROOT/lib/core_users.sh"   || return 1
+    # shellcheck source=../lib/core_pki.sh
+    . "$VPN55_ROOT/lib/core_pki.sh"     || return 1
+    # shellcheck source=../lib/core_adapters.sh
+    . "$VPN55_ROOT/lib/core_adapters.sh" || return 1
+    return 0
+}
+
+# Adapters are loaded only by the three verbs that need one. user-add and the
+# enable/disable pair touch the registry alone, and loading three protocol
+# modules to write one line into a text file is work that can only fail.
+_ctl_load_adapters() {
+    vpn_adapter_load "$VPN55_ROOT/lib" || return 1
+    return 0
+}
+
+# Resolve a tag to a REGISTERED adapter, or fail. This is the authorisation
+# check for service-restart: the shape check said the string is an identifier,
+# and this says an adapter claimed it. Without the second, `service-restart` is
+# "restart anything on this box that answers to a name".
+_ctl_require_adapter() {
+    local tag="${1:-}"
+    if ! vpn_adapter_known "$tag"; then
+        ctl_fail "$E_TARGET" "no adapter is registered under the tag '${tag}'"
+    fi
+    return 0
+}
+
+# ─── Verbs ────────────────────────────────────────────────────────────────────
+
+# user-add <name> [quota_bytes=… expires_at=… conn_limit=… quota_reset=…]
+#
+# Every policy field is optional and every one defaults to null, which means
+# unlimited / never. That is what lets one codebase serve an own-fleet
+# deployment and a paid tier without a fork.
+verb_user_add() {
+    local name="${1:-}"
+    shift || true
+    ctl_valid_user "$name" || ctl_fail "$E_ARG" "invalid user name"
+    VPNCTL_TARGET="$name"
+
+    local -a fields=()
+    local pair
+    for pair in "$@"; do
+        ctl_valid_field "$pair" || ctl_fail "$E_ARG" "invalid field assignment '${pair%%=*}'"
+        fields+=("$pair")
+    done
+
+    _ctl_load_libs || ctl_fail "$E_FAILED" "cannot load the VPN55 libraries"
+
+    users_init || ctl_fail "$E_FAILED" "cannot prepare the user registry"
+    if users_exists "$name"; then
+        ctl_fail "$E_ARG" "a user named '${name}' already exists"
+    fi
+
+    users_add "$name" ${fields[@]+"${fields[@]}"} \
+        || ctl_fail "$E_FAILED" "the registry refused to create '${name}'"
+
+    ctl_detail user "$name"
+    ctl_ok "user created"
+}
+
+# user-remove <name>
+#
+# There is deliberately NO force flag. The registry refuses while any credential
+# is still active, because a peer left behind by a deleted user is working access
+# with nobody accountable for it — and a helper that offered a way past that
+# check would be offering the panel a way to create exactly that state. The panel
+# revokes the credentials first, through cred-revoke, and each revocation gets
+# its own audit record. That is the feature, not the friction.
+verb_user_remove() {
+    local name="${1:-}"
+    ctl_valid_user "$name" || ctl_fail "$E_ARG" "invalid user name"
+    [[ $# -eq 1 ]] || ctl_fail "$E_USAGE" "user-remove takes exactly one argument"
+    VPNCTL_TARGET="$name"
+
+    _ctl_load_libs || ctl_fail "$E_FAILED" "cannot load the VPN55 libraries"
+    users_exists "$name" || ctl_fail "$E_TARGET" "no such user"
+
+    local active
+    active="$(users_cred_list "$name" active 2>/dev/null | grep -c . || true)"
+    if [[ "${active:-0}" -gt 0 ]]; then
+        ctl_detail active_credentials "${active}"
+        ctl_fail "$E_FAILED" "revoke this user's ${active} active credential(s) first"
+    fi
+
+    users_remove "$name" || ctl_fail "$E_FAILED" "the registry refused to remove '${name}'"
+    ctl_ok "user removed"
+}
+
+# user-enable <name> / user-disable <name>
+#
+# ── What disabling does, and what it does not ─────────────────────────────────
+# It sets a policy flag in the registry. The panel and the portal read it, so a
+# disabled person cannot be issued anything new and cannot fetch a config.
+#
+# It does NOT end an existing tunnel, and it does not stop one from coming back
+# up. There is no protocol here that can suspend a credential and then restore
+# it: revocation is the only lever, and it is one-way. So a disabled user with
+# live credentials is still carrying traffic, and this verb SAYS SO in a detail
+# record rather than reporting a clean success that the operator would read as
+# "access cut". Reporting "disabled" while the device still connects is the same
+# class of lie as reporting a revocation that has not taken effect.
+_ctl_set_enabled() {
+    local name="${1:-}" want="${2:-}"
+    ctl_valid_user "$name" || ctl_fail "$E_ARG" "invalid user name"
+    VPNCTL_TARGET="$name"
+
+    _ctl_load_libs || ctl_fail "$E_FAILED" "cannot load the VPN55 libraries"
+    users_exists "$name" || ctl_fail "$E_TARGET" "no such user"
+
+    if [[ "$want" == "1" ]]; then
+        users_enable "$name" || ctl_fail "$E_FAILED" "the registry refused to enable '${name}'"
+        ctl_ok "user enabled"
+    fi
+
+    users_disable "$name" || ctl_fail "$E_FAILED" "the registry refused to disable '${name}'"
+
+    local active
+    active="$(users_cred_list "$name" active 2>/dev/null | grep -c . || true)"
+    ctl_detail active_credentials "${active:-0}"
+    if [[ "${active:-0}" -gt 0 ]]; then
+        ctl_detail access_cut "0"
+        ctl_ok "user disabled in the registry; ${active} credential(s) still carry traffic — revoke them to cut access"
+    fi
+    ctl_detail access_cut "1"
+    ctl_ok "user disabled"
+}
+
+verb_user_enable() {
+    [[ $# -eq 1 ]] || ctl_fail "$E_USAGE" "user-enable takes exactly one argument"
+    _ctl_set_enabled "${1:-}" 1
+}
+
+verb_user_disable() {
+    [[ $# -eq 1 ]] || ctl_fail "$E_USAGE" "user-disable takes exactly one argument"
+    _ctl_set_enabled "${1:-}" 0
+}
+
+# cred-add <user> <adapter-tag> [key=value …]
+#
+# The option keys and values are opaque here by contract — this file must not
+# learn what any adapter's options mean. It guarantees each is one argv word of
+# printable text and hands them over; the adapter refuses one it did not declare,
+# which is where the question is actually answerable.
+verb_cred_add() {
+    local name="${1:-}" tag="${2:-}"
+    shift 2 2>/dev/null || ctl_fail "$E_USAGE" "cred-add <user> <service> [key=value …]"
+
+    ctl_valid_user "$name" || ctl_fail "$E_ARG" "invalid user name"
+    ctl_valid_tag "$tag"   || ctl_fail "$E_ARG" "invalid service tag"
+    VPNCTL_TARGET="${name}/${tag}"
+
+    local -a opts=()
+    local pair
+    for pair in "$@"; do
+        ctl_valid_option "$pair" || ctl_fail "$E_ARG" "invalid option '${pair%%=*}'"
+        opts+=("$pair")
+    done
+
+    _ctl_load_libs || ctl_fail "$E_FAILED" "cannot load the VPN55 libraries"
+    _ctl_load_adapters || ctl_fail "$E_FAILED" "cannot load the protocol adapters"
+    _ctl_require_adapter "$tag"
+
+    users_exists "$name" || ctl_fail "$E_TARGET" "no such user"
+
+    # An issued credential for a disabled or expired account is access the policy
+    # already says this person should not have. Refusing here rather than in the
+    # panel means it is refused however the panel is reached.
+    local state
+    state="$(users_state "$name" 2>/dev/null || true)"
+    if [[ "$state" != "active" ]]; then
+        ctl_detail user_state "${state:-unknown}"
+        ctl_fail "$E_FAILED" "this account is '${state:-unknown}' — enable it before issuing a credential"
+    fi
+
+    # Captured through command substitution, which also disables errexit for the
+    # adapter's whole body — the shape every lib in this project is written for.
+    local cred=""
+    cred="$(vpn_adapter_call "$tag" cred_add "$name" ${opts[@]+"${opts[@]}"})" \
+        || ctl_fail "$E_FAILED" "the service refused to issue a credential"
+    [[ -n "$cred" ]] || ctl_fail "$E_FAILED" "the service returned no credential id"
+
+    ctl_detail cred_id "$cred"
+    ctl_detail service "$tag"
+    ctl_ok "credential issued"
+}
+
+# cred-revoke <cred_id> [adapter-tag]
+#
+# The owning adapter is resolved from the REGISTRY, not from the caller: the
+# credential rows carry the tag of whichever adapter created them, so the panel
+# cannot aim a revocation at the wrong service. The optional tag is the fallback
+# for a credential that exists on a server but never made it into the registry —
+# it still has to be a registered tag, and it is only consulted when the lookup
+# found nothing.
+#
+# One verb, three genuinely different operations. The adapter reports what it
+# actually achieved and that is passed through verbatim: an adapter that managed
+# to end the live session says so and is believed, because over-warning on the
+# days it is instant is how an operator learns to ignore the warning on the day
+# it is not.
+verb_cred_revoke() {
+    local cred="${1:-}" tag="${2:-}"
+    [[ $# -ge 1 && $# -le 2 ]] || ctl_fail "$E_USAGE" "cred-revoke <cred_id> [service]"
+
+    ctl_valid_cred "$cred" || ctl_fail "$E_ARG" "invalid credential id"
+    if [[ -n "$tag" ]]; then
+        ctl_valid_tag "$tag" || ctl_fail "$E_ARG" "invalid service tag"
+    fi
+    VPNCTL_TARGET="$cred"
+
+    _ctl_load_libs || ctl_fail "$E_FAILED" "cannot load the VPN55 libraries"
+    _ctl_load_adapters || ctl_fail "$E_FAILED" "cannot load the protocol adapters"
+
+    local row owner=""
+    if row="$(users_cred_find "$cred" 2>/dev/null)"; then
+        owner="$(printf '%s' "$row" | cut -f2)"
+        ctl_detail user "$(printf '%s' "$row" | cut -f1)"
+    fi
+    if [[ -z "$owner" ]]; then
+        owner="$tag"
+    fi
+    [[ -n "$owner" ]] || ctl_fail "$E_TARGET" "this credential is in no registry record; name its service explicitly"
+    ctl_valid_tag "$owner" || ctl_fail "$E_TARGET" "the registry holds an unusable service tag for this credential"
+    _ctl_require_adapter "$owner"
+
+    local out=""
+    out="$(vpn_adapter_call "$owner" cred_remove "$cred")" \
+        || ctl_fail "$E_FAILED" "the service refused to revoke '${cred}'"
+
+    # revoked <tag> <cred_id> <latency> <worst_case_seconds>
+    local latency seconds
+    latency="$(printf '%s\n' "$out" | awk -F'\t' '$1 == "revoked" { print $4; exit }')"
+    seconds="$(printf '%s\n' "$out" | awk -F'\t' '$1 == "revoked" { print $5; exit }')"
+
+    ctl_detail service  "$owner"
+    ctl_detail latency  "${latency:-unknown}"
+    ctl_detail latency_seconds "${seconds:--1}"
+
+    if [[ "$latency" == "immediate" ]]; then
+        ctl_ok "credential revoked — access ended now"
+    fi
+    ctl_ok "credential revoked — an established session may continue; see latency"
+}
+
+# cred-config <user> <cred_id> [artifact] [locale]
+#
+# The one verb here that reads instead of writing, and the only one that decides
+# for itself WHO is allowed to ask.
+#
+# ── Why the user is an argument and not an assumption ──────────
+#
+# Every other verb takes the target alone and trusts the panel to have decided
+# that the caller may act on it. That is right for an operator's console: an
+# administrator may revoke anybody's credential, and a helper second-guessing
+# that would only be in the way.
+#
+# The self-serve portal is the opposite situation. It is reached by the people
+# being served, one session per person, and the thing it hands back is a private
+# key. So the caller must name whose credential it thinks this is, and the
+# REGISTRY decides whether that is true. A bug in the portal's own ownership
+# check — an id read out of a URL, a session mixed up under load — then costs
+# nothing, because the answer was never the panel's to give.
+#
+# ── One answer for three different situations ─────────────────
+#
+# "no such credential for this user" is returned for a credential that does not
+# exist, one that belongs to somebody else, and one that has been revoked. That
+# is deliberate, and it is why the message is worded so blandly. A helper that
+# said "that credential belongs to another user" would confirm the id is real,
+# and confirming which ids are real is most of what an attacker changing a
+# number in a URL is trying to learn.
+#
+# ── What comes back ────────────────────────────────────────────
+#
+#   artifact  <id>  <label>  <filename>  <text|base64>  <qr>  <note>
+#             One per configuration this credential still has — the adapter's
+#             own records, passed through untouched. A list rather than just the
+#             one delivered, so a caller can offer the others without asking
+#             again and without a second root call per credential.
+#   detail    body_b64  <base64 of the FILE'S BYTES>
+#
+# body_b64 is always base64, whatever the artifact's own encoding is, because a
+# record stream is line-based and a configuration is not. `encoding` still rides
+# along and still means what the contract says: `text` promises the decoded
+# bytes are text, which is what makes a QR meaningful; `base64` says they are
+# not. Normalising both into one transport encoding here is what stops every
+# caller having to get that distinction right a second time.
+verb_cred_config() {
+    local name="${1:-}" cred="${2:-}" artifact="${3:-}" locale="${4:-}"
+    [[ $# -ge 2 && $# -le 4 ]] || ctl_fail "$E_USAGE" "cred-config <user> <cred_id> [artifact] [locale]"
+
+    ctl_valid_user "$name" || ctl_fail "$E_ARG" "invalid user name"
+    ctl_valid_cred "$cred" || ctl_fail "$E_ARG" "invalid credential id"
+    if [[ -n "$artifact" ]]; then
+        ctl_valid_artifact "$artifact" || ctl_fail "$E_ARG" "invalid artifact id"
+    fi
+    if [[ -n "$locale" ]]; then
+        ctl_valid_locale "$locale" || ctl_fail "$E_ARG" "invalid locale"
+    fi
+    VPNCTL_TARGET="${name}/${cred}"
+
+    _ctl_load_libs || ctl_fail "$E_FAILED" "cannot load the VPN55 libraries"
+    _ctl_load_adapters || ctl_fail "$E_FAILED" "cannot load the protocol adapters"
+
+    # ─── Ownership, from the registry ──────────
+    # users_cred_find prints  name<TAB>owner<TAB>created<TAB>state  and returns
+    # 1 when the id appears in no record at all.
+    local row="" holder="" owner="" cred_state=""
+    row="$(users_cred_find "$cred" 2>/dev/null)" || row=""
+    if [[ -n "$row" ]]; then
+        holder="$(printf '%s' "$row" | cut -f1)"
+        owner="$(printf '%s' "$row" | cut -f2)"
+        cred_state="$(printf '%s' "$row" | cut -f4)"
+    fi
+    if [[ -z "$row" || "$holder" != "$name" || "$cred_state" != "active" ]]; then
+        ctl_fail "$E_TARGET" "no such credential for this user"
+    fi
+
+    # A disabled or expired account cannot fetch a configuration. Refusing here
+    # rather than in the portal means it is refused however the portal is
+    # reached — and it is the other half of what `user-disable` promises. That
+    # verb says it stops new credentials being issued AND stops a configuration
+    # being fetched; this is the line that makes the second half true.
+    local ustate
+    ustate="$(users_state "$name" 2>/dev/null || true)"
+    if [[ "$ustate" != "active" ]]; then
+        ctl_detail user_state "${ustate:-unknown}"
+        ctl_fail "$E_FAILED" "this account is '${ustate:-unknown}' — it cannot fetch a configuration"
+    fi
+
+    ctl_valid_tag "$owner" || ctl_fail "$E_TARGET" "the registry holds an unusable service tag for this credential"
+    _ctl_require_adapter "$owner"
+
+    # ─── What this credential still has ────────
+    # An empty list is an expected end state, not a fault: the adapters shred a
+    # spooled key some hours after issue, and after that there is genuinely
+    # nothing left to hand over. It is reported as an unknown target so the
+    # caller offers a rotation rather than a retry.
+    local rows=""
+    rows="$(vpn_adapter_call "$owner" artifacts "$cred")" \
+        || ctl_fail "$E_FAILED" "the service could not list this credential's configurations"
+    [[ -n "$rows" ]] || ctl_fail "$E_TARGET" "this credential has no configuration left to hand out"
+    printf '%s\n' "$rows"
+
+    local want="$artifact"
+    if [[ -z "$want" ]]; then
+        want="$(printf '%s\n' "$rows" | awk -F'\t' '$1 == "artifact" { print $2; exit }')"
+    fi
+    [[ -n "$want" ]] || ctl_fail "$E_TARGET" "this credential has no configuration left to hand out"
+
+    local meta
+    meta="$(printf '%s\n' "$rows" | awk -F'\t' -v w="$want" '$1 == "artifact" && $2 == w { print; exit }')"
+    [[ -n "$meta" ]] || ctl_fail "$E_TARGET" "this credential has no '${want}' configuration to hand out"
+
+    # The record type and the id are already known, so they are read into `_`
+    # rather than into names nothing goes on to use — an unused local draws a
+    # lint warning, and leaves a reader wondering what it was for.
+    #
+    # (Do not start that sentence with the linter's own name. A comment whose
+    # first word is `shellcheck` is parsed as a DIRECTIVE, and an unparseable
+    # directive is an error, not a warning — it failed the whole CI job.)
+    local label filename encoding qr note
+    IFS=$'\t' read -r _ _ label filename encoding qr note <<< "$meta"
+
+    # The file name is the adapter's, and the caller will use it to name a
+    # download. Checked here rather than trusted, exactly as vpn55.sh checks it
+    # before writing into the operator's working directory — a name with a slash
+    # in it is not a file name, it is a path.
+    case "$filename" in
+        ""|*/*|.*) ctl_fail "$E_FAILED" "the service returned an unusable file name" ;;
+    esac
+
+    local body=""
+    body="$(vpn_adapter_call "$owner" client_config "$cred" "$want" "$locale")" \
+        || ctl_fail "$E_FAILED" "the service refused to produce this configuration"
+
+    # ─── One transport encoding ────────────
+    # `base64` without -w0: busybox's base64 has no such option and this runs on
+    # whatever the host happens to ship. The line folding is stripped instead.
+    local b64=""
+    if [[ "$encoding" == "base64" ]]; then
+        # Already base64 of the file's bytes — the adapter encoded it because it
+        # is not text. Re-encoding would double it; only the folding goes.
+        b64="$(printf '%s' "$body" | tr -d '[:space:]')"
+    else
+        # Command substitution ate the trailing newline on the way in. It is put
+        # back, because a configuration file without a final newline is a file
+        # that some parsers read one line short.
+        b64="$(printf '%s\n' "$body" | base64 | tr -d '\n')"
+    fi
+    [[ -n "$b64" ]] || ctl_fail "$E_FAILED" "the configuration came back empty"
+
+    ctl_detail service  "$owner"
+    ctl_detail artifact "$want"
+    ctl_detail label    "$label"
+    ctl_detail filename "$filename"
+    ctl_detail encoding "${encoding:-text}"
+    ctl_detail qr       "${qr:-0}"
+    ctl_detail note     "$note"
+    ctl_detail locale   "$locale"
+    ctl_detail body_b64 "$b64"
+    ctl_ok "configuration delivered"
+}
+
+# service-restart <adapter-tag>
+#
+# The tag must be one an adapter registered. That check is the whole verb: with
+# it, the panel can restart the tunnel services VPN55 manages; without it, the
+# panel can restart any unit on the box, which is a different and much larger
+# permission wearing the same name.
+verb_service_restart() {
+    local tag="${1:-}"
+    [[ $# -eq 1 ]] || ctl_fail "$E_USAGE" "service-restart takes exactly one argument"
+    ctl_valid_tag "$tag" || ctl_fail "$E_ARG" "invalid service tag"
+    VPNCTL_TARGET="$tag"
+
+    _ctl_load_libs || ctl_fail "$E_FAILED" "cannot load the VPN55 libraries"
+    _ctl_load_adapters || ctl_fail "$E_FAILED" "cannot load the protocol adapters"
+    _ctl_require_adapter "$tag"
+
+    local out="" rc=0
+    out="$(vpn_adapter_call "$tag" restart)" || rc=$?
+
+    # restarted <tag> <ok|failed> <disruption> <message>
+    local state disruption message
+    state="$(printf '%s\n' "$out"      | awk -F'\t' '$1 == "restarted" { print $3; exit }')"
+    disruption="$(printf '%s\n' "$out" | awk -F'\t' '$1 == "restarted" { print $4; exit }')"
+    message="$(printf '%s\n' "$out"    | awk -F'\t' '$1 == "restarted" { print $5; exit }')"
+
+    ctl_detail service "$tag"
+    ctl_detail disruption "${disruption:-sessions-dropped}"
+
+    if [[ "$rc" -ne 0 || "$state" != "ok" ]]; then
+        ctl_fail "$E_FAILED" "${message:-the service did not come back up}"
+    fi
+    ctl_ok "${message:-service restarted}"
+}
+
+# ─── Usage ────────────────────────────────────────────────────────────────────
+ctl_usage() {
+    cat >&2 <<USAGE
+vpnctl ${VPNCTL_VERSION} — the VPN55 privileged helper.
+
+  The only thing in VPN55 that runs as root on behalf of the panel. It takes
+  eight verbs and nothing else — seven that change the host, and one that reads
+  back a credential's own configuration. No verb accepts a command, a path or a
+  shell fragment, and every argument is validated in here rather than by the
+  caller.
+
+Usage:
+  vpnctl [--actor <name>] <verb> [arguments]
+
+Verbs:
+  user-add        <name> [quota_bytes=N] [expires_at=YYYY-MM-DD] [conn_limit=N]
+                         [quota_reset=daily|weekly|monthly]
+  user-remove     <name>            refuses while any credential is still active
+  user-enable     <name>
+  user-disable    <name>            a policy flag; it does NOT end a live tunnel
+  cred-add        <name> <service> [key=value …]
+  cred-revoke     <cred_id> [service]
+  service-restart <service>         <service> is a registered adapter tag
+
+Read:
+  cred-config     <user> <cred_id> [artifact] [locale]
+                  That user's own configuration, and only theirs. The registry
+                  decides whether the person holds the credential; an id
+                  belonging to somebody else is refused in exactly the same
+                  words as one that does not exist.
+
+Options:
+  --actor <name>  who the caller says is asking; recorded in the audit log and
+                  used for nothing else. It grants nothing.
+  --verbs         print the verb list, one per line, and exit
+  --self-test     run the argument validators; no root, no side effects
+  --version       print the version and exit
+  --help          this text
+
+Output on stdout, tab-separated, first field is the record type:
+  result    <ok|error>  <verb>  <target>  <code>  <message>
+  detail    <key>  <value>
+  artifact  <id> <label> <filename> <text|base64> <qr> <note>   (cred-config)
+
+Exit codes:
+  ${E_OK}  success        ${E_USAGE}  usage        ${E_ARG}  bad argument
+  ${E_PRIV}  not root       ${E_TARGET}  unknown target   ${E_FAILED}  action failed
+
+Audit log: ${VPNCTL_AUDIT_FILE} (root only)
+USAGE
+}
+
+# ─── Entry point ──────────────────────────────────────────────────────────────
+main() {
+    # The read-only introspection options are answered before anything else:
+    # they need no root, source nothing, and touch nothing. A caller must be able
+    # to ask "what can you do" without being privileged to do any of it.
+    case "${1:-}" in
+        --help|-h)   ctl_usage; return "$E_OK" ;;
+        --version)   printf '%s\n' "$VPNCTL_VERSION"; return "$E_OK" ;;
+        --verbs)     printf '%s\n' "${VPNCTL_VERBS[@]}"; return "$E_OK" ;;
+        --self-test)
+            # Explicitly captured rather than left to errexit: the point of this
+            # mode is a legible pass/fail, and "the shell exited somewhere" is not
+            # the same answer as "the validators rejected what they should".
+            local st=0
+            ctl_self_test || st=$?
+            return "$st" ;;
+        "")          ctl_usage; return "$E_USAGE" ;;
+    esac
+
+    trap _ctl_on_exit EXIT
+
+    # Global options, which must precede the verb. `--` ends them, so a verb can
+    # never be swallowed by an option parser.
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --actor)
+                [[ $# -ge 2 ]] || ctl_fail "$E_USAGE" "--actor needs a value"
+                ctl_valid_actor "$2" || ctl_fail "$E_ARG" "invalid actor name"
+                VPNCTL_ACTOR="$2"
+                shift 2 ;;
+            --actor=*)
+                ctl_valid_actor "${1#*=}" || ctl_fail "$E_ARG" "invalid actor name"
+                VPNCTL_ACTOR="${1#*=}"
+                shift ;;
+            --) shift; break ;;
+            -*) ctl_fail "$E_USAGE" "unknown option" ;;
+            *)  break ;;
+        esac
+    done
+
+    local verb="${1:-}"
+    shift || true
+    [[ -n "$verb" ]] || ctl_fail "$E_USAGE" "no verb given"
+
+    # Closed set, matched exactly. An unknown verb is refused HERE, before the
+    # root check and before anything is loaded, so a probe learns nothing about
+    # the host from how long a refusal took.
+    local known=0 v
+    for v in "${VPNCTL_VERBS[@]}"; do
+        if [[ "$verb" == "$v" ]]; then known=1; break; fi
+    done
+    VPNCTL_VERB="$verb"
+    if [[ "$known" -ne 1 ]]; then
+        VPNCTL_VERB="-"
+        ctl_fail "$E_USAGE" "unknown verb"
+    fi
+
+    # Root, for every verb. There is no verb here that does something useful
+    # unprivileged, and a partial run as the wrong user leaves root-owned files
+    # in a directory the service user then cannot write.
+    if [[ "$(id -u 2>/dev/null || printf '1')" != "0" ]]; then
+        ctl_fail "$E_PRIV" "vpnctl must run as root"
+    fi
+
+    case "$verb" in
+        user-add)        verb_user_add        "$@" ;;
+        user-remove)     verb_user_remove     "$@" ;;
+        user-enable)     verb_user_enable     "$@" ;;
+        user-disable)    verb_user_disable    "$@" ;;
+        cred-add)        verb_cred_add        "$@" ;;
+        cred-revoke)     verb_cred_revoke     "$@" ;;
+        service-restart) verb_service_restart "$@" ;;
+        cred-config)     verb_cred_config     "$@" ;;
+    esac
+
+    # Every verb above exits through ctl_ok or ctl_fail. Reaching this line means
+    # one of them returned instead, which is a bug in this file rather than a
+    # condition on the server — so it is reported as a failure, not as silence.
+    ctl_fail "$E_FAILED" "the verb returned without a result"
+}
+
+main "$@"

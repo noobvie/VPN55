@@ -1,0 +1,26 @@
+# Node
+node_modules/
+npm-debug.log*
+package-lock.json
+
+# Runtime state — never committed. Lives on the server under /etc/vpn55 and
+# /var/lib/vpn55; anything of this shape in the tree is an accident.
+*.key
+*.pem
+*.p12
+*.crt
+*.csr
+*.mobileconfig
+*.ovpn
+*.conf.local
+users.json
+panel/data/
+panel/sessions/
+
+# Local
+.env
+*.log
+.DS_Store
+
+# Release artifacts — built by tools/release.sh, published, never committed.
+dist/

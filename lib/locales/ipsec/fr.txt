@@ -1,0 +1,96 @@
+@@ main
+VPN55 — installation IKEv2
+==========================
+
+  Serveur              {endpoint}
+  Identité du serveur  {endpoint}
+  Identifiant          {cred}   (délivré à {user})
+  Autorité émettrice   {ca_cn}
+  Phrase secrète       {pass}
+
+La phrase secrète ci-dessus déverrouille vpn55-{cred}.p12. Elle n'est affichée
+qu'une fois. Ce serveur ne conserve aucune copie de votre clé privée : si le
+paquet est perdu, la réponse est un nouvel identifiant, jamais un renvoi.
+
+Tout ce qui suit est la même identité, présentée de trois façons. Utilisez celle
+qui correspond à votre appareil ; les autres ne vous servent à rien.
+
+
+iOS et macOS
+------------
+  1. Transférez vpn55-{cred}.mobileconfig sur l'appareil — AirDrop, courriel à
+     vous-même, ou lien de téléchargement. L'ouvrir depuis un message suffit.
+  2. iOS :   Réglages > Profil téléchargé > Installer.
+     macOS : Réglages Système > Général > VPN et gestion des appareils >
+             Installer.
+  3. Connectez-vous depuis Réglages > VPN.
+
+  Le profil contient le certificat de l'autorité et votre identité : il n'y a
+  rien d'autre à importer et aucune phrase secrète à saisir.
+
+
+Windows 10 et 11
+----------------
+Ouvrez PowerShell EN TANT QU'ADMINISTRATEUR, dans le dossier contenant
+vpn55-ca.crt et vpn55-{cred}.p12.
+
+  # 1. Faire confiance à l'autorité émettrice.
+  Import-Certificate -FilePath .\vpn55-ca.crt `
+      -CertStoreLocation Cert:\LocalMachine\Root
+
+  # 2. Installer l'identité de cet appareil.
+  $p = ConvertTo-SecureString -String '{pass}' -AsPlainText -Force
+  Import-PfxCertificate -FilePath .\vpn55-{cred}.p12 `
+      -CertStoreLocation Cert:\LocalMachine\My -Password $p
+
+  # 3. Créer la connexion.
+  Add-VpnConnection -Name 'VPN55' -ServerAddress '{endpoint}' `
+      -TunnelType Ikev2 -AuthenticationMethod MachineCertificate `
+      -EncryptionLevel Required -SplitTunneling $false -RememberCredential
+
+  # 4. OBLIGATOIRE — ce n'est ni une option ni un durcissement supplémentaire.
+  #    Windows propose par défaut Diffie-Hellman 1024 bits et SHA-1. Ce serveur
+  #    n'accepte ni l'un ni l'autre : sans cette étape la connexion échoue avec
+  #    une erreur de correspondance de stratégie peu explicite. C'est cette
+  #    commande qui la fait fonctionner.
+  Set-VpnConnectionIPsecConfiguration -ConnectionName 'VPN55' `
+      -AuthenticationTransformConstants GCMAES256 `
+      -CipherTransformConstants GCMAES256 `
+      -EncryptionMethod AES256 -IntegrityCheckMethod SHA256 `
+      -DHGroup Group14 -PfsGroup PFS2048 -Force
+
+Connectez-vous ensuite depuis Paramètres > Réseau et Internet > VPN.
+
+
+Android
+-------
+  1. Installez « strongSwan VPN Client » depuis le Play Store ou F-Droid.
+  2. Copiez vpn55-{cred}.p12 sur l'appareil.
+  3. Dans l'application : CA certificates > menu > Import certificate —
+     choisissez le .p12 et saisissez la phrase secrète ci-dessus.
+  4. Ajoutez un profil VPN :
+       Server         {endpoint}
+       VPN Type       IKEv2 Certificate
+       User certificate   celui que vous venez d'importer
+       CA certificate     Select automatically
+  5. Connectez-vous.
+
+
+Linux
+-----
+  Importez le paquet avec le greffon IKEv2 de NetworkManager, ou pointez swanctl
+  directement dessus. L'identité inscrite dans le certificat est « {cred} » et
+  celle du serveur est « {endpoint} ».
+
+
+Ce que ce tunnel ne fait pas
+----------------------------
+  L'IPv6 n'y transite pas. Ce protocole ne distribue qu'une adresse IPv4 : un
+  appareil disposant d'un IPv6 fonctionnel continue de l'utiliser directement
+  pour tout site qui le prend en charge — ce trafic n'entre pas dans le tunnel
+  et n'est donc pas protégé par lui. Le serveur n'y peut rien : ce trafic ne
+  l'atteint jamais.
+
+  Si cela compte pour votre usage, désactivez l'IPv6 sur l'appareil, ou demandez
+  à l'opérateur un identifiant WireGuard — celui-là capture l'IPv6 et le
+  supprime, ce qui échoue de façon fermée plutôt que de fuir.

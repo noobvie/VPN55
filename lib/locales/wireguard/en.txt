@@ -1,0 +1,26 @@
+@@ header
+VPN55 client configuration
+Credential {cred}  ·  user {user}
+
+@@ custody.client
+KEY CUSTODY: client-generated. This server has never held the private
+  key for this credential and cannot produce one. Put your own key on
+  the PrivateKey line below.
+
+@@ custody.server
+KEY CUSTODY: server-generated. This server created the private key
+  below and held it for up to {ttl_hours} hours after issue, then erased it.
+  Save this file now — it cannot be produced again afterwards.
+
+@@ routing
+
+All traffic goes through the tunnel. IPv6 is captured and dropped rather
+  than routed, so it fails closed instead of leaving in the clear.
+
+@@ transport.awg
+
+TRANSPORT: AmneziaWG. This needs a client that speaks it — the stock
+  WireGuard app will reject the Jc/S1/H1 lines below, and deleting them
+  does not fall back to WireGuard, it just stops connecting.
+  Those values are this server's and must be carried exactly as they
+  are; they are not secret and they are not tunable.

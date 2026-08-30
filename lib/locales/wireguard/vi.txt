@@ -1,0 +1,27 @@
+@@ header
+Cấu hình máy khách VPN55
+Chứng danh {cred}  ·  người dùng {user}
+
+@@ custody.client
+GIỮ KHOÁ: do máy khách tạo. Máy chủ này chưa bao giờ giữ khoá riêng của
+  chứng danh này và không thể tạo ra một khoá nào. Hãy điền khoá của
+  chính bạn vào dòng PrivateKey bên dưới.
+
+@@ custody.server
+GIỮ KHOÁ: do máy chủ tạo. Máy chủ này đã tạo khoá riêng bên dưới và giữ
+  nó tối đa {ttl_hours} giờ sau khi cấp, rồi xoá đi.
+  Hãy lưu tệp này ngay — sau đó không thể tạo lại được nữa.
+
+@@ routing
+
+Toàn bộ lưu lượng đi qua đường hầm. IPv6 bị bắt lại và bỏ đi chứ không
+  được định tuyến, nên nó hỏng theo hướng an toàn thay vì lọt ra ngoài
+  mà không được mã hoá.
+
+@@ transport.awg
+
+VẬN CHUYỂN: AmneziaWG. Cách này cần một ứng dụng hiểu được nó — ứng dụng
+  WireGuard tiêu chuẩn sẽ từ chối các dòng Jc/S1/H1 bên dưới, và xoá
+  chúng đi cũng không quay về WireGuard thường, chỉ là ngừng kết nối.
+  Những giá trị đó là của riêng máy chủ này và phải được giữ nguyên
+  chính xác; chúng không phải bí mật và cũng không phải để tinh chỉnh.

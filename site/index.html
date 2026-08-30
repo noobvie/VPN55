@@ -1,0 +1,214 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>VPN55 — Máy chủ VPN của riêng bạn</title>
+<meta name="description" content="VPN55 — tự dựng máy chủ VPN riêng: WireGuard, IKEv2 và OpenVPN, một lệnh cài đặt, một trang quản trị. Mã nguồn mở, giấy phép MIT.">
+<meta name="color-scheme" content="light dark">
+<link rel="canonical" href="https://vpn55.org/">
+
+<!--
+  Deliberately ONE file, with no external requests of any kind.
+
+  No web fonts, no analytics, no CDN. Three reasons, and each one alone would
+  be enough:
+
+    1. This page has to render from an onion service and from a plain static
+       mirror, where a request to fonts.googleapis.com simply hangs.
+    2. Every external request is a hostname in the TLS SNI — a second thing for
+       a filter to key on, attached to a page whose whole subject is filtering.
+    3. A privacy tool that phones a third party on its own front page has
+       already lost the argument it is making.
+
+  Keep it that way. If this page ever needs a build step, it is doing too much.
+-->
+<style>
+  :root {
+    --bg: #f4f6f8; --surface: #fff; --ink: #14181d; --ink-2: #55606b;
+    --line: #d8dee4; --accent: #b4552a; --ok: #1f7a5c;
+    --mono: ui-monospace, "SFMono-Regular", "Cascadia Mono", Consolas, monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #12151a; --surface: #191d23; --ink: #e5e9ed; --ink-2: #9ba5b0;
+      --line: #2b323b; --accent: #e08048; --ok: #4fbf95;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 16px/1.65 var(--sans); -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 780px; margin: 0 auto; padding: 0 20px 80px; }
+  header { padding: 64px 0 32px; border-bottom: 1px solid var(--line); margin-bottom: 40px; }
+  h1 { font-size: clamp(2.2rem, 7vw, 3.2rem); margin: 0 0 12px; letter-spacing: -.03em; }
+  .tag { font-size: 1.15rem; color: var(--ink-2); margin: 0 0 8px; max-width: 34em; }
+  .tag-en { font-size: .95rem; color: var(--ink-2); opacity: .8; margin: 0; max-width: 40em; }
+  h2 { font-size: 1.3rem; margin: 44px 0 10px; letter-spacing: -.01em; }
+  h2 .en { font-weight: 400; color: var(--ink-2); font-size: .8em; }
+  p { max-width: 40em; }
+  .en-note { color: var(--ink-2); font-size: .92rem; }
+  pre {
+    background: var(--surface); border: 1px solid var(--line); border-radius: 8px;
+    padding: 14px 16px; overflow-x: auto; font: 13.5px/1.6 var(--mono); margin: 14px 0;
+  }
+  code { font-family: var(--mono); font-size: .9em; }
+  p code, li code, td code { background: var(--surface); border: 1px solid var(--line);
+    border-radius: 4px; padding: 1px 5px; }
+  a { color: var(--accent); }
+  .banner {
+    border: 1px solid var(--line); border-left: 3px solid var(--accent);
+    background: var(--surface); border-radius: 0 8px 8px 0; padding: 14px 18px; margin: 24px 0;
+  }
+  .banner p { margin: 0; } .banner p + p { margin-top: 8px; }
+  ul { padding-left: 20px; max-width: 40em; }
+  li { margin: 6px 0; }
+  table { border-collapse: collapse; width: 100%; margin: 16px 0; font-size: .92rem; }
+  td, th { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--line);
+    vertical-align: top; }
+  th { color: var(--ink-2); font-weight: 500; font-size: .8rem; text-transform: uppercase;
+    letter-spacing: .06em; }
+  .grid { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
+  .card { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 16px 18px; }
+  .card h3 { margin: 0 0 6px; font-size: 1rem; }
+  .card p { margin: 0; font-size: .92rem; color: var(--ink-2); }
+  footer { border-top: 1px solid var(--line); margin-top: 56px; padding-top: 22px;
+    color: var(--ink-2); font-size: .88rem; }
+  .wrapover { overflow-x: auto; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>VPN55</h1>
+  <p class="tag">Máy chủ VPN của riêng bạn — WireGuard, IKEv2 và OpenVPN, một lệnh cài đặt,
+     một trang quản trị.</p>
+  <p class="tag-en">Your own VPN server: three protocols behind one installer and one admin
+     panel. Open source, MIT licensed, nothing phones home.</p>
+</header>
+
+<div class="banner">
+  <p><b>Bản thử nghiệm (pre-release).</b> Toàn bộ mã đã được viết xong, nhưng
+     <b>chưa chạy thật trên máy chủ nào</b>. Đừng dùng cho việc quan trọng.</p>
+  <p class="en-note">Pre-release: everything is written, none of it has run on a real
+     server yet. The supported-distribution table in the repository is empty on purpose —
+     a row appears only after a real install, uninstall and re-install on that system.</p>
+</div>
+
+<h2>Cài đặt <span class="en">· Install</span></h2>
+<pre>bash &lt;(curl -fsSL https://raw.githubusercontent.com/noobvie/VPN55/main/vpn55.sh)</pre>
+<p>Chạy bằng quyền <code>root</code> trên một VPS mới. Không cần Docker, không cần tài
+   khoản, không gửi dữ liệu đi đâu cả.</p>
+<p class="en-note">Run as root on a fresh VPS. That URL is served by the code host, not by
+   this website — <b>this site is a convenience, not a dependency.</b> If this page is
+   unreachable from your network but you already have the command, nothing is lost.</p>
+
+<h2>Nếu trang này bị chặn <span class="en">· If this site is blocked</span></h2>
+<p>Mọi thứ trình cài đặt tải về đều đến từ <b>một URL gốc duy nhất</b>. Đổi biến đó là đủ:</p>
+<pre>VPN55_MIRROR=https://ban-sao.example/VPN55 \
+  bash &lt;(curl -fsSL https://ban-sao.example/VPN55/vpn55.sh)</pre>
+<p class="en-note">Any static host works — another code host, a plain web directory, an
+   onion service behind <code>torsocks</code>. The current mirrors are listed
+   <b>in the repository README</b>, not here: a site that lists its own mirrors disappears
+   together with them.</p>
+
+<h2>Kiểm tra trước khi chạy <span class="en">· Verify before you run it</span></h2>
+<p>VPN55 chạy bằng quyền <code>root</code>. Nếu bạn tải nó từ nơi nào khác ngoài kho mã
+   chính thức, hãy kiểm tra chữ ký trước:</p>
+<pre>curl -fsSLO .../SHA256SUMS
+curl -fsSLO .../SHA256SUMS.minisig
+minisign -Vm SHA256SUMS -P '&lt;khóa công khai trong README&gt;'
+sha256sum -c SHA256SUMS</pre>
+<div class="banner">
+  <p><b><code>curl | bash</code> không thể tự kiểm tra chính nó.</b> Khi script có thể
+     kiểm tra chữ ký thì nó đã chạy bằng quyền <code>root</code> rồi. Chữ ký giải quyết
+     vấn đề <i>bản sao</i> — chứ không làm cho lệnh một dòng trở nên an toàn.</p>
+  <p class="en-note"><code>curl | bash</code> cannot verify itself: by the time the script
+     could check a signature it is already running as root. Signing fixes the mirror
+     problem, not that one. The one-liner is the convenience path; the four commands above
+     are the recommended one.</p>
+</div>
+
+<h2>Vì sao <span class="en">· Why</span></h2>
+<div class="grid">
+  <div class="card">
+    <h3>Tiếng Việt là mặc định</h3>
+    <p>Không phải bản dịch máy gắn thêm sau. Kể cả hướng dẫn gửi cho người dùng cuối.
+       English and French included.</p>
+  </div>
+  <div class="card">
+    <h3>Ba giao thức song song</h3>
+    <p>WireGuard cho tốc độ, IKEv2 cho máy không cần cài app, OpenVPN TCP/443 cho mạng
+       chặn UDP.</p>
+  </div>
+  <div class="card">
+    <h3>Một người, một hồ sơ</h3>
+    <p>Một người dùng có thể có chứng thư cho cả ba giao thức. Danh sách người dùng là
+       một, không phải ba.</p>
+  </div>
+  <div class="card">
+    <h3>Panel không phải là root</h3>
+    <p>Trang quản trị gọi một trình trợ giúp có danh sách lệnh cố định. Panel bị chiếm
+       không đồng nghĩa với mất máy chủ.</p>
+  </div>
+  <div class="card">
+    <h3>Trang tự phục vụ</h3>
+    <p>Người dùng tự tải cấu hình, tự xem dung lượng, tự đổi khóa — không cần hỏi bạn.</p>
+  </div>
+  <div class="card">
+    <h3>Máy chủ là của bạn</h3>
+    <p>Không có dịch vụ nào ở giữa. Tác giả không vận hành máy chủ nào và không giữ dữ
+       liệu của bạn.</p>
+  </div>
+</div>
+
+<h2>Không giao thức nào chống được kiểm duyệt như nhau
+    <span class="en">· They are not equivalent under a filter</span></h2>
+<div class="wrapover">
+<table>
+  <thead><tr><th>Giao thức</th><th>Trên mạng bị lọc</th><th></th></tr></thead>
+  <tbody>
+    <tr><td><b>WireGuard</b></td><td>Dễ nhận dạng nhất</td>
+        <td class="en-note">Fixed-size handshake with a fixed type byte — the cheapest of
+            the three for a censor to block. Turn on the obfuscated mode.</td></tr>
+    <tr><td><b>OpenVPN</b></td><td>Tốt, khi dùng TCP/443</td>
+        <td class="en-note">With <code>tls-crypt</code> on by default, the control-channel
+            handshake is hidden. This is the mode that survives networks dropping UDP.</td></tr>
+    <tr><td><b>IKEv2</b></td><td>Bị chặn trước tiên</td>
+        <td class="en-note">UDP 500/4500 and ESP are not meaningfully disguisable. It is
+            here for native clients with no app to install, not for filtered networks —
+            and the panel says so where you choose it.</td></tr>
+  </tbody>
+</table>
+</div>
+<p class="en-note">Listing a protocol that will be blocked first, alongside two that will
+   not, with no indication of which is which, fails the person choosing. So VPN55 states
+   it at the point of the choice rather than in a footnote.</p>
+
+<h2>Mã nguồn <span class="en">· Source</span></h2>
+<ul>
+  <li><a href="https://github.com/noobvie/VPN55">github.com/noobvie/VPN55</a> — mã nguồn,
+      README, và <b>danh sách bản sao hiện hành</b></li>
+  <li><a href="https://github.com/noobvie/VPN55/blob/main/docs/security-model.md">Mô hình bảo mật</a>
+      — ai giữ khóa nào, panel làm được gì và không làm được gì, và mất panel thì mất gì</li>
+  <li><a href="https://github.com/noobvie/VPN55/blob/main/DISCLAIMER.md">Miễn trừ trách nhiệm</a>
+      — chúng tôi thấy gì và không thấy gì, VPN làm được gì và không làm được gì, và
+      chuyện pháp lý</li>
+  <li>Giấy phép <b>MIT</b> — dùng, sao chép, sửa, bán, fork, không cần xin phép</li>
+</ul>
+
+<footer>
+  <p>VPN55 · MIT · Chúng tôi không vận hành máy chủ nào, không giữ dữ liệu của bạn, và
+     không thấy lưu lượng của bạn. Luật về VPN khác nhau ở mỗi nước — chúng tôi không thể
+     tư vấn cho hoàn cảnh của bạn. Phần mềm cung cấp “nguyên trạng”, không bảo đảm.</p>
+  <p class="en-note">We run no servers, hold none of your data, and see none of your
+     traffic. VPN law differs by country and we cannot advise on your situation. Provided
+     “as is”, without warranty. Not legal advice.</p>
+</footer>
+
+</div>
+</body>
+</html>

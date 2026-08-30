@@ -1,0 +1,93 @@
+@@ main
+VPN55 — IKEv2 setup
+===================
+
+  Server            {endpoint}
+  Server identity   {endpoint}
+  Credential        {cred}   (issued to {user})
+  Issuer            {ca_cn}
+  Bundle passphrase {pass}
+
+The passphrase above unlocks vpn55-{cred}.p12. It is shown once. This server
+does not keep a copy of your private key, so if the bundle is lost the answer is
+a new credential, never a resend.
+
+Everything below is the same identity in three packagings. Use the one for your
+device; you do not need the others.
+
+
+iOS and macOS
+-------------
+  1. Get vpn55-{cred}.mobileconfig onto the device — AirDrop, email to yourself,
+     or a download link. Opening it from a message is enough.
+  2. iOS:   Settings > Profile Downloaded > Install.
+     macOS: System Settings > General > VPN & Device Management > Install.
+  3. Connect from Settings > VPN.
+
+  The profile carries the issuer certificate and your identity, so there is
+  nothing else to import and no passphrase to type.
+
+
+Windows 10 and 11
+-----------------
+Run PowerShell AS ADMINISTRATOR, in the folder holding vpn55-ca.crt and
+vpn55-{cred}.p12.
+
+  # 1. Trust the issuer.
+  Import-Certificate -FilePath .\vpn55-ca.crt `
+      -CertStoreLocation Cert:\LocalMachine\Root
+
+  # 2. Install this device's identity.
+  $p = ConvertTo-SecureString -String '{pass}' -AsPlainText -Force
+  Import-PfxCertificate -FilePath .\vpn55-{cred}.p12 `
+      -CertStoreLocation Cert:\LocalMachine\My -Password $p
+
+  # 3. Create the connection.
+  Add-VpnConnection -Name 'VPN55' -ServerAddress '{endpoint}' `
+      -TunnelType Ikev2 -AuthenticationMethod MachineCertificate `
+      -EncryptionLevel Required -SplitTunneling $false -RememberCredential
+
+  # 4. REQUIRED — not optional, and not a hardening extra.
+  #    Windows offers 1024-bit Diffie-Hellman and SHA-1 by default. This server
+  #    does not accept either, so without this step the connection fails with an
+  #    unhelpful policy-match error. This command is what makes it work.
+  Set-VpnConnectionIPsecConfiguration -ConnectionName 'VPN55' `
+      -AuthenticationTransformConstants GCMAES256 `
+      -CipherTransformConstants GCMAES256 `
+      -EncryptionMethod AES256 -IntegrityCheckMethod SHA256 `
+      -DHGroup Group14 -PfsGroup PFS2048 -Force
+
+Then connect from Settings > Network & Internet > VPN.
+
+
+Android
+-------
+  1. Install "strongSwan VPN Client" from the Play Store or F-Droid.
+  2. Copy vpn55-{cred}.p12 to the device.
+  3. In the app: CA certificates > menu > Import certificate — pick the .p12
+     and enter the passphrase above.
+  4. Add a VPN profile:
+       Server         {endpoint}
+       VPN Type       IKEv2 Certificate
+       User certificate   the one you just imported
+       CA certificate     Select automatically
+  5. Connect.
+
+
+Linux
+-----
+  Import the bundle with your NetworkManager IKEv2 plugin, or point swanctl at
+  it directly. The identity in the certificate is "{cred}" and the server
+  identity is "{endpoint}".
+
+
+What this tunnel does not do
+----------------------------
+  IPv6 does not travel through it. This protocol hands out an IPv4 address only,
+  so a device with working IPv6 keeps using it directly for any site that
+  supports it — that traffic does not enter the tunnel and is not protected by
+  it. The server cannot change this: the traffic never reaches the server.
+
+  If that matters for what you are doing, either turn IPv6 off on the device, or
+  ask the operator for a WireGuard credential instead — that one captures IPv6
+  and drops it, which fails closed rather than leaking.
