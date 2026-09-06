@@ -60,7 +60,26 @@
 #
 set -euo pipefail
 
-VPN55_VERSION="0.9.0-phase9"
+# ─── Version: the date it ships, not a sequence number ────────────────────────
+# CalVer, YYYY.MM.DD. 2026.09.09 is go-live; every release after it is dated the
+# day it was cut, and a second cut on the same day appends a counter —
+# 2026.09.09.1.
+#
+# The question an operator has, on a box they set up months ago and are now
+# reading a bug report about, is "how old is this install?". A date answers that
+# without a changelog; 0.9.0 never could. That is also why it is the first thing
+# the menu prints (main_banner, below) rather than something --version has to be
+# asked for.
+#
+# ⚠ This string is the RELEASE date, so between releases it reads behind or
+# ahead of today. Never "correct" it to the current date — a version that moves
+# on its own identifies nothing. And it does not identify the code either: two
+# trees can both say 2026.09.09 and differ. src_revision does that, which is why
+# the banner and --version print it alongside.
+#
+# tools/release.sh refuses to build unless this equals the version it was given,
+# so bumping it is a step of cutting a release, not a chore that can drift.
+VPN55_VERSION="2026.09.09"
 
 # ─── Distribution: the project website is never in the critical path ──────────
 # The only thing this installer ever fetches is ITSELF, and only when it was
@@ -82,6 +101,24 @@ VPN55_VERSION="0.9.0-phase9"
 : "${VPN55_MIRROR:=https://raw.githubusercontent.com/noobvie/VPN55/main}"
 : "${VPN55_HOME:=/usr/local/lib/vpn55}"
 
+# ─── The release public key lives HERE, in the file the user can verify ───────
+# It used to live in lib/core_source.sh, and that was the wrong file. The
+# bootstrap below fetches core_source.sh from the mirror and sources it as root,
+# so a key declared inside it is a key the mirror supplies — along with the code
+# that checks it against itself. A hostile mirror served both halves and passed.
+#
+# Here it is part of vpn55.sh: the one file a user can download, check against
+# the README's public key with minisign, and then run. core_source.sh reads it
+# through `: "${VPN55_PUBKEY:=}"`, so the exported value below wins and the lib
+# keeps working when it is sourced on its own (CI does that).
+#
+# ⚠ EMPTY until the release key exists — tools/release.sh explains how it is
+# made and why it stays offline. While it is empty the bootstrap and the fetcher
+# both WARN and continue, because refusing would make a first install impossible
+# before launch. Filling it in turns on enforcement in both places at once, and
+# that is a launch-blocking step rather than a later polish.
+export VPN55_PUBKEY="${VPN55_PUBKEY:-}"
+
 # ─── Bootstrap: the one-line install has no directory ─────────────────────────
 # `bash <(curl …)` — the command in the README — runs this file from a process
 # substitution. BASH_SOURCE[0] is then /dev/fd/63 and its dirname is /dev/fd, so
@@ -93,14 +130,48 @@ VPN55_VERSION="0.9.0-phase9"
 # path is pinned rather than chosen because the panel's sudo rules name it —
 # deploy/sudoers.d/vpn55-panel.
 #
-# ⚠ Be honest about what this does and does not prove. The manifest arrives over
-# the same connection as the files, so it catches a truncated download or a
-# mirror serving an error page — not a mirror that is lying to you. `curl | bash`
-# cannot verify itself: by the time this code could check a signature it is
-# already running as root. The verified path is the one in the README, and
-# docs/distribution.md §5 says so in the same words.
+# ── What this proves, and where the proof stops ──────────────────────────────
+#
+# The step that matters is the manifest's SIGNATURE, checked BEFORE anything
+# fetched is sourced. Everything downstream hangs off it: core_source.sh is
+# checked by digest against the manifest, and src_fetch checks the rest of the
+# tree the same way — so an authenticated manifest makes those digest checks
+# provenance checks rather than corruption checks.
+#
+# ⚠ It is verified with the minisign BINARY, never with the openssl fallback in
+# lib/core_source.sh, and the difference is the whole point: that fallback is
+# code this host has not authenticated yet. Using the mirror's own verifier to
+# check the mirror's own manifest proves nothing at all. So with a key compiled
+# in and no minisign on the host, this FAILS CLOSED and says which of the two
+# ways out to take.
+#
+# ⚠ What none of this fixes is `curl … | bash` itself: by the time this code
+# runs it is already root, and it is whatever the mirror sent. The signature
+# check protects the OTHER eighteen files, and a user who downloaded vpn55.sh
+# through the verified path in the README has the whole chain. That distinction
+# is stated the same way in docs/distribution.md §5 and docs/launch.md §4, and
+# no file may imply more.
 _vpn55_bootstrap() {
     local tmp="" lib="lib/core_source.sh" want got
+
+    # ── The loop guard ───────────────────────────────────────────────────────
+    # This function ends in `exec`, and the process it hands over to runs the
+    # same test that got us here. A tree whose manifest simply does not LIST
+    # lib/ui.sh downloads and verifies perfectly — src_manifest_verify checks
+    # the files a manifest names and cannot miss one it does not — and then
+    # re-enters this function, forever, re-fetching the whole tree every round
+    # as root. A stale or partially synced mirror is enough to trigger it.
+    #
+    # src_fetch now refuses to install a tree with no entry point, which is the
+    # fix at source. This is the backstop, because the cost of being wrong is an
+    # unbounded loop hammering a mirror rather than an error message.
+    if [[ -n "${VPN55_RELAUNCHED:-}" ]]; then
+        printf '[ERROR] Already fetched VPN55 once in this run, and the copy at %s\n' "$VPN55_HOME" >&2
+        printf '[ERROR] still cannot be started — %s/lib/ui.sh is missing.\n' "$VPN55_HOME" >&2
+        printf '[ERROR] That means %s is serving an incomplete file list.\n' "$VPN55_MIRROR" >&2
+        printf '[ERROR] Refusing to fetch it again. Set VPN55_MIRROR to another base URL.\n' >&2
+        exit 1
+    fi
 
     if [[ "$(id -u)" != "0" ]]; then
         printf '[ERROR] VPN55 installs as root. Re-run with sudo.\n' >&2
@@ -134,9 +205,48 @@ _vpn55_bootstrap() {
         exit 1
     fi
 
-    # Check the one file about to be sourced as root against the list. Same
-    # channel, so this is a corruption check and not a provenance one — but
-    # sourcing a half-downloaded file as root is worth ruling out on its own.
+    # ── The manifest's signature, before a byte of it is trusted ─────────────
+    if [[ -n "$VPN55_PUBKEY" ]]; then
+        if ! command -v minisign >/dev/null 2>&1; then
+            printf '[ERROR] This copy of VPN55 carries a release key, so the file list has to\n' >&2
+            printf '[ERROR] be verified before anything fetched is run as root — and the only\n' >&2
+            printf '[ERROR] verifier that can do that here is minisign. The fallback inside\n' >&2
+            printf '[ERROR] lib/core_source.sh cannot be used: it would be the mirror checking\n' >&2
+            printf '[ERROR] its own work.\n' >&2
+            printf '[ERROR]\n' >&2
+            printf '[ERROR] Either install minisign and re-run, or take the verified path in\n' >&2
+            printf '[ERROR] the README: download vpn55.sh with the rest of the tree, check\n' >&2
+            printf '[ERROR] SHA256SUMS, and run it from the directory it came in.\n' >&2
+            rm -rf "$tmp" || true
+            exit 1
+        fi
+        if ! _vpn55_boot_get "${VPN55_MIRROR%/}/MANIFEST.sha256.minisig" "$tmp/MANIFEST.sha256.minisig" \
+           || [[ ! -s "$tmp/MANIFEST.sha256.minisig" ]]; then
+            printf '[ERROR] %s served no signature for MANIFEST.sha256.\n' "$VPN55_MIRROR" >&2
+            printf '[ERROR] Every release is signed, so this mirror is either out of date or\n' >&2
+            printf '[ERROR] is not serving VPN55. Nothing was installed.\n' >&2
+            rm -rf "$tmp" || true
+            exit 1
+        fi
+        if ! minisign -Vm "$tmp/MANIFEST.sha256" \
+                      -x "$tmp/MANIFEST.sha256.minisig" \
+                      -P "$VPN55_PUBKEY" >/dev/null 2>&1; then
+            printf '[ERROR] %s served a file list that is NOT signed by the VPN55 release\n' "$VPN55_MIRROR" >&2
+            printf '[ERROR] key. This is what a tampered mirror looks like. Nothing was\n' >&2
+            printf '[ERROR] installed and nothing at %s was touched.\n' "$VPN55_HOME" >&2
+            rm -rf "$tmp" || true
+            exit 1
+        fi
+        printf '[INFO]  File list signature verified (minisign).\n' >&2
+    else
+        printf '[WARN]  This copy has no release key built in, so the file list cannot be\n' >&2
+        printf '[WARN]  checked for provenance. Continuing on the mirror'"'"'s word alone.\n' >&2
+    fi
+
+    # The one file about to be sourced as root, checked against the list. With a
+    # verified manifest above this is a provenance check; with an empty
+    # VPN55_PUBKEY it degrades to what it always was — proof the download was not
+    # truncated and that the mirror did not serve an error page in its place.
     if command -v sha256sum >/dev/null 2>&1; then
         want="$(awk -v p="$lib" '$2 == p { print $1; exit }' "$tmp/MANIFEST.sha256")"
         got="$(sha256sum "$tmp/core_source.sh" | cut -d' ' -f1)"
@@ -153,6 +263,9 @@ _vpn55_bootstrap() {
 
     src_fetch "$VPN55_HOME" || exit 1
     printf '[INFO]  Starting %s/vpn55.sh\n' "$VPN55_HOME" >&2
+    # The sentinel is EXPORTED, because the loop it guards is across an exec and
+    # a shell variable does not survive one.
+    export VPN55_RELAUNCHED="boot"
     exec "$VPN55_HOME/vpn55.sh" "$@"
 }
 
@@ -183,6 +296,8 @@ readonly VPN55_VERSION VPN55_ROOT
 . "$VPN55_ROOT/lib/core_pki.sh"
 # shellcheck source=lib/core_adapters.sh
 . "$VPN55_ROOT/lib/core_adapters.sh"
+# shellcheck source=lib/core_backup.sh
+. "$VPN55_ROOT/lib/core_backup.sh"
 # shellcheck source=lib/ui_adapter.sh
 . "$VPN55_ROOT/lib/ui_adapter.sh"
 # shellcheck source=lib/ui_screens.sh
@@ -201,13 +316,55 @@ readonly VPN55_VERSION VPN55_ROOT
 # became its second consumer. Two copies of "which tags are legitimate" is one
 # copy too many once one of them is deciding what root may restart.
 
+# ─── Banner ───────────────────────────────────────────────────────────────────
+# Drawn on every menu render, not once at startup. The menu is what an operator
+# returns to for the life of the server, and a version that scrolled off the
+# screen an hour ago is a version they will guess at instead of read.
+#
+# Two lines, because the version alone does not identify the code: two trees can
+# both say 2026.09.09 and differ. The revision is what tells them apart, so it
+# sits beside the version rather than behind --version.
+#
+# Resolved once. src_revision hashes MANIFEST.sha256 on an installed copy, and
+# there is no reason to pay for that on every trip round the menu loop.
+_VPN55_REVISION=""
+
+# One row of the box. The right edge lines up because the padding is computed
+# from the text's own byte length — which only holds while the text is ASCII. An
+# em dash is three bytes and one column, and putting one in here is how the box
+# comes out ragged on the operator's terminal and straight on yours.
+_banner_row() {
+    local text="$1" width="$2" cb="${BOLD}${CYAN}"
+    if (( ${#text} > width )); then
+        text="${text:0:width}"
+    fi
+    printf '%s║%s  %-*s  %s║%s\n' "$cb" "$RESET" "$width" "$text" "$cb" "$RESET" >&2
+}
+
+main_banner() {
+    local inner=55 text_width=$(( 55 - 4 )) bar cb="${BOLD}${CYAN}"
+
+    if [[ -z "$_VPN55_REVISION" ]]; then
+        _VPN55_REVISION="$(src_revision "$VPN55_ROOT" 2>/dev/null)" || _VPN55_REVISION=""
+        [[ -n "$_VPN55_REVISION" ]] || _VPN55_REVISION="unknown"
+    fi
+
+    printf -v bar '%*s' "$inner" ''
+    bar="${bar// /═}"
+
+    printf '\n%s╔%s╗%s\n' "$cb" "$bar" "$RESET" >&2
+    _banner_row "VPN55  self-hosted multi-protocol VPN manager" "$text_width"
+    _banner_row "version ${VPN55_VERSION}   rev ${_VPN55_REVISION}" "$text_width"
+    printf '%s╚%s╝%s\n\n' "$cb" "$bar" "$RESET" >&2
+}
+
 # ─── Menu ─────────────────────────────────────────────────────────────────────
 # Every arm is ||-guarded. Under `set -e` an unguarded non-zero return from a
 # screen kills the whole script instead of returning here, which reads to the
 # operator as a crash rather than as a failed action.
 main_menu() {
     while true; do
-        section "VPN55 ${VPN55_VERSION}"
+        main_banner
         cat >&2 <<'MENU'
   1) Host report          — OS, container, firewall, pools
   2) Network setup        — IP forwarding, NAT, firewall backend
@@ -251,7 +408,21 @@ VPN55 ${VPN55_VERSION} — self-hosted multi-protocol VPN manager
       --uninstall <tag>   Remove one tunnel service, reversing its install
       --update      Replace this installation with the current code, then stop
       --verify      Check this installation against its own file list
+      --backup      Archive everything that cannot be regenerated, encrypted
+                    with a passphrase you type. Takes [--passfile <path>]
+                    [--out <dir>]
+      --backup-list What is in /var/backups/vpn55 on this host
+      --restore <archive>
+                    Put a backup back. Takes [--passfile <path>] [--force]
       --revision    Print what identifies the code in this tree
+      --rendezvous <file> [signature]
+                    Check a signed mirror/endpoint list you were handed,
+                    and print it only if the signature is good
+      --endpoints   List the additional addresses clients are given
+      --endpoint-add <host>
+                    Add one, so new client configs list it as a fallback
+      --endpoint-remove <host>
+                    Drop one. Configs already issued keep it
 
 With no option, the interactive menu is shown. Every action runs as root on the
 local host. The only thing fetched over the network is VPN55 itself, and only by
@@ -273,6 +444,9 @@ Environment:
                     installer's own output stays English either way.
   VPN55_NO_COLOR    Set to disable colour. NO_COLOR is honoured too.
   VPN55_DEBUG       Set for verbose diagnostics.
+  VPN55_BACKUP_PASS Passphrase for --backup / --restore, for automation only.
+                    Root can read /proc/<pid>/environ, so this is no better than
+                    --passfile and no worse. There is no default and no schedule.
 USAGE
 }
 
@@ -309,6 +483,13 @@ main() {
         --install)    cli_install   "${2:-}" || return $? ;;
         --uninstall)  cli_uninstall "${2:-}" || return $? ;;
         --verify)     cli_verify || return 1 ;;
+        --rendezvous)      shift; cli_rendezvous "$@" || return $? ;;
+        --endpoints)       cli_endpoints list          || return $? ;;
+        --endpoint-add)    cli_endpoints add "${2:-}"    || return $? ;;
+        --endpoint-remove) cli_endpoints remove "${2:-}" || return $? ;;
+        --backup)      shift; cli_backup  "$@" || return $? ;;
+        --backup-list) bak_list || return 1 ;;
+        --restore)     shift; cli_restore "$@" || return $? ;;
         --update)
             local rc=0
             src_update "$VPN55_ROOT" || rc=$?

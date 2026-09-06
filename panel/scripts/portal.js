@@ -150,7 +150,11 @@ function main() {
 
   let cfg;
   try {
-    cfg = loadConfig();
+    // forListener:false — this script opens no socket, so the listener
+    // arrangement checks (which trust_proxy goes with which bind) must not
+    // stop it. They would otherwise lock an operator out of the very tool
+    // that fixes a panel refusing to start.
+    cfg = loadConfig({ forListener: false });
   } catch (err) {
     if (err instanceof ConfigError) fail('configuration is not usable:', err.problems);
     throw err;

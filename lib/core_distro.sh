@@ -131,12 +131,35 @@ _distro_need_detect() {
 }
 
 # ─── Packages ─────────────────────────────────────────────────────────────────
+#
+# ⚠ pacman is NOT apt with different spelling, and the difference is a broken
+# host rather than a style point.
+#
+# `pacman -Sy` followed later by `pacman -S <pkg>` is the partial upgrade Arch
+# documents as unsupported: the sync database is then newer than what is
+# installed, so the package that arrives is built against library versions this
+# host does not have. It does not fail loudly — it links against a soname that
+# is not there, and the breakage surfaces somewhere else entirely. Arch offers
+# exactly one safe shape, `-Syu`, which refreshes and upgrades together.
+#
+# Every adapter calls distro_pkg_refresh immediately before distro_pkg_install,
+# so the old pairing fired on the FIRST install on every Arch host.
+#
+# The fix is to stop splitting the operation on pacman: refresh is a no-op there
+# and distro_pkg_install does `-Syu --needed`, which is one atomic, supported
+# call. On apt and dnf the split stays, because on those the two halves are
+# genuinely independent and a full upgrade is not something an installer should
+# perform on somebody's server without being asked.
 distro_pkg_refresh() {
     _distro_need_detect || return 1
     case "$VPN55_PKG_MGR" in
         apt-get) apt-get update -qq || { error "apt-get update failed"; return 1; } ;;
         dnf|yum) "$VPN55_PKG_MGR" makecache -q || { error "$VPN55_PKG_MGR makecache failed"; return 1; } ;;
-        pacman)  pacman -Sy --noconfirm >/dev/null || { error "pacman -Sy failed"; return 1; } ;;
+        pacman)
+            # Deliberately nothing. The refresh happens inside distro_pkg_install
+            # as part of -Syu; doing it here as a bare -Sy is what creates the
+            # partial-upgrade window described above.
+            debug "pacman: refresh is folded into the install (-Syu)" ;;
     esac
     return 0
 }
@@ -152,7 +175,10 @@ distro_pkg_install() {
             "$VPN55_PKG_MGR" install -y "$@" \
                 || { error "$VPN55_PKG_MGR install failed: $*"; return 1; } ;;
         pacman)
-            pacman -S --needed --noconfirm "$@" \
+            # -Syu, not -S: see the note above. --needed keeps a re-run from
+            # reinstalling what is already there, which is what makes an install
+            # safe to run three times.
+            pacman -Syu --needed --noconfirm "$@" \
                 || { error "pacman install failed: $*"; return 1; } ;;
     esac
     return 0

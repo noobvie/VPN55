@@ -122,13 +122,26 @@ function accumulate(slot, dir, value) {
 }
 
 class Collector {
-  constructor({ privileged, store, cfg }) {
+  constructor({ privileged, store, cfg, onPoll = null }) {
     this.privileged = privileged;
     this.store = store;
     this.cfg = cfg;
     this.timer = null;
     this.stopped = false;
     this.polling = false;
+
+    // Live values, owned here rather than read from the frozen cfg on every
+    // tick. The settings screen changes them without a restart, and the panel
+    // cannot restart itself — see panel/lib/settings.js. cfg stays the record of
+    // what was loaded at start-up; this is the record of what is in effect.
+    this.pollSeconds = cfg.poll_seconds;
+    this.eventLimit = cfg.event_limit;
+
+    // Called after every poll attempt, successful or not. It exists so that
+    // ALERTING is wired in one place (server.js) instead of this file learning
+    // what an alert is — the same reason it does not know what a protocol is.
+    // A throwing callback must never break the poll loop.
+    this.onPoll = onPoll;
 
     // The most recent successful parse, plus how the last attempt went. Both,
     // always: a page that shows stale data must be able to say it is stale.
@@ -140,18 +153,46 @@ class Collector {
   }
 
   start() {
-    const period = this.cfg.poll_seconds * 1000;
     const tick = () => {
       if (this.stopped) return;
       this.poll()
         .catch((err) => log.error('poll threw', err && err.stack ? err.stack : String(err)))
         .finally(() => {
           if (this.stopped) return;
-          this.timer = setTimeout(tick, period);
+          // Read at the moment the next tick is scheduled, not once at start:
+          // a period captured in a closure would keep the old interval until
+          // the next restart, so the settings screen would report a change it
+          // had not made.
+          this.timer = setTimeout(tick, this.pollSeconds * 1000);
           if (this.timer.unref) this.timer.unref();
         });
     };
     tick();
+  }
+
+  /**
+   * Change the poll interval, in effect from the next tick.
+   *
+   * The tick in flight keeps the old one — cancelling and rescheduling would
+   * mean a settings change could reset the interval indefinitely if it were
+   * repeated, and one interval of latency is not worth that.
+   */
+  setPollSeconds(seconds) {
+    if (!Number.isFinite(seconds) || seconds < 1) return;
+    this.pollSeconds = Math.floor(seconds);
+  }
+
+  /**
+   * Change how many events are kept.
+   *
+   * Lowering it does not truncate the history that is already stored — the next
+   * recorded event does that, in record(). Truncating here would throw away
+   * events the moment somebody dragged a slider, before they had confirmed
+   * anything.
+   */
+  setEventLimit(limit) {
+    if (!Number.isFinite(limit) || limit < 1) return;
+    this.eventLimit = Math.floor(limit);
   }
 
   stop() {
@@ -208,6 +249,15 @@ class Collector {
       } catch (err) {
         log.error('could not write state', err.message);
       }
+      if (this.onPoll) {
+        // Guarded, and reported once. A monitoring hook that could break the
+        // poll loop would be a monitoring system that causes outages.
+        try {
+          this.onPoll(this.health());
+        } catch (err) {
+          log.warnOnce('collector-onpoll', `the poll hook threw: ${err.message}`);
+        }
+      }
     }
   }
 
@@ -250,9 +300,24 @@ class Collector {
           });
         }
 
-        // 'unknown' never overwrites a real answer. The daemon forgetting is not
-        // the credential never having been used.
-        if (cred.handshake.kind !== 'unknown') slot.lastSeen = cred.handshake;
+        // `lastSeen` only ever moves FORWARD in confidence. Two ways to get this
+        // wrong, and both destroy a stored fact rather than failing visibly:
+        //
+        //   'unknown' must not overwrite anything. The daemon forgetting is not
+        //   the credential never having been used.
+        //
+        //   'never' must not overwrite a timestamp either. It may FILL an
+        //   unknown — that is a real first answer — but a stored "seen at 14:02"
+        //   is evidence, and "never" is the absence of evidence. These daemons
+        //   forget on restart, so an adapter can legitimately report `never`
+        //   about a credential this panel already watched connect; taking it as
+        //   a correction would rewrite the real date, and `lastSeen` is in the
+        //   durable store, so the real date would be gone for good.
+        if (cred.handshake.kind === 'at') {
+          slot.lastSeen = cred.handshake;
+        } else if (cred.handshake.kind === 'never' && slot.lastSeen.kind === 'unknown') {
+          slot.lastSeen = cred.handshake;
+        }
       }
     }
 
@@ -332,7 +397,7 @@ class Collector {
   record(at, type, data) {
     const events = this.store.state.events;
     events.push({ at, type, data });
-    const limit = this.cfg.event_limit;
+    const limit = this.eventLimit;
     if (events.length > limit) events.splice(0, events.length - limit);
     this.store.markDirty();
   }
@@ -353,7 +418,7 @@ class Collector {
       lastAttemptAt: this.lastAttemptAt,
       consecutiveFailures: this.consecutiveFailures,
       error: this.lastError,
-      pollSeconds: this.cfg.poll_seconds,
+      pollSeconds: this.pollSeconds,
     };
   }
 }

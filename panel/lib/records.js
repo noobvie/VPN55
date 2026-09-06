@@ -12,7 +12,7 @@
 //   adapter     <tag>  <label>  <available 0|1>
 //   capability  <tag>  <record…>
 //   service     <tag>  <state> <enabled> <listen> <since> <cred_count>
-//   cred        <tag>  <cred_id> <user> <state> <address> <rx> <tx> <handshake> <endpoint>
+//   cred        <tag>  <cred_id> <user> <state> <address> <rx> <tx> <handshake> <endpoint> <connected>
 //   credmeta    <tag>  <cred_id> <user> <state> <address> <created> <custody> <held 0|1>
 //   note        <tag>  <info|warn|crit>  <message>
 //   user        <name> <created> <enabled> <quota> <expires> <conn_limit> <reset> <creds>
@@ -29,7 +29,15 @@
 //    two. A daemon that keeps no history cannot assert "never" and must not be
 //    read as having done so — telling an operator that a user who connected
 //    yesterday has never connected is the kind of wrong that gets someone's
-//    access removed.
+//    access removed. `never` is therefore FILLABLE BUT NOT OVERWRITABLE
+//    downstream: see the note on lastSeen in collector.js.
+//
+// 2a. `connected` is the liveness answer, and `endpoint` is not one. On one of
+//    these protocols the endpoint is the last address a peer was ever seen at
+//    and survives for the life of the interface, so reading presence off it
+//    reports a device that connected in March as online. It is also the field a
+//    protocol with no peers at all cannot answer, which would make every
+//    credential on such a service permanently invisible. Ask `connected`.
 //
 // 3. An EMPTY user-registry column is a genuine null, not a zero. `quota_bytes`
 //    empty means unlimited; reading it as 0 would render every user as being
@@ -179,6 +187,13 @@ function parseStatus(text) {
           tx: num(f[7]),
           handshake: handshake(f[8]),
           endpoint: str(f[9]),
+          // Is the service carrying a session for this credential right now?
+          // `flag()` gives true / false / null, and null is the third state the
+          // contract defines: the adapter's daemon is stopped or unreadable, so
+          // it has not established that nobody is connected — it has
+          // established nothing. An adapter that predates this field also
+          // arrives as null, which is the same honest answer.
+          connected: flag(f[10]),
         });
         break;
       }

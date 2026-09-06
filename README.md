@@ -131,14 +131,21 @@ the build targets, not what has been verified. Claiming an untested distro is ho
 first issue gets filed.
 
 A row turns ✅ only when [`tests/vps-acceptance.sh`](tests/vps-acceptance.sh) has passed
-on that distribution — install three times over, uninstall, and the host left byte-for-byte
-as it was found, with its route out and its SSH port intact. The run prints one
-machine-readable line, and that line is the evidence for the row:
+on that distribution — the service comes up and listens, installing it three times over
+changes nothing after the first, uninstalling puts back **every piece of network state**
+it touched, and the host keeps its route out and its SSH port throughout. The run prints
+one machine-readable line, and that line is the evidence for the row:
 
 ```bash
 # On a throwaway VPS, as root, over SSH:
 ./tests/vps-acceptance.sh --yes-destroy-this-host
 ```
+
+Firewall, routing, sysctl, interface, address, listener and systemd-unit residue fail
+the run. Packages left installed and files left under `/etc/vpn55` are reported as
+warnings and left to a human — an uninstall reverses what it *configured*, not what the
+operator now has installed — so a passing run is not a claim that the disk is
+byte-for-byte as it was found. [tests/README.md](tests/README.md) lists which is which.
 
 It does **not** connect a client. A tunnel that installs reversibly is not a tunnel that
 carries traffic, and no row here claims it does on the strength of that script alone —

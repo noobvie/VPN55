@@ -81,7 +81,7 @@ const STATUS = [
   ['capability', 'alpha', 'custody', 'server', 'This server made the key.'],
   ['capability', 'alpha', 'filtering', 'resistant', 'Hard to spot on a filtered network.'],
   ['service', 'alpha', 'running', '1', 'udp/51820', '1799000000', '3'],
-  ['cred', 'alpha', 'cred-nam-1', 'nam', 'active', '10.8.0.2', '5000', '9000', '1799999000', '1.2.3.4'],
+  ['cred', 'alpha', 'cred-nam-1', 'nam', 'active', '10.8.0.2', '5000', '9000', '1799999000', '1.2.3.4', '1'],
   ['credmeta', 'alpha', 'cred-nam-1', 'nam', 'active', '10.8.0.2', '2026-08-01', 'server', '1'],
   ['credmeta', 'alpha', 'cred-nam-2', 'nam', 'active', '10.8.0.3', '2026-08-02', 'server', '0'],
   ['credmeta', 'alpha', 'cred-linh-1', 'linh', 'active', '10.8.0.4', '2026-08-03', 'server', '1'],
@@ -91,7 +91,7 @@ const STATUS = [
   ['credmeta', 'beta', 'cred-linh-2', 'linh', 'active', '10.8.1.4', '2026-08-04', 'server', '1'],
   // An orphan: the service is carrying it, the register never heard of it. It
   // must not become claimable by whoever happens to hold that name.
-  ['cred', 'beta', 'cred-ghost', 'nam', 'active', '10.8.1.9', '10', '10', '0', '-'],
+  ['cred', 'beta', 'cred-ghost', 'nam', 'active', '10.8.1.9', '10', '10', '0', '-', '0'],
   ['user', 'nam', '2026-07-01', '1', '', '', '', '', '2'],
   ['user', 'linh', '2026-07-02', '1', '1000000', '2027-01-01', '2', 'monthly', '2'],
   ['user', 'disabled_one', '2026-07-03', '0', '', '', '', '', '0'],
@@ -138,6 +138,36 @@ check('credmeta reached the parser', () => {
   assert.strictEqual(alpha.credmeta['cred-nam-1'].held, true);
   assert.strictEqual(alpha.credmeta['cred-nam-2'].held, false,
     'held=0 must be false, and it is not the same as absent');
+});
+
+check('liveness comes from `connected`, never from the endpoint', () => {
+  const alpha = snapshot.adapters.find((a) => a.tag === 'alpha');
+  const live = alpha.creds.find((c) => c.id === 'cred-nam-1');
+  assert.strictEqual(live.connected, true);
+
+  // The reason this field exists. On a peer-based protocol the endpoint is the
+  // last address a peer was ever seen at and outlives the session for the life
+  // of the interface, so presence read off it reports a device that connected
+  // months ago as online. A record carrying an endpoint and connected=0 must
+  // come out as NOT connected.
+  const stale = parseStatus([
+    ['adapter', 'alpha', 'Alpha service', '1'],
+    ['service', 'alpha', 'running', '1', 'udp/51820', '1799000000', '1'],
+    ['cred', 'alpha', 'c-stale', 'nam', 'active', '10.8.0.5',
+     '5000', '9000', '1780000000', '1.2.3.4', '0'],
+  ].map((r) => r.join(T)).join('\n'));
+  const c = stale.adapters[0].creds[0];
+  assert.strictEqual(c.endpoint, '1.2.3.4', 'the endpoint is still carried');
+  assert.strictEqual(c.connected, false, 'an endpoint must not imply a session');
+
+  // And an adapter that cannot tell says so as null, which is not `false`: a
+  // stopped daemon has not established that nobody is connected.
+  const dark = parseStatus([
+    ['adapter', 'alpha', 'Alpha service', '1'],
+    ['service', 'alpha', 'stopped', '1', 'udp/51820', '-', '1'],
+    ['cred', 'alpha', 'c-dark', 'nam', 'active', '10.8.0.6', '-', '-', '-', '-', '-'],
+  ].map((r) => r.join(T)).join('\n'));
+  assert.strictEqual(dark.adapters[0].creds[0].connected, null);
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -451,7 +481,96 @@ check('every failed redemption is audited', () => {
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
-section('7. The QR encoder, against published values');
+section('7. Two processes, one token file');
+
+// panel/scripts/portal.js is the operator CLI and it is a SEPARATE PROCESS
+// over the same file as the running daemon. Every case below was broken until
+// 2026-08-31: the daemon read the file once at startup, so a revoke made on the
+// console never took effect, and the daemon's next write — which happens on a
+// plain sign-in, because verify() records lastUsedAt — erased it from disk.
+//
+// A second PortalTokens on the same path IS the second process for the purpose
+// of this test: the two share nothing but the file, which is the whole point.
+
+const twoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'vpn55-portal-twowriter-'));
+const twoFile = path.join(twoDir, 'portal-tokens.json');
+const daemonStore = new PortalTokens({ file: twoFile, warn() {} });
+daemonStore.load();
+const dToken = daemonStore.issue('nam', { label: 'phone' });
+
+function console_() {
+  const t = new PortalTokens({ file: twoFile, warn() {} });
+  t.load();
+  return t;
+}
+
+check('a code revoked on the console stops working without a restart', () => {
+  assert.ok(daemonStore.verify(dToken.token), 'the code did not work to begin with');
+  const cli = console_();
+  assert.ok(cli.revoke(dToken.record.id), 'the console could not revoke it');
+  assert.strictEqual(daemonStore.verify(dToken.token), null,
+    'the running process still honours a revoked code');
+});
+
+check("the console's revoke survives the daemon's next write", () => {
+  // The erasure path: any later save() from the daemon serialises its whole
+  // map, so a revoke it never saw would be written away.
+  daemonStore.issue('linh', {});
+  const onDisk = JSON.parse(fs.readFileSync(twoFile, 'utf8'));
+  const row = Object.values(onDisk.tokens).find((r) => r.id === dToken.record.id);
+  assert.ok(row, 'the record vanished from the file');
+  assert.ok(row.revokedAt, 'the revoke was erased by a later write');
+  assert.ok(Object.values(onDisk.tokens).some((r) => r.user === 'linh'),
+    "the daemon's own new code was lost in the merge");
+});
+
+check('a code issued on the console works without a restart', () => {
+  const minted = console_().issue('mai', {});
+  const seen = daemonStore.verify(minted.token);
+  assert.ok(seen && seen.user === 'mai', 'a console-issued code was not honoured');
+});
+
+check('the later lastUsedAt wins rather than whichever process wrote last', () => {
+  const cli = console_();
+  const future = new Date(Date.now() + 600000).toISOString();
+  let target = null;
+  for (const r of Object.values(cli.state.tokens)) if (r.user === 'mai') { r.lastUsedAt = future; target = r.id; }
+  assert.ok(target, 'no record to age');
+  cli.save();
+  daemonStore.issue('hoa', {});
+  const after = JSON.parse(fs.readFileSync(twoFile, 'utf8'));
+  const row = Object.values(after.tokens).find((r) => r.id === target);
+  assert.strictEqual(row.lastUsedAt, future, 'the newer reading was overwritten by an older one');
+});
+
+check('a corrupt file does not sign every user out', () => {
+  // Adopting an unreadable file would empty the map and 401 everybody at once,
+  // which is exactly what load()'s refusal to start empty exists to prevent.
+  const good = console_().issue('quan', {});
+  assert.ok(daemonStore.verify(good.token));
+  fs.writeFileSync(twoFile, '{ not json');
+  const still = daemonStore.verify(good.token);
+  assert.ok(still && still.user === 'quan', 'a corrupt file emptied the in-memory map');
+});
+
+check('a stale tmp file from a dead process does not wedge every later save', () => {
+  // The tmp name used to be <file>.<pid>.tmp and the open is 'wx'. A pid is
+  // reused, so one crash mid-write made the state directory silently
+  // unwritable for whatever process next got that pid.
+  fs.writeFileSync(twoFile, JSON.stringify({ version: 1, tokens: {} }, null, 2));
+  fs.writeFileSync(`${twoFile}.${process.pid}.tmp`, 'stale');
+  assert.doesNotThrow(() => { daemonStore.issue('binh', {}); });
+});
+
+check('save() leaves no temporary file behind', () => {
+  const left = fs.readdirSync(twoDir)
+    .filter((f) => f.endsWith('.tmp') && f !== `${path.basename(twoFile)}.${process.pid}.tmp`);
+  assert.deepStrictEqual(left, [], `temporary files left behind: ${left.join(', ')}`);
+});
+
+fs.rmSync(twoDir, { recursive: true, force: true });
+
+section('8. The QR encoder, against published values');
 
 check('the block table agrees with the published codeword totals', () => {
   const I = QR._internals;

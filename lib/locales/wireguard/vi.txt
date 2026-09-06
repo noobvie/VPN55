@@ -1,27 +1,69 @@
-@@ header
-Cấu hình máy khách VPN55
-Chứng danh {cred}  ·  người dùng {user}
+@@ main
+VPN55 — Hướng dẫn cài đặt
+=========================
+
+  Chứng danh  {cred}   (cấp cho {user})
+  Máy chủ     {endpoint}:{port}
+  Địa chỉ của bạn trong đường hầm  {ip}
+  DNS của đường hầm  {dns}
+
+Tệp nằm cạnh tệp này, vpn55-{cred}.conf, chính là toàn bộ chứng danh của bạn.
+Nó chứa một khoá riêng. Bất kỳ ai có bản sao đều dùng được quyền truy cập của
+bạn, vì vậy hãy gửi nó như gửi một mật khẩu và xoá khỏi mọi nơi không cần giữ.
+Máy chủ không giữ bản sao — nếu mất, câu trả lời là một chứng danh mới, không
+bao giờ là gửi lại.
+
+Toàn bộ lưu lượng đi qua đường hầm. IPv6 bị bắt lại và bỏ đi chứ không được
+định tuyến, nên nó hỏng theo hướng an toàn thay vì lọt ra ngoài mà không được
+mã hoá.
+
+DNS của đường hầm do máy chủ đặt. Trình phân giải đó thấy mọi tên miền bạn tra
+cứu trong lúc đang kết nối.
+
+
+Windows, macOS, Linux
+---------------------
+  1. Cài ứng dụng máy khách cho nền tảng của bạn.
+  2. Nhập vpn55-{cred}.conf — "Add Tunnel", hoặc "Import tunnel from file".
+  3. Bật đường hầm lên.
+
+  Trên Linux bạn cũng có thể dùng trực tiếp tệp cấu hình:
+      sudo cp vpn55-{cred}.conf /etc/wireguard/
+      sudo wg-quick up vpn55-{cred}
+
+Android và iOS
+--------------
+  1. Cài ứng dụng máy khách từ Play Store hoặc App Store.
+  2. Hoặc quét mã QR đã hiện ra khi chứng danh này được cấp, hoặc nhập tệp
+     vpn55-{cred}.conf từ thư mục tải về.
+  3. Bật đường hầm lên.
+
+  Mã QR và tệp là cùng một chứng danh. Quét thì nhanh hơn; tệp là thứ để dùng
+  khi mã không còn nữa.
 
 @@ custody.client
-GIỮ KHOÁ: do máy khách tạo. Máy chủ này chưa bao giờ giữ khoá riêng của
-  chứng danh này và không thể tạo ra một khoá nào. Hãy điền khoá của
-  chính bạn vào dòng PrivateKey bên dưới.
+Việc giữ khoá
+-------------
+  Chứng danh này được tạo từ khoá công khai do bạn cung cấp. Máy chủ này chưa
+  bao giờ giữ khoá riêng của nó và không thể tạo ra một khoá nào. Dòng
+  PrivateKey trong tệp cấu hình chỉ là giá trị tạm — hãy điền khoá của chính bạn
+  vào đó trước khi nhập tệp.
 
 @@ custody.server
-GIỮ KHOÁ: do máy chủ tạo. Máy chủ này đã tạo khoá riêng bên dưới và giữ
-  nó tối đa {ttl_hours} giờ sau khi cấp, rồi xoá đi.
-  Hãy lưu tệp này ngay — sau đó không thể tạo lại được nữa.
-
-@@ routing
-
-Toàn bộ lưu lượng đi qua đường hầm. IPv6 bị bắt lại và bỏ đi chứ không
-  được định tuyến, nên nó hỏng theo hướng an toàn thay vì lọt ra ngoài
-  mà không được mã hoá.
+Việc giữ khoá
+-------------
+  Máy chủ này đã tạo khoá riêng trong tệp cấu hình và giữ nó tối đa {ttl_hours}
+  giờ sau khi cấp để có thể tải về, rồi xoá đi. Hãy lưu tệp ngay bây giờ: sau đó
+  không thể tạo lại được nữa, và một chứng danh đã mất khoá thì phải thu hồi rồi
+  cấp lại chứ không thể gửi lại.
 
 @@ transport.awg
+Về cách truyền tải của máy chủ này
+----------------------------------
+  Máy chủ này chạy một biến thể được nguỵ trang, nên bạn cần một ứng dụng hiểu
+  được nó. Ứng dụng tiêu chuẩn sẽ từ chối các dòng Jc/S1/H1 trong tệp cấu hình,
+  và xoá những dòng đó đi cũng không quay về giao thức tiêu chuẩn — chỉ là ngừng
+  kết nối.
 
-VẬN CHUYỂN: AmneziaWG. Cách này cần một ứng dụng hiểu được nó — ứng dụng
-  WireGuard tiêu chuẩn sẽ từ chối các dòng Jc/S1/H1 bên dưới, và xoá
-  chúng đi cũng không quay về WireGuard thường, chỉ là ngừng kết nối.
-  Những giá trị đó là của riêng máy chủ này và phải được giữ nguyên
-  chính xác; chúng không phải bí mật và cũng không phải để tinh chỉnh.
+  Những giá trị đó là của riêng máy chủ này. Hãy giữ nguyên chính xác. Chúng
+  không phải bí mật và cũng không phải để tinh chỉnh.

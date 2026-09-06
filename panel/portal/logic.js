@@ -33,12 +33,20 @@
 // ── This is the second of two checks, not the only one ───────────────────────
 //
 // helper/vpnctl re-derives ownership from the register, as root, before it will
-// produce a single byte of a configuration — see `cred-config` there. So the
-// checks in this file are what make the portal give a good answer; they are not
-// what makes it a safe one. If everything below were deleted, a user still
-// could not read another user's configuration. Worth stating because the
-// tempting simplification — "the portal already checked, the helper can trust
-// it" — is the change that turns two independent checks into one.
+// produce a single byte of a configuration — see `cred-config` there — and
+// before it will revoke one for a caller that named a holder, which the portal
+// always does — see `cred-revoke`'s `user=`. So the checks in this file are
+// what make the portal give a good answer; they are not what makes it a safe
+// one. If everything below were deleted, a user still could not read or revoke
+// another user's credential. Worth stating because the tempting simplification
+// — "the portal already checked, the helper can trust it" — is the change that
+// turns two independent checks into one.
+//
+// The second half of that was NOT true until 2026-08-31. cred-revoke took an id
+// and revoked it, with no holder to compare against, so on the rotation path
+// this file was the only check — while this comment said it was not. If a verb
+// is added here, check what the helper does with it before extending the claim
+// to cover it: the claim is only worth making where it is true.
 //
 // ── Nothing here knows which protocol it is talking to ───────────────────────
 //
@@ -84,7 +92,15 @@ function ownCredentials(snapshot, user) {
       });
     }
   }
-  out.sort((a, b) => String(a.meta.created).localeCompare(String(b.meta.created)));
+  // Plain byte order, not localeCompare. `created` is a machine timestamp with
+  // a total order of its own; collating it would make the order of this list a
+  // property of whoever is reading it, which is not a thing anyone would think
+  // to check when it went wrong in one language only.
+  out.sort((a, b) => {
+    const x = String(a.meta.created);
+    const y = String(b.meta.created);
+    return x < y ? -1 : x > y ? 1 : 0;
+  });
   return out;
 }
 
@@ -155,8 +171,11 @@ function accountView({ snapshot, collector, user, health, now = Math.floor(Date.
       // and the page offers the download and lets it fail honestly rather than
       // telling somebody their working credential is beyond recovery.
       configAvailable: meta.held,
-      // Live state, absent when the service is not carrying this credential.
-      connected: Boolean(live && live.endpoint !== null),
+      // Live state, from the adapter's own answer. Not inferred from the
+      // endpoint: on a peer-based protocol that address is the last one the
+      // peer was ever seen at and outlives the session entirely, so a phone
+      // that connected in March would show here as connected now.
+      connected: Boolean(live && live.connected === true),
       lastSeen: slot ? slot.lastSeen : (live ? live.handshake : { kind: 'unknown', at: null }),
       rxTotal: slot ? slot.rxTotal : null,
       txTotal: slot ? slot.txTotal : null,

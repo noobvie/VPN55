@@ -340,6 +340,12 @@ _ipsec_stop_legacy() {
 _ipsec_install_packages() {
     local -a want=() missing=()
     mapfile -t want < <(_ipsec_packages) || return 1
+    # mapfile succeeds even when the process substitution inside it failed, so
+    # the emptiness is what has to be tested. Without this the loop below is
+    # skipped, nothing is installed, and the failure surfaces two calls later as
+    # "'swanctl' is still missing after installing packages" — which points at
+    # the wrong thing. Same guard, same reason, as _ovpn_install_packages.
+    [[ ${#want[@]} -gt 0 ]] || { error "no package set for this host"; return 1; }
 
     local pkg
     for pkg in "${want[@]}"; do
@@ -518,6 +524,19 @@ CONF
 # the PKI rather than copies, so there is one file on disk per key and the CRL
 # the daemon loads is always the one core_pki just regenerated — a copy would
 # quietly go stale the first time the timer ran.
+#
+# ⚠ The condition that makes this safe: charon runs as ROOT on every
+# distribution this project claims. $VPN55_PKI is 0700 root-owned, so a symlink
+# out of it is only followable by root — the modes on the directories below are
+# not what governs access, the target's are. The day strongSwan is packaged to
+# drop to its own user, every one of these links stops resolving and the daemon
+# fails to load the CA, the server key AND the revocation list at once, which
+# presents as "nobody can connect" with nothing wrong in the config.
+#
+# If that day comes, the fix is the one the OpenVPN adapter already uses:
+# PUBLISH a copy into a directory the daemon's user can read (see
+# _ovpn_publish_crl) and re-copy from the refresh hook, rather than loosening
+# the mode on the directory that holds the CA key.
 _ipsec_link_creds() {
     local cn
     cn="$(_ipsec_server_cn)"
@@ -1110,8 +1129,16 @@ vpn_ipsec_cred_remove() {
     # pki_cert_revoke regenerates the list and fires the reload hook, so the
     # daemon already refuses the next authentication. What is left is the
     # session that authenticated before any of that happened.
-    local published=0
+    #
+    # A STOPPED daemon is not a failure of either step. It holds no security
+    # associations, so there is nothing to terminate and nothing to reload into
+    # — the revocation is complete the moment the certificate is on the list.
+    # Reporting that as "the live session could not be ended" would warn an
+    # operator about a session that does not exist, and would return a CRL-bound
+    # latency for a revocation that is already absolute.
+    local running=0 published=0 terminated=1
     if _ipsec_active; then
+        running=1
         if _ipsec_reload_creds; then
             published=1
         else
@@ -1119,17 +1146,19 @@ vpn_ipsec_cred_remove() {
         fi
     fi
 
-    local terminated=1 ike_id
-    if [[ "$published" == "1" ]]; then
-        while IFS= read -r ike_id; do
-            [[ -n "$ike_id" ]] || continue
-            if ! swanctl --terminate --ike-id "$ike_id" >/dev/null 2>&1; then
-                warn "could not terminate the live session ${ike_id} for '${cred}'"
-                terminated=0
-            fi
-        done < <(_ipsec_sa_records | awk -F'\t' -v c="$cred" '$1 == c { print $2 }')
-    else
-        terminated=0
+    local ike_id
+    if [[ "$running" == "1" ]]; then
+        if [[ "$published" == "1" ]]; then
+            while IFS= read -r ike_id; do
+                [[ -n "$ike_id" ]] || continue
+                if ! swanctl --terminate --ike-id "$ike_id" >/dev/null 2>&1; then
+                    warn "could not terminate the live session ${ike_id} for '${cred}'"
+                    terminated=0
+                fi
+            done < <(_ipsec_sa_records | awk -F'\t' -v c="$cred" '$1 == c { print $2 }')
+        else
+            terminated=0
+        fi
     fi
 
     fs_remove "$(_ipsec_cred_file "$cred")" || warn "could not remove the index entry for '${cred}'"
@@ -1142,10 +1171,14 @@ vpn_ipsec_cred_remove() {
             || warn "the certificate is revoked but the registry still shows '${cred}' active"
     fi
 
-    if [[ "$published" == "1" && "$terminated" == "1" ]]; then
+    if [[ "$terminated" == "1" ]]; then
         printf 'revoked\t%s\t%s\timmediate\t0\n' "$VPN55_IPSEC_TAG" "$cred"
         success "Credential '${cred}' revoked — the certificate is on the revocation"
-        success "list and any live session was terminated."
+        if [[ "$running" == "1" ]]; then
+            success "list and any live session was terminated."
+        else
+            success "list, and the service is stopped so no session is carrying it."
+        fi
     else
         local bound
         bound="$(_ipsec_revoke_bound)"
@@ -1388,6 +1421,13 @@ _ipsec_ca_cn() {
 # ⚠ This file contains the certificate bundle AND its passphrase in the clear.
 # It is exactly as sensitive as the private key, which is why it lives in the
 # same spool under the same TTL and never in a world-readable place.
+#
+# ⚠ PayloadDescription is a LABEL here, not a sentence, and must stay one. This
+# file is spooled at issue and read from the device's own Settings screen, so
+# any prose written into it is frozen in one language at the moment somebody
+# pressed a button — and the person reading it is usually not that somebody.
+# What the profile is and what it carries is explained in the `instructions`
+# artifact, which is rendered at handover and translated.
 _ipsec_build_mobileconfig() {
     local cred="${1:-}" user="${2:-}" pass="${3:-}"
     local endpoint ca_cn ca_b64 p12_b64
@@ -1429,7 +1469,7 @@ _ipsec_build_mobileconfig() {
   <key>PayloadDisplayName</key>
   <string>VPN55</string>
   <key>PayloadDescription</key>
-  <string>IKEv2 VPN for ${e_user}. Contains the certificate authority and this device's identity.</string>
+  <string>VPN55 &#8212; ${e_user}</string>
   <key>PayloadOrganization</key>
   <string>VPN55</string>
   <key>PayloadRemovalDisallowed</key>
@@ -1634,10 +1674,22 @@ _ipsec_sa_records() {
 
         function flush() {
             if (cred != "") {
-                print cred TAB ike TAB state TAB rhost TAB rport TAB vip TAB est TAB bin TAB bout
+                # LAST SEEN, not session start. `established` is when this
+                # tunnel came up, and reporting it would show a device that has
+                # been connected and busy for three days as three days idle —
+                # the exact reading the contract says this field is not. The
+                # child SAs carry `use-in` / `use-out`, seconds since traffic
+                # last crossed in each direction, and the smaller of those is
+                # the honest answer. They only appear once there HAS been
+                # traffic, so a session that has carried none falls back to the
+                # moment it came up, which is then genuinely the last proof of
+                # life there is.
+                seen = est
+                if (use != "" && use + 0 >= 0) seen = now - use
+                print cred TAB ike TAB state TAB rhost TAB rport TAB vip TAB seen TAB bin TAB bout
             }
             cred = ""; ike = ""; state = ""; rhost = "-"; rport = "-"
-            vip = "-"; est = "-"; bin = 0; bout = 0; seen = 0
+            vip = "-"; est = "-"; bin = 0; bout = 0; use = ""
         }
 
         {
@@ -1688,6 +1740,13 @@ _ipsec_sa_records() {
             } else if (depth == 3) {
                 if (key == "bytes-in")       bin += val + 0
                 else if (key == "bytes-out") bout += val + 0
+                # Seconds since this direction last carried traffic. Kept as the
+                # SMALLEST across every direction of every child SA, because the
+                # question is when the credential was last seen at all, not when
+                # a particular half of a particular association was.
+                else if (key == "use-in" || key == "use-out") {
+                    if (val + 0 >= 0 && (use == "" || val + 0 < use + 0)) use = val
+                }
             }
         }
 
@@ -1702,24 +1761,35 @@ _ipsec_sa_records() {
 # concatenate every adapter's output into one stream.
 #
 #   service   <tag>  <state>  <enabled>  <listen>  <since>  <cred_count>
-#   cred      <tag>  <cred_id>  <user>  <state>  <address>  <rx>  <tx>  <handshake>  <endpoint>
-#   note      <tag>  <severity>  <message>
+#   cred      <tag>  <cred_id>  <user>  <state>  <address>  <rx>  <tx>  <handshake>  <endpoint>  <connected>
+#   note      <tag>  <info|warn|crit>  <message>
 #
 #   state      absent | stopped | running   (closed vocabulary, all protocols)
 #   listen     a display string, not a single port — this one serves two
+#   address    "-", always. This protocol does not pin an address per
+#              credential: the daemon hands out a virtual IP from its own pool
+#              at connect time, so there is nothing to report until a session
+#              exists — and once one does, the `cred` record below carries it.
 #   rx / tx    bytes as the protocol reports them RIGHT NOW, or "-" when there
 #              is no reading. "-" is NOT zero and must not be treated as a
 #              counter reset by the collector.
-#   handshake  unix epoch of the last proof this credential was live.
-#              0  = never, as a fact.
-#              -  = no reading. This adapter cannot tell the two apart for a
-#                   credential that is not connected right now: the daemon keeps
-#                   no history, so "never connected" and "connected yesterday"
-#                   look identical from here. Reporting 0 for both would state a
-#                   fact this adapter does not have.
+#   handshake  unix epoch of the last moment this credential was OBSERVED live —
+#              the newest `use-in`/`use-out` across its child SAs, falling back
+#              to when the association came up for a session that has carried no
+#              traffic yet. Not the session's start time: a device connected and
+#              busy for three days was last seen NOW, not three days ago.
+#              -  = no reading. This adapter cannot say "never": the daemon
+#                   keeps no history, so a credential that is not connected
+#                   right now looks identical whether it connected yesterday or
+#                   has never been used, and reporting 0 would state a fact this
+#                   adapter does not have.
 #   endpoint   the peer's current remote address, or "-". LIVE state only, never
 #              retained — docs/security-model.md §2 says VPN55 keeps no per-user
 #              connection IP history.
+#   connected  1 | 0 | -. There is an association for this credential in the
+#              live SA table, or there is not. "-" while the daemon is stopped
+#              or unreadable, because then this adapter has established nothing
+#              — not that nobody is connected.
 vpn_ipsec_status() {
     _ipsec_spool_sweep || true
 
@@ -1761,18 +1831,18 @@ vpn_ipsec_status() {
     # comes from the registry. The underscore keeps a linter quiet, and it is
     # also the honest signal that this loop is POSITIONAL: dropping a name here
     # rather than renaming it would shift every value after it by one.
-    declare -A sa_host sa_vip sa_est sa_in sa_out
-    local c_cred _c_ike _c_state c_host c_port c_vip c_est c_in c_out
-    while IFS=$'\t' read -r c_cred _c_ike _c_state c_host c_port c_vip c_est c_in c_out; do
+    declare -A sa_host sa_vip sa_seen sa_in sa_out
+    local c_cred _c_ike _c_state c_host c_port c_vip c_seen c_in c_out
+    while IFS=$'\t' read -r c_cred _c_ike _c_state c_host c_port c_vip c_seen c_in c_out; do
         [[ -n "$c_cred" ]] || continue
         sa_host["$c_cred"]="${c_host}:${c_port}"
         sa_vip["$c_cred"]="$c_vip"
-        sa_est["$c_cred"]="$c_est"
+        sa_seen["$c_cred"]="$c_seen"
         sa_in["$c_cred"]="$c_in"
         sa_out["$c_cred"]="$c_out"
     done < <(_ipsec_sa_records)
 
-    local cred user cstate row
+    local cred user cstate row connected
     while IFS= read -r cred; do
         [[ -n "$cred" ]] || continue
         user="$(_ipsec_cred_get "$cred" user)"
@@ -1782,12 +1852,22 @@ vpn_ipsec_status() {
             cstate="${row##*$'\t'}"
         fi
 
-        printf 'cred\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        # A stopped daemon has no SA table to be absent from, so it cannot say
+        # this credential is disconnected — only that it does not know.
+        if [[ "$state" != "running" ]]; then
+            connected='-'
+        elif [[ -n "${sa_seen[$cred]:-}" ]]; then
+            connected=1
+        else
+            connected=0
+        fi
+
+        printf 'cred\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
             "$tag" "$cred" "$user" "$cstate" \
             "${sa_vip[$cred]:--}" \
             "${sa_in[$cred]:--}" "${sa_out[$cred]:--}" \
-            "${sa_est[$cred]:--}" \
-            "${sa_host[$cred]:--}"
+            "${sa_seen[$cred]:--}" \
+            "${sa_host[$cred]:--}" "$connected"
     done <<< "$ids"
     return 0
 }
@@ -1800,6 +1880,24 @@ _ipsec_notes() {
 
     printf 'note\t%s\tinfo\t%s\n' "$tag" \
         "IPv6 does not travel through this tunnel. A dual-stack device keeps using its own IPv6 path, and the server cannot block traffic that never reaches it."
+
+    # ── Why this service gets no second endpoint ────────────────────────────
+    #
+    # docs/circumvention.md §4 wants every client config to carry more than one
+    # address. The other two adapters now do. This one deliberately does not,
+    # and the reason is the same one that puts it in the toolkit at all.
+    #
+    # strongSwan's own client honours a list of remote addresses. The clients
+    # this protocol EXISTS to serve — the ones already on the phone, with no app
+    # to install — take exactly one server address: iOS, macOS and Windows all
+    # store a single host in the profile. Emitting a list would therefore serve
+    # the users who have the least need of it and none of the users this is for,
+    # while letting the endpoint list read as though it covered all three
+    # services. Saying nothing would be the quieter version of the same lie.
+    if [[ "$(net_endpoints_count)" != "0" ]]; then
+        printf 'note\t%s\twarn\t%s\n' "$tag" \
+            "The additional endpoints on this server do not reach this service. A device connecting with no app installed stores one server address and cannot move to another, so these profiles carry this host's address alone. On a network that blocks it, this service goes with it."
+    fi
 
     local left
     left="$(pki_crl_expires_in)"
@@ -1816,6 +1914,46 @@ _ipsec_notes() {
     if [[ "$(_ipsec_reauth)" == "0" ]]; then
         printf 'note\t%s\twarn\t%s\n' "$tag" \
             "Re-authentication is off. If a revoked credential's live session cannot be terminated, its tunnel has no guaranteed end."
+    fi
+    return 0
+}
+
+# ─── What must survive this host ──────────────────────────────────────────────
+# The backup contract: one absolute path per line, on stdout. core_backup.sh
+# names no protocol, so this is the only place that knows what IKEv2 keeps.
+#
+# ⚠ The server's PRIVATE KEY is named here by the CN this adapter recorded, for
+# the same reason the OpenVPN adapter names its own: an archive holding the
+# certificate but not the key restores a host whose daemon cannot load its own
+# identity. It is more acute here — _ipsec_server_cert_ensure REVOKES the
+# previous server certificate when it issues a replacement, so a restore that
+# forced a reissue would revoke a certificate that is still the only one clients
+# have been told to expect.
+#
+# NOT here, and each for its own reason:
+#   the spool          .mobileconfig and .p12 bundles awaiting collection, each
+#                      holding a client private key, erased hours after issue
+#   /etc/swanctl/**    swanctl.conf is regenerated by the next --install, and
+#                      everything under x509/ and private/ is a SYMLINK into the
+#                      PKI this backup already carries. Archiving those links
+#                      would preserve two copies of one fact and restore neither
+#                      usefully — the links are remade when the service is
+#                      installed on the replacement host.
+vpn_ipsec_backup_paths() {
+    local p cn
+
+    [[ -f "$VPN55_IPSEC_CONF" ]] && printf '%s\n' "$VPN55_IPSEC_CONF"
+
+    if [[ -d "$VPN55_IPSEC_CREDS" ]]; then
+        for p in "$VPN55_IPSEC_CREDS"/*; do
+            [[ -f "$p" ]] && printf '%s\n' "$p"
+        done
+    fi
+
+    cn="$(_ipsec_server_cn)"
+    if [[ -n "$cn" ]]; then
+        p="$(pki_key_path "$cn")"
+        [[ -f "$p" ]] && printf '%s\n' "$p"
     fi
     return 0
 }

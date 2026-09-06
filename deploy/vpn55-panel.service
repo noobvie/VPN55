@@ -3,7 +3,13 @@
 #
 #   install:  install -o root -g root -m 0644 vpn55-panel.service \
 #                     /etc/systemd/system/vpn55-panel.service
+#             install -d -o root -g root -m 0700 /var/log/vpn55
 #             systemctl daemon-reload && systemctl enable --now vpn55-panel
+#
+# The log directory is part of the install, not something the helper creates on
+# first use: ReadWritePaths= below names it, and a path named there must exist
+# or the unit refuses to start. See the hardening block for why that is
+# deliberate, and why LogsDirectory= is the wrong way to create it.
 #
 # Its own unit, its own port, its own user. It shares a process with nothing
 # public-facing, so a flaw in a public site is not a flaw in the panel and the
@@ -89,6 +95,20 @@ StateDirectoryMode=0750
 #   SystemCallFilter=  is the one a hardening guide will most want to add. It is
 #       also the one that most reliably breaks this unit, for the reason above.
 #
+# ── One more, which does NOT set no_new_privs and still breaks something ────
+#
+#   IPAddressDeny=any (with an allow list for the bind address) is the obvious
+#       hardening for a service that only ever listens. It was true until
+#       alerting existed. With alert_enabled=1 the panel makes ONE outbound
+#       connection, to the webhook the operator configured, and an address
+#       filter that does not allow it kills exactly that — silently, because a
+#       blocked connect looks like a webhook that did not answer, and the whole
+#       point of the alerts is that nobody is watching when they matter.
+#
+#       If you add one, allow the webhook's address, and check
+#       `journalctl -u vpn55-panel | grep "could not deliver alert"` afterwards
+#       rather than assuming.
+#
 # ── Verify rather than trust this comment ───────────────────────────────────
 # After any change to this file:
 #
@@ -99,11 +119,20 @@ StateDirectoryMode=0750
 # read will fail with the misleading message above. Find it and remove it — do
 # not work around it by giving the panel user broader privileges.
 #
+# Two more, because a unit that starts is not a unit whose privileged path works
+# — and neither of these fails at start-up, only at the first write:
+#
+#     systemctl show -p CapabilityBoundingSet vpn55-panel   # must NOT be empty
+#     systemctl show -p ReadWritePaths vpn55-panel          # must list /etc/vpn55
+#
 # ── What IS safe here ───────────────────────────────────────────────────────
 # The mount- and namespace-based protections below restrict what the process can
-# SEE rather than what it can call, and none of them touches no_new_privs. They
-# are the ones that matter most for this service anyway: it reads a fixed set of
-# files and writes exactly one.
+# SEE rather than what it can call, and none of them touches no_new_privs.
+#
+# But "safe" is not the same as "free": a mount namespace binds the sudo'd root
+# child as well, so every one of them constrains the HELPER too. That is what
+# ReadWritePaths= below is for, and it is why the capability bounding set is
+# left alone. Read both before adding anything else here.
 # =============================================================================
 
 ProtectSystem=strict
@@ -112,11 +141,103 @@ PrivateTmp=yes
 ProtectProc=invisible
 ProcSubset=pid
 
-# The panel needs no capabilities of its own — everything privileged happens in
-# a separate process that sudo gives its own. Emptying the bounding set does not
-# prevent sudo from working: sudo's transition is by setuid, and the bounding
-# set is re-established for the new process.
-CapabilityBoundingSet=
+# ── ReadWritePaths — and why root needs to be listed here at all ─────────────
+#
+# ⚠ A mount namespace is per-UNIT, and every descendant is inside it — INCLUDING
+# the process sudo starts as root. `ProtectSystem=strict` therefore makes the
+# whole hierarchy read-only for `helper/vpnctl` too, and root does not escape a
+# read-only bind mount. Without the list below, all seven write verbs fail on
+# their first write and `/var/log/vpn55/vpnctl.log` is never created at all —
+# silently, because _ctl_audit is deliberately non-fatal so that an unwritable
+# log can never block a revocation. That is the one log docs/security-model.md
+# §6E.4 says survives a panel compromise, so its absence would be discovered on
+# the day it was needed.
+#
+# This is the set the ROOT HELPER writes, not the panel:
+#
+#   /etc/vpn55       the user registry, the PKI, address leases, and each
+#                    adapter's own state and hand-off spool
+#   /var/log/vpn55   the helper's audit log
+#   /etc/wireguard   the [Peer] block cred-add appends
+#   /etc/openvpn     the per-client entry and the CRL
+#   /etc/swanctl     the IKEv2 credentials
+#
+# ⚠ The last three are ADAPTER-SPECIFIC, so a fourth protocol adapter means a
+# fourth line here. The failure if it is forgotten is a write verb that fails at
+# runtime on a host where everything else works.
+#
+# The adapter paths are prefixed `-`, so a missing one is ignored rather than
+# refusing to start: a host running only WireGuard has no /etc/swanctl, and that
+# is the normal case rather than a misconfiguration.
+#
+# ⚠ The first two are NOT prefixed, and the asymmetry is the point. For an
+# adapter directory, absent means "that protocol is not installed". For these
+# two it means the registry or the audit log has nowhere to live — and the
+# helper's own `mkdir -p` cannot rescue it, because /etc and /var/log are
+# read-only inside this namespace. A start-up refusal naming the directory is
+# the whole failure, said while somebody is looking; the alternative is a panel
+# that runs and keeps no root-side audit trail at all, which is precisely the
+# state docs/security-model.md §6E.4 exists to prevent.
+#
+# ⚠ Do NOT "fix" a missing /var/log/vpn55 with LogsDirectory=vpn55. systemd
+# would create it owned by the SERVICE USER, and a log the panel can rewrite is
+# not a log that survives a panel compromise — which is the only property that
+# file has. It is root:root 0700, created by the install (see the header).
+ReadWritePaths=/etc/vpn55
+ReadWritePaths=/var/log/vpn55
+ReadWritePaths=-/etc/wireguard
+ReadWritePaths=-/etc/openvpn
+ReadWritePaths=-/etc/swanctl
+
+# ── The one path this service must never see ────────────────────────────────
+# /var/backups/vpn55 holds the encrypted archive, and that archive contains the
+# CERTIFICATE AUTHORITY'S PRIVATE KEY. DAC already stops the panel user reading
+# a 0700 root-owned directory, but this service reaches root through two sudo
+# rules and the mount namespace binds that root child too — so the exclusion is
+# stated in the unit, where it holds for the helper as well.
+#
+# ⚠ There is deliberately no panel route, no vpnctl verb and no sudoers rule for
+# backup or restore. A panel compromise costs the seven write verbs it already
+# costs; it must not also cost the whole fleet's identity in one file. If a
+# future release wants a "download the backup" button, the answer is no — read
+# the passphrase note at the top of lib/core_backup.sh first.
+#
+# It is prefixed `-` because a host that has never taken a backup has no such
+# directory, and a unit that refuses to start over a missing backup directory
+# would take the panel down for the least urgent reason available.
+InaccessiblePaths=-/var/backups/vpn55
+
+# ── The capability bounding set is deliberately NOT restricted ───────────────
+#
+# ⚠ This file used to carry `CapabilityBoundingSet=` (empty), with a comment
+# claiming sudo was unaffected because "the bounding set is re-established for
+# the new process". That is not how the kernel works, and the claim cost nothing
+# to write and everything to believe.
+#
+# The bounding set is inherited across execve and can only ever be DROPPED. On a
+# setuid-root exec the kernel computes the new permitted set as
+#
+#     pP' = bset | pI          (security/commoncap.c, privileged-root case)
+#
+# so an empty bounding set means the process sudo starts has euid 0 and ZERO
+# capabilities. sudo itself then fails first, at the setgroups()/setresgid(0)
+# it does before exec: the file is setuid, not setgid, so gid 0 is not already
+# in its saved set and the change needs CAP_SETGID, which is gone. This is the
+# same breakage that empties `ping` under the identical setting. Had sudo
+# survived it, `wg set` would have failed next for want of CAP_NET_ADMIN.
+#
+# Restricting the set to just what the adapters need was the other option and is
+# rejected: it is a list that goes stale the day an adapter shells out to
+# something new, and it goes stale silently.
+#
+# Nothing is lost by leaving it alone. The panel runs as an unprivileged user
+# with no file capabilities, so its own effective and permitted sets are empty
+# whatever the bounding set says — the bounding set constrains only what a
+# future setuid exec may pick up, and the only setuid exec here is the one that
+# is supposed to reach root.
+#
+# Ambient capabilities ARE emptied: that is this process's own set, it is
+# already empty for a normal service user, and saying so costs nothing.
 AmbientCapabilities=
 
 # ── Logging ─────────────────────────────────────────────────────────────────

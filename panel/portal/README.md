@@ -73,8 +73,17 @@ is most of what changing a number in a URL is for.
 
 **That check happens twice, and this one is not the control.** `helper/vpnctl`'s
 `cred-config` verb takes the user *and* the credential and re-derives ownership from
-the register, as root, before it produces a single byte. If every line of `logic.js`
-were wrong, a user still could not read another user's configuration.
+the register, as root, before it produces a single byte. Its `cred-revoke` verb does
+the same when the caller passes `user=`, which the portal always does — the admin
+panel does not, because revoking on somebody else's behalf is what an operator is
+for. If every line of `logic.js` were wrong, a user still could not read or revoke
+another user's credential.
+
+That was a claim before it was a fact. Until 2026-08-31 `cred-revoke` took an id and
+revoked it, so the destructive half of a rotation had exactly one ownership check —
+this file's — while this paragraph said otherwise. The lesson is narrower than "add
+a check": a defence-in-depth claim written about one verb quietly generalises to
+every verb the reader is looking at. Say which verb.
 
 ---
 

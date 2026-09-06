@@ -19,8 +19,10 @@ panel/sessions/
 
 # Local
 .env
+.env.*
 *.log
 .DS_Store
 
 # Release artifacts — built by tools/release.sh, published, never committed.
 dist/
+.vscode/

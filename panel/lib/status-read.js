@@ -103,6 +103,12 @@ class StatusReader {
     return programProblems(this.installer, {
       settingName: 'installer',
       label: `${this.installer} ${STATUS_ARG}`,
+      // vpn55.sh resolves VPN55_ROOT to its OWN directory and sources
+      // "$VPN55_ROOT/lib" from there, so the libraries sit beside it. Named here
+      // rather than derived in privileged-path.js because the helper resolves
+      // the same directory differently, and a shared guess would be wrong for
+      // one of them without saying so.
+      sourcedFrom: path.join(path.dirname(path.resolve(this.installer)), 'lib'),
     });
   }
 

@@ -43,6 +43,7 @@
 //     the real ordering.
 
 const { spawn } = require('node:child_process');
+const path = require('node:path');
 
 const { programProblems } = require('./privileged-path');
 
@@ -172,7 +173,16 @@ class Privileged {
    * Returns problem sentences; empty means good.
    */
   preflight() {
-    return programProblems(this.helper, { settingName: 'helper' });
+    return programProblems(this.helper, {
+      settingName: 'helper',
+      // vpnctl resolves VPN55_ROOT to its own directory's PARENT and sources
+      // "$VPN55_ROOT/lib" — eight core libraries and then every proto_*.sh
+      // adapter — as root, before a verb does anything. lib/ is a sibling of
+      // helper/, so walking the helper's parents never reaches it: being able
+      // to write lib/ui.sh is root just as surely as being able to write the
+      // helper, and until this argument was passed it was not checked at all.
+      sourcedFrom: path.join(path.dirname(path.dirname(path.resolve(this.helper))), 'lib'),
+    });
   }
 
   /**
@@ -379,6 +389,16 @@ class Privileged {
     if (service) {
       if (!RE_TAG.test(service)) return Promise.reject(new HelperError('invalid service tag', { code: 3, verb: 'cred-revoke' }));
       args.push(service);
+    }
+    // An ownership assertion the helper re-derives from the registry as root.
+    // The self-serve portal passes it because it has exactly one user it is
+    // allowed to act for; the admin panel and the enforcement sweep do not,
+    // because acting on somebody else's behalf is what they are for.
+    if (opts.expectUser) {
+      if (!RE_USER.test(opts.expectUser)) {
+        return Promise.reject(new HelperError('invalid user name', { code: 3, verb: 'cred-revoke' }));
+      }
+      args.push(`user=${opts.expectUser}`);
     }
     return this.call('cred-revoke', args, opts);
   }

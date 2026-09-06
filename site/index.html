@@ -28,7 +28,12 @@
     --bg: #f4f6f8; --surface: #fff; --ink: #14181d; --ink-2: #55606b;
     --line: #d8dee4; --accent: #b4552a; --ok: #1f7a5c;
     --mono: ui-monospace, "SFMono-Regular", "Cascadia Mono", Consolas, monospace;
-    --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+    /* No "Helvetica Neue": its Latin Extended Additional coverage is incomplete
+       and this page is entirely Vietnamese, where a missing glyph is a
+       per-character fallback in the middle of a word. Same rule as
+       panel.css — see .github/scripts/check-fonts.mjs, which now reads this
+       file too. Arial is the measured face that ends the stack. */
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
   }
   @media (prefers-color-scheme: dark) {
     :root {
@@ -76,6 +81,21 @@
   .card p { margin: 0; font-size: .92rem; color: var(--ink-2); }
   footer { border-top: 1px solid var(--line); margin-top: 56px; padding-top: 22px;
     color: var(--ink-2); font-size: .88rem; }
+  /* The signature. Same mark, same place, as the admin panel and the user
+     portal — those two share panel/public/css/brand.css; this page cannot,
+     because it makes no external request of any kind. Keep the two in step by
+     hand: the geometry is the six percentages below and nothing else.
+     Three red stripes on yellow in a 3:2 field, centred — five bands of 7.5%
+     spanning 31.25%–68.75%, which is what puts the middle stripe exactly on the
+     centre line. Drawn in CSS so there is no image to load and none to block. */
+  .made { display: flex; align-items: center; gap: .45rem; flex-wrap: wrap; margin-top: 14px; }
+  .made__flag {
+    width: 1.35em; height: .9em; flex: none; border-radius: 2px;
+    background: linear-gradient(
+      #ffcd00 0 31.25%, #da251d 0 38.75%, #ffcd00 0 46.25%, #da251d 0 53.75%,
+      #ffcd00 0 61.25%, #da251d 0 68.75%, #ffcd00 0 100%);
+    box-shadow: inset 0 0 0 1px rgba(0, 0, 0, .25);
+  }
   .wrapover { overflow-x: auto; }
 </style>
 </head>
@@ -207,6 +227,7 @@ sha256sum -c SHA256SUMS</pre>
   <p class="en-note">We run no servers, hold none of your data, and see none of your
      traffic. VPN law differs by country and we cannot advise on your situation. Provided
      “as is”, without warranty. Not legal advice.</p>
+  <p class="made"><span>❤️ Từ Sài Gòn thân yêu · From beloved Saigon</span><span class="made__flag" aria-hidden="true"></span></p>
 </footer>
 
 </div>

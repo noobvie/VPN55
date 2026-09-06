@@ -20,18 +20,29 @@
 // adapter can answer, since every one of them resets its counters.
 
 /**
- * A credential is "reported" when the service returned a current remote address
- * for it on this poll. That is the one liveness signal all three protocols can
- * answer the same way.
+ * A credential is "reported" when its service says it is carrying a session for
+ * it right now. That is the `connected` field, which the adapter answers because
+ * only the adapter can: this side may not learn which protocol it is holding.
  *
- * It is deliberately NOT combined with the handshake into a single "connected"
- * boolean. The handshake means three different things across the three
- * protocols — last completed handshake, session established time, status-file
- * timestamp — so folding them together would produce a confident boolean that
- * is wrong for at least one of them. Both facts are carried; the UI shows both.
+ * It used to be read off `endpoint`, on the reasoning that a current remote
+ * address was the one liveness signal every protocol could answer the same way.
+ * It is not one. On a peer-based protocol the endpoint is the LAST address the
+ * peer was seen at and survives for the life of the interface, so a device that
+ * connected once in March reads as online for ever; and a protocol with no peers
+ * at all has no endpoint to give, which would make every credential on such a
+ * service permanently invisible here. Both are silent, plausible-looking wrong
+ * answers, which is the worst kind.
+ *
+ * `connected` is deliberately NOT folded together with the handshake. The
+ * handshake is a TIME — when this credential was last observed live — and the
+ * two answer different questions. Both facts are carried; the UI shows both.
+ *
+ * null means the adapter could not tell (its daemon is stopped or unreadable),
+ * and that is not "disconnected": it is treated as not-reported for counting,
+ * but the service's own state is what says why.
  */
 function isReported(cred) {
-  return cred.endpoint !== null;
+  return cred.connected === true;
 }
 
 function buildView({ snapshot, collector, cfg, health }) {
@@ -45,7 +56,9 @@ function buildView({ snapshot, collector, cfg, health }) {
       services: [],
       users: [],
       connections: [],
-      events: collector.events(cfg.event_limit).slice(0, 100),
+      // collector.eventLimit, not cfg.event_limit: the settings screen changes
+      // it without a restart, and cfg is the record of what was loaded.
+      events: collector.events(collector.eventLimit).slice(0, 100),
       orphanCredentials: [],
       counts: { services: 0, users: 0, credentials: 0, reported: 0 },
     };
@@ -100,6 +113,7 @@ function buildView({ snapshot, collector, cfg, health }) {
         resets: slot ? slot.resets : 0,
         firstSeen: slot ? slot.firstSeen : null,
         handshake: c.handshake,
+        connected: c.connected,
         lastSeen: slot ? slot.lastSeen : c.handshake,
       });
     }

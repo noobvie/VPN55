@@ -1,26 +1,67 @@
-@@ header
-VPN55 client configuration
-Credential {cred}  ·  user {user}
+@@ main
+VPN55 — setup instructions
+==========================
+
+  Credential  {cred}   (issued to {user})
+  Server      {endpoint}:{port}
+  Your address inside the tunnel  {ip}
+  Tunnel DNS  {dns}
+
+The file beside this one, vpn55-{cred}.conf, is your whole credential. It holds
+a private key. Anyone who has a copy of it can use your access, so send it the
+way you would send a password and delete it from anywhere it does not need to
+stay. The server does not keep a copy — if it is lost, the answer is a new
+credential, never a resend.
+
+All traffic goes through the tunnel. IPv6 is captured and dropped rather than
+routed, so it fails closed instead of leaving in the clear.
+
+The tunnel's DNS is set by the server. That resolver sees every hostname you
+look up while connected.
+
+
+Windows, macOS, Linux
+---------------------
+  1. Install the client app for your platform.
+  2. Import vpn55-{cred}.conf — "Add Tunnel", or "Import tunnel from file".
+  3. Activate it.
+
+  On Linux you can also use the configuration directly:
+      sudo cp vpn55-{cred}.conf /etc/wireguard/
+      sudo wg-quick up vpn55-{cred}
+
+Android and iOS
+---------------
+  1. Install the client app from the Play Store or the App Store.
+  2. Either scan the QR code you were shown when this credential was issued, or
+     import vpn55-{cred}.conf from your downloads.
+  3. Turn the tunnel on.
+
+  The QR code and the file are the same credential. Scanning is easier; the file
+  is what to use once the code is no longer available.
 
 @@ custody.client
-KEY CUSTODY: client-generated. This server has never held the private
-  key for this credential and cannot produce one. Put your own key on
-  the PrivateKey line below.
+Key custody
+-----------
+  This credential was made from a public key you supplied. This server has never
+  held its private key and cannot produce one. The PrivateKey line in the
+  configuration is a placeholder — put your own key there before importing it.
 
 @@ custody.server
-KEY CUSTODY: server-generated. This server created the private key
-  below and held it for up to {ttl_hours} hours after issue, then erased it.
-  Save this file now — it cannot be produced again afterwards.
-
-@@ routing
-
-All traffic goes through the tunnel. IPv6 is captured and dropped rather
-  than routed, so it fails closed instead of leaving in the clear.
+Key custody
+-----------
+  This server created the private key in the configuration and held it for up to
+  {ttl_hours} hours after issue so it could be fetched, then erased it. Save the
+  file now: it cannot be produced again afterwards, and a credential whose key is
+  gone has to be revoked and reissued rather than resent.
 
 @@ transport.awg
+About this server's transport
+-----------------------------
+  This server runs an obfuscated variant, so you need a client app that speaks
+  it. The standard app will reject the Jc/S1/H1 lines in the configuration, and
+  deleting those lines does not fall back to the standard protocol — it just
+  stops connecting.
 
-TRANSPORT: AmneziaWG. This needs a client that speaks it — the stock
-  WireGuard app will reject the Jc/S1/H1 lines below, and deleting them
-  does not fall back to WireGuard, it just stops connecting.
-  Those values are this server's and must be carried exactly as they
-  are; they are not secret and they are not tunable.
+  Those values belong to this server. Carry them exactly as they are. They are
+  not secret and they are not tunable.

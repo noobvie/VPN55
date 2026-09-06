@@ -9,7 +9,8 @@
 // different, and each is a change this deployment needs rather than a
 // preference:
 //
-//  1. THE CLIENT IP IS NOT TAKEN FROM A HEADER BY DEFAULT.
+//  1. THE CLIENT IP IS NOT TAKEN FROM A HEADER BY DEFAULT, AND WHEN IT IS, IT
+//     IS NOT TAKEN FROM THE FIRST HOP.
 //     Upstream reads the first X-Forwarded-For hop unconditionally, which is
 //     correct there — every request arrives through nginx and Cloudflare, so the
 //     header is written by infrastructure and the socket address is a proxy.
@@ -19,6 +20,13 @@
 //     out. So the header is consulted only when the operator has said a proxy is
 //     the sole way in (`trust_proxy`), and otherwise the socket address wins.
 //     A rate limiter keyed on caller-controlled input is not a rate limiter.
+//
+//     ⚠ Consulting the header is not enough on its own, and the first version of
+//     this module got that wrong. `trust_proxy=1` with a first-hop read is the
+//     SAME hole wearing a permission slip, because nginx APPENDS to this header
+//     rather than replacing it — see clientIp() below for the arithmetic. The
+//     gate says whether to believe a header; it cannot say which part of one is
+//     true.
 //
 //  2. THE PRUNE TIMER IS UNREFERENCED.
 //     Upstream's setInterval keeps a Node process alive forever, which is
@@ -42,8 +50,31 @@
  */
 function clientIp(req, { trustProxy = false } = {}) {
   if (trustProxy) {
-    const fwd = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
-    if (fwd) return fwd;
+    // X-Real-IP FIRST, because it is the only one of the two a client cannot
+    // contribute to. nginx sets it with `proxy_set_header X-Real-IP
+    // $remote_addr`, and proxy_set_header OVERWRITES — an inbound X-Real-IP is
+    // discarded before it ever reaches this process.
+    const real = String(req.headers['x-real-ip'] || '').trim();
+    if (real) return real;
+
+    // Fall back to the LAST X-Forwarded-For hop, never the first.
+    //
+    // ⚠ The first hop is CLIENT-CONTROLLED, which is the opposite of what it
+    // looks like. The shipped vhost sets the header with
+    // `$proxy_add_x_forwarded_for`, and that APPENDS $remote_addr to whatever
+    // the caller already sent — so `X-Forwarded-For: 1.2.3.4` arrives here as
+    // "1.2.3.4, <real client>" and reading [0] hands the caller the pen. With
+    // the lockout keyed on this value that is two separate holes at once: an
+    // endless supply of fresh identities to guess from, and the ability to
+    // aim a lockout AT the operator by sending their address with their
+    // username. The last hop is the one the proxy itself wrote.
+    //
+    // Behind two chained proxies the last hop is the inner proxy rather than
+    // the client, which collapses everyone into one bucket — noisy, but it
+    // fails CLOSED, and that is the right direction for this value.
+    const hops = String(req.headers['x-forwarded-for'] || '').split(',');
+    const last = hops[hops.length - 1].trim();
+    if (last) return last;
   }
   return (req.socket && req.socket.remoteAddress) || 'unknown';
 }

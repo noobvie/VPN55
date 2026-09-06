@@ -55,10 +55,23 @@ const REPO = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
 // carries its own copy of the --font overrides. Vietnamese is the default
 // locale and the portal is the surface most users see, which makes it the worst
 // possible place for the mid-word fallback these overrides exist to prevent.
+//
+// site/index.html is here too, and it is the one that got away. It is a single
+// self-contained file with its stylesheet inline, it is `lang="vi"` and it is
+// the ONLY page in this repo that is entirely Vietnamese — and it shipped
+// naming "Helvetica Neue", the exact family this check records as `none`. It
+// was invisible because this list was three panel stylesheets, so the rule the
+// whole file exists to enforce was enforced everywhere except the page with the
+// most Vietnamese on it.
 const CSS = [
   join(REPO, 'panel', 'public', 'css', 'panel.css'),
   join(REPO, 'panel', 'portal', 'public', 'css', 'portal.css'),
   join(REPO, 'panel', 'public', 'css', 'vendor', 'office-tools.css'),
+  join(REPO, 'site', 'index.html'),
+  // The nginx 502/503/504 page. Also inline, also Vietnamese, and served at the
+  // exact moment nothing else on this host is — so it is the last page anyone
+  // would notice a font hole on, and the last one anybody would think to check.
+  join(REPO, 'deploy', 'nginx', 'vpn55-offline.html'),
 ];
 
 // ── The repertoire ───────────────────────────────────────────────────────────
@@ -212,9 +225,46 @@ if (process.argv[2] === '--probe') {
 // selector where the vendored file sets `--font`, panel.css must set it too.
 // An un-overridden one is judged on its own merits, because that one does reach
 // the screen.
+//
+// ── Unless the theme is unreachable ─────────────────────────────────────────
+//
+// A [data-theme="x"] rule only ever renders if something can set that
+// attribute to "x", and the one thing that ever does is VPN55_THEMES in
+// public/js/theme.js. The vendored file still carries full palettes for themes
+// this panel no longer offers — matrix and anime — byte-identical to upstream,
+// so that a re-vendor stays a diff rather than an archaeology exercise. Those
+// stacks reach nobody.
+//
+// Grading them anyway would demand an override in panel.css for a theme that
+// cannot be selected, which is a rule that exists only to keep a check quiet.
+// That is how a check stops being believed. So the reachable set is read from
+// theme.js — from the list itself, not from a copy of it here, because a
+// second copy is a thing to forget.
 const problems = [];
 const overridden = [];
+const unreachable = [];
 let stackCount = 0;
+
+/** The theme names public/js/theme.js actually offers. */
+const REACHABLE = (() => {
+  const src = readFileSync(join(REPO, 'panel', 'public', 'js', 'theme.js'), 'utf8');
+  const m = src.match(/VPN55_THEMES\s*=\s*\[([^\]]*)\]/);
+  if (!m) {
+    // Not a warning to swallow: if the list cannot be read, every theme has to
+    // be treated as reachable, or a real hole hides behind a parse failure.
+    problems.push('panel/public/js/theme.js: could not read VPN55_THEMES — every theme will be graded.');
+    return null;
+  }
+  return new Set(m[1].split(',').map((x) => x.trim().replace(/^['"]|['"]$/g, '')).filter(Boolean));
+})();
+
+/** '[data-theme="matrix"]' -> false once matrix is no longer in the list. */
+function selectorReachable(selector) {
+  if (REACHABLE === null) return true;
+  const m = String(selector).match(/^\[data-theme="([^"]+)"\]$/);
+  if (!m) return true;         // :root, or a compound selector — always live
+  return REACHABLE.has(m[1]);
+}
 
 /** Split a font-family value into families, respecting quotes. */
 function families(value) {
@@ -257,9 +307,14 @@ for (const file of CSS) {
   const label = file.slice(REPO.length + 1).replace(/\\/g, '/');
   const isVendor = label.includes('/vendor/');
 
-  // Both `font-family: …` and the `--font: …` token, which is what every rule
-  // in this project actually resolves through.
-  const re = /(?:^|[;{\s])(font-family|--font)\s*:\s*([^;}]+)/g;
+  // `font-family: …`, the `--font: …` token every panel rule resolves through,
+  // and `--sans`/`--mono`, which is what site/index.html calls its two. The
+  // names are listed rather than guessed at: a heuristic like "any custom
+  // property whose value mentions sans-serif" would grade half the palette on
+  // the day somebody writes `--card-shadow` badly, and a check that reports
+  // non-problems is a check that gets switched off. A new surface that invents
+  // a fourth token name adds it here.
+  const re = /(?:^|[;{\s])(font-family|--font|--sans|--mono)\s*:\s*([^;}]+)/g;
   let m;
   while ((m = re.exec(src)) !== null) {
     const prop = m[1];
@@ -273,6 +328,13 @@ for (const file of CSS) {
     const selector = selectorAt(src, m.index);
 
     if (isVendor && prop === '--font') {
+      // A theme nothing can select renders nothing, so its stack is not a
+      // stack anyone reads. Recorded rather than silently skipped — the note
+      // at the end is what stops this becoming a place to hide a hole.
+      if (!selectorReachable(selector)) {
+        unreachable.push(`${selector}  (${where})`);
+        continue;
+      }
       if (panelTokenSelectors.has(selector)) {
         overridden.push(`${selector || ':root'}  (${where})`);
         continue;
@@ -321,6 +383,13 @@ if (problems.length) {
   console.error('  Vietnamese is the default locale. A stack that falls back mid-word is');
   console.error('  what most users see, and it reads as a fault on their machine.\n');
   process.exit(1);
+}
+
+if (unreachable.length) {
+  console.log('  Vendored --font tokens for themes theme.js no longer offers, so');
+  console.log('  never selected and never rendered:');
+  for (const u of unreachable) console.log(`    - ${u}`);
+  console.log('');
 }
 
 if (overridden.length) {

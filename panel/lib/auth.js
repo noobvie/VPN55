@@ -9,7 +9,7 @@
 // model on its own route tree — a role flag on shared admin routes is exactly
 // how a user reaches an admin endpoint.
 //
-// ── Five decisions, each with a failure it is avoiding ────────────────────────
+// ── Six decisions, each with a failure it is avoiding ─────────────────────────
 //
 //  1. SESSIONS LIVE IN MEMORY, NOT ON DISK. A restart logs everybody out, which
 //     is the correct trade for a panel one person uses: a token written to disk
@@ -38,10 +38,36 @@
 //     enough, and the panel is the one thing on this box that can revoke access.
 //     Every write also carries the session's CSRF token in a request header,
 //     which a cross-origin page cannot set and cannot read.
+//
+//  6. THE SECOND FACTOR GATES SIGNING IN, NOT EACH WRITE. Two reasons, and the
+//     second is the one that decided it.
+//
+//     The reads are not innocuous. A session that opened without a second factor
+//     but could not write would still hand over every user name, every quota,
+//     every endpoint address and every traffic total on the host — which is most
+//     of what somebody would want it for. Gating writes protects the actions and
+//     leaks the intelligence.
+//
+//     And a factor demanded per write TEACHES THE WRONG REFLEX. An operator
+//     prompted for a code six times an hour stops reading the prompt, and a
+//     person who enters a code whenever they are asked is a person a phishing
+//     page can ask. A factor that is demanded once, at a moment the operator
+//     chose, is a factor they notice being asked for at a moment they did not.
+//
+//     Enrolment, clearing and password changes are all CONSOLE actions
+//     (scripts/admin.js), so a stolen session cannot enrol a factor of its own
+//     or remove the one that is there. The break-glass path for a lost device is
+//     `admin.js totp --clear <name>` as root on the host — which is not a bypass
+//     in any meaningful sense, because anyone who can run it already has root
+//     and does not need the panel. Deliberately, there are NO remote recovery
+//     codes: a stack of single-use secrets that skip the factor, stored on the
+//     same host as the hashes, is the bypass this design was asked to avoid, and
+//     it buys nothing the console does not already give.
 
 const crypto = require('node:crypto');
-const fs = require('node:fs');
 
+const adminFile = require('./admins');
+const totp = require('./totp');
 const { clientIp, makeRateLimiter, makeLockout } = require('./rate-limit');
 
 const COOKIE = 'vpn55_sid';
@@ -100,6 +126,21 @@ function verifyPassword(password, stored) {
 // path costs the same as the wrong-password path. Computed once at load.
 const DUMMY_HASH = hashPassword(crypto.randomBytes(32).toString('base64'));
 
+/**
+ * Cookie header → object.
+ *
+ * ⚠ decodeURIComponent THROWS on a malformed escape, and `Cookie: x=%` is a
+ * malformed escape. Unguarded, that URIError propagates out of resolve() —
+ * which every gated route calls — and express turns it into a 500 with a stack
+ * trace in the journal. So any caller at all, holding no session and needing no
+ * credential, could make every authenticated route on the panel fail by sending
+ * one junk byte. A cookie that cannot be decoded is a cookie we do not have:
+ * the value is dropped and the request goes on to be treated as signed out,
+ * which is what it is.
+ *
+ * (server.js:readCookie and portal/auth.js:parseCookies both already had this
+ * guard. This copy, the one on the authenticated path, did not.)
+ */
 function parseCookies(header) {
   const out = Object.create(null);
   for (const part of String(header || '').split(';')) {
@@ -107,18 +148,39 @@ function parseCookies(header) {
     if (eq < 0) continue;
     const k = part.slice(0, eq).trim();
     if (!k) continue;
-    out[k] = decodeURIComponent(part.slice(eq + 1).trim());
+    try {
+      out[k] = decodeURIComponent(part.slice(eq + 1).trim());
+    } catch {
+      // Not a value we can read. Not a reason to fail the request either.
+      continue;
+    }
   }
   return out;
 }
 
 class Auth {
-  constructor({ config, audit, warn = console.warn }) {
+  constructor({ config, audit, warn = console.warn, alerter = null }) {
     this.config = config;
     this.audit = audit;
     this.warn = warn;
+    this.alerter = alerter;
 
     this.sessions = new Map();   // sid -> { user, createdAt, lastSeenAt, ip, csrf }
+
+    // The TOTP replay guard: the highest time step each administrator has
+    // already spent. A code is good for one step and the skew window either
+    // side, and without this it stays good for all of that after it has been
+    // used — which is exactly the window somebody relaying a code in real time
+    // is working in.
+    //
+    // ⚠ IN MEMORY, like the sessions, and for a related reason. Persisting it
+    // would mean the HTTP-facing process writing the file that holds every
+    // administrator's hash, on every login. That file is read-only from here on
+    // purpose (panel/lib/admins.js), and a write path into it is a bigger thing
+    // to give away than the failure it would close: a restart forgets the spent
+    // counter, so a code could be replayed across one — inside its own 90-second
+    // window, by somebody who already had it, at a moment they cannot choose.
+    this.totpSpent = new Map();
 
     this.absoluteTtlMs = Math.min(config.session_ttl_ms, ABSOLUTE_TTL_CAP_MS);
     this.idleTtlMs = Math.min(config.session_idle_ms, this.absoluteTtlMs);
@@ -156,18 +218,31 @@ class Auth {
   // is nothing next to an scrypt.
   _loadAdmins() {
     try {
-      const parsed = JSON.parse(fs.readFileSync(this.config.admins_file, 'utf8'));
-      const admins = parsed && typeof parsed === 'object' ? parsed.admins : null;
-      if (!admins || typeof admins !== 'object') return Object.create(null);
-      // Copied onto a null-prototype object: a username of `constructor` or
-      // `__proto__` must look up nothing rather than find a function.
-      return Object.assign(Object.create(null), admins);
+      return adminFile.read(this.config.admins_file);
     } catch (err) {
-      if (err.code !== 'ENOENT') {
-        this.warn(`[auth] cannot read ${this.config.admins_file}: ${err.code || err.message}`);
-      }
+      // A malformed file is an empty set HERE, with a loud warning, rather than
+      // a throw. This runs on the login path, and a throw would be a 500 on
+      // every attempt with the reason only in a stack trace; an empty set is a
+      // refused login, which is what a panel with no readable administrator
+      // file should do. scripts/admin.js treats the same error as fatal,
+      // because there the operator is standing in front of it.
+      this.warn(`[auth] ${err.message}`);
       return Object.create(null);
     }
+  }
+
+  /**
+   * Which administrators have no second factor enrolled.
+   *
+   * server.js prints these at start-up when `require_totp` is on, because
+   * otherwise the first anybody hears of it is a refused login with a message
+   * about a console they may not be sitting at.
+   */
+  adminsWithoutTotp() {
+    const admins = this._loadAdmins();
+    return Object.keys(admins)
+      .filter((name) => adminFile.isUsable(admins[name]) && !adminFile.totpSecret(admins[name]))
+      .sort();
   }
 
   /**
@@ -182,8 +257,7 @@ class Auth {
     const admins = this._loadAdmins();
     let n = 0;
     for (const name of Object.keys(admins)) {
-      const rec = admins[name];
-      if (rec && typeof rec.hash === 'string' && rec.hash.startsWith('scrypt$')) n += 1;
+      if (adminFile.isUsable(admins[name])) n += 1;
     }
     return n;
   }
@@ -198,7 +272,7 @@ class Auth {
    * Every outcome is audited, including the refusals. A refused login is the
    * record that matters — a successful one looks the same whoever caused it.
    */
-  login(req, { username, password }) {
+  login(req, { username, password, totp: token = '' }) {
     const ip = this.ip(req);
     const user = String(username || '');
     const auditBase = { actor: user || null, ip, verb: 'login', target: user || null };
@@ -225,22 +299,64 @@ class Auth {
     const stored = (record && typeof record.hash === 'string') ? record.hash : DUMMY_HASH;
     const passed = verifyPassword(password, stored) && record !== null;
 
-    if (!passed) {
-      const after = this.lockout.fail(key);
-      this.audit.write({
-        ...auditBase,
-        result: 'denied',
-        message: after.locked ? 'auth.locked' : 'auth.bad_credentials',
-        detail: { failures: after.failures },
-      });
-      return {
-        ok: false,
-        error: after.locked ? 'auth.locked' : 'auth.bad_credentials',
-        retryAfterMs: after.remainingMs,
-      };
+    if (!passed) return this._fail(key, auditBase, 'auth.bad_credentials');
+
+    // ── The second factor ────────────────────────────────────────────────────
+    //
+    // Reached only once the password is right, which is the ordinary two-step
+    // shape and gives nothing away: whoever is here has already proven the first
+    // factor, so being told a second one is wanted tells them nothing they could
+    // not work out by holding a correct password.
+    //
+    // The lockout is NOT cleared until both factors have passed — clearing it
+    // after the password would mean an attacker with a leaked password could
+    // reset the failure counter at will and guess codes forever.
+    const secret = adminFile.totpSecret(record);
+
+    if (!secret && this.config.require_totp) {
+      // Policy says every account carries a factor and this one does not. The
+      // fix is at the console, so the message says so rather than offering a
+      // field the operator cannot fill in.
+      this.audit.write({ ...auditBase, result: 'denied', message: 'auth.totp_enrol_required' });
+      return { ok: false, error: 'auth.totp_enrol_required' };
+    }
+
+    if (secret) {
+      const typed = String(token || '').trim();
+      if (!typed) {
+        // Not a failure, and deliberately not counted as one: the normal sign-in
+        // passes through here exactly once, and counting it would spend a fifth
+        // of the operator's own lockout budget every time they signed in. The
+        // per-IP limiter has already counted the request.
+        this.audit.write({ ...auditBase, result: 'denied', message: 'auth.totp_required' });
+        return { ok: false, error: 'auth.totp_required', needsTotp: true };
+      }
+
+      const spent = this.totpSpent.has(user) ? this.totpSpent.get(user) : -1;
+      const check = totp.verify(secret, typed, { notBefore: spent });
+      if (!check.ok) {
+        // A reused code is audited as its own thing. It is usually a
+        // double-submit, and it is occasionally somebody replaying a code they
+        // watched being typed — which is the one login failure worth being able
+        // to find in a log afterwards.
+        const message = check.reason === 'reused' ? 'auth.totp_reused' : 'auth.totp_invalid';
+        return this._fail(key, auditBase, message, { needsTotp: true });
+      }
+      this.totpSpent.set(user, check.counter);
     }
 
     this.lockout.succeed(key);
+
+    // The caller's previous session, if they had one, ends here.
+    //
+    // There is no session fixation to worry about — nothing hands out a session
+    // id before authentication and `sid` below is 32 fresh bytes — but without
+    // this, signing in again simply ADDS a session and leaves the old cookie
+    // live for its full absolute lifetime. Sessions would then accumulate per
+    // user with no ceiling, and "sign in again" would not be a way to end a
+    // session left open on a machine somebody no longer has.
+    const previous = parseCookies(req.headers.cookie)[COOKIE];
+    if (previous) this.sessions.delete(previous);
 
     const now = Date.now();
     const sid = crypto.randomBytes(32).toString('base64url');
@@ -256,6 +372,67 @@ class Auth {
 
     this.audit.write({ ...auditBase, result: 'ok', message: 'auth.signed_in' });
     return { ok: true, session };
+  }
+
+  /**
+   * One refusal: count it, audit it, and tell the operator if a lockout tripped.
+   *
+   * Shared by the password and the second-factor branches so they cannot drift —
+   * a wrong code and a wrong password must cost the same against the same
+   * counter, or the factor with the cheaper failure is the one worth attacking.
+   */
+  _fail(key, auditBase, message, extra = {}) {
+    const after = this.lockout.fail(key);
+    const finalMessage = after.locked ? 'auth.locked' : message;
+    this.audit.write({
+      ...auditBase, result: 'denied', message: finalMessage,
+      detail: { failures: after.failures, reason: message },
+    });
+
+    // The alert carries a COUNT and nothing else — no username, no address. The
+    // audit log has both and is one SSH session away; a webhook URL is the least
+    // trusted place anything about this host ends up. See lib/alerts.js.
+    if (after.locked && this.alerter) {
+      try {
+        this.alerter.event('auth.locked_out', {});
+      } catch {
+        // Alerting must never turn a refused login into a 500.
+      }
+    }
+
+    return { ok: false, error: finalMessage, retryAfterMs: after.remainingMs, ...extra };
+  }
+
+  /**
+   * Change the session timeouts while the panel is running.
+   *
+   * The absolute cap still applies and configuration still cannot raise it.
+   * Shortening either one takes effect at the next resolve(), including for
+   * sessions that are already open — which is the point of shortening it.
+   */
+  setSessionTimeouts({ ttlMs, idleMs }) {
+    if (Number.isFinite(ttlMs)) this.absoluteTtlMs = Math.min(ttlMs, ABSOLUTE_TTL_CAP_MS);
+    if (Number.isFinite(idleMs)) this.idleTtlMs = Math.min(idleMs, this.absoluteTtlMs);
+    else this.idleTtlMs = Math.min(this.idleTtlMs, this.absoluteTtlMs);
+  }
+
+  /**
+   * Rebuild the login lockout and the per-IP limiter.
+   *
+   * ⚠ THIS DISCARDS WHATEVER THEY WERE HOLDING — every accumulated failure and
+   * every live lockout. That is not a bypass: those counters only ever restrain
+   * somebody who is NOT signed in, and whoever reaches this is signed in. It
+   * does mean an operator can clear a lockout by nudging a number, which is
+   * better known than discovered.
+   *
+   * The old timers are stopped first. A replaced limiter whose prune interval is
+   * still running is a leak that only shows up as a process that will not exit.
+   */
+  setLoginLimits({ windowMs, maxFailures, lockMs, ipMax }) {
+    this.lockout.stop();
+    this.ipLimiter.stop();
+    this.lockout = makeLockout({ maxFailures, windowMs, lockMs });
+    this.ipLimiter = makeRateLimiter({ windowMs, max: ipMax, message: 'auth.rate_limited' });
   }
 
   /**
@@ -299,8 +476,18 @@ class Auth {
    */
   checkCsrf(req, session) {
     const sent = req.headers[CSRF_HEADER];
-    if (!session || typeof sent !== 'string' || sent.length !== session.csrf.length) return false;
-    return crypto.timingSafeEqual(Buffer.from(sent), Buffer.from(session.csrf));
+    if (!session || typeof sent !== 'string') return false;
+
+    // ⚠ Compare BYTE lengths, not character lengths. timingSafeEqual measures
+    // bytes and THROWS when they differ, so a header of the right character
+    // count carrying multi-byte UTF-8 ("é".repeat(43) against a 43-char token)
+    // passed the string-length guard and threw inside the compare. That is a
+    // 500 where a 403 belongs — and worse, the audit line for a refused CSRF
+    // never gets written, which is exactly the refusal worth having a record of.
+    const a = Buffer.from(sent, 'utf8');
+    const b = Buffer.from(session.csrf, 'utf8');
+    if (a.length !== b.length) return false;
+    return crypto.timingSafeEqual(a, b);
   }
 
   logout(req) {

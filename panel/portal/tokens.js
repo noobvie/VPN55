@@ -73,11 +73,24 @@ class PortalTokens {
     this.warn = warn;
     this.state = { version: VERSION, tokens: Object.create(null) };
     this.loaded = false;
+    // What the file looked like when this process last read or wrote it. The
+    // inode is the useful part: save() replaces the file by rename, so every
+    // write by anybody produces a new one, and a changed inode is a reliable
+    // "somebody else has written this" that does not depend on clock
+    // resolution.
+    this.stamp = null;
   }
 
   // ── Storage ───────────────────────────────────────────────────────────────
 
-  load() {
+  /**
+   * The tokens map as it is on disk right now, or null when there is no file.
+   *
+   * Split out of load() because save() needs to read the file WITHOUT adopting
+   * it wholesale: this process may hold a change of its own that is not written
+   * yet.
+   */
+  _readFile() {
     let raw;
     try {
       raw = fs.readFileSync(this.file, 'utf8');
@@ -85,8 +98,7 @@ class PortalTokens {
       if (err.code === 'ENOENT') {
         // No codes yet is the normal state of a fresh install, not a fault. The
         // portal answers 401 to everything until an operator issues one.
-        this.loaded = true;
-        return this.state;
+        return null;
       }
       throw err;
     }
@@ -117,28 +129,177 @@ class PortalTokens {
     // the file is JSON on disk and a hand-edit could put one there, and a
     // lookup that found Object.prototype.constructor instead of a record is a
     // bug nobody would guess at from the symptom.
-    this.state = {
-      version: VERSION,
-      tokens: Object.assign(Object.create(null), parsed.tokens || {}),
-    };
+    return Object.assign(Object.create(null), parsed.tokens || {});
+  }
+
+  /** Record what the file looks like now, so refresh() can tell it apart. */
+  _stamp() {
+    try {
+      const st = fs.statSync(this.file);
+      this.stamp = { ino: st.ino, mtimeMs: st.mtimeMs, size: st.size };
+    } catch (err) {
+      this.stamp = null;
+    }
+  }
+
+  load() {
+    const tokens = this._readFile();
+    if (tokens !== null) this.state = { version: VERSION, tokens };
     this.loaded = true;
+    this._stamp();
     return this.state;
+  }
+
+  /**
+   * Re-read the file if another process has written it since we last touched
+   * it, and say whether it did.
+   *
+   * -- Why this exists ------------------------------------------------------
+   *
+   * `panel/scripts/portal.js` is the operator CLI, and it is a SEPARATE
+   * PROCESS with its own PortalTokens over the same file. Without this, the
+   * running panel loaded the file once at startup and never looked again, so:
+   * a code the operator revoked from the CLI kept working -- while `list` on
+   * the console showed it as revoked, which is the worst kind of wrong answer
+   * -- and a code issued from the CLI did not work at all until a restart.
+   *
+   * Worse than either: verify() writes lastUsedAt through save(), and save()
+   * serialises the whole map. The next sign-in by ANY user therefore rewrote
+   * the file from this process's stale memory and erased the revoke outright.
+   * That is a lost update on the only record of who can reach this portal.
+   *
+   * -- Why it is safe to call on every request ------------------------------
+   *
+   * One statSync, which is a few microseconds and no read at all in the normal
+   * case where nothing has changed. save() replaces the file by rename, so a
+   * reader never sees a half-written one: it gets the whole old file or the
+   * whole new one.
+   *
+   * A file that cannot be read or parsed leaves memory ALONE and warns. The
+   * alternative -- adopting an empty or broken file -- would sign every user
+   * out of the portal at once, which is precisely the outcome load()'s refusal
+   * to start empty exists to prevent.
+   */
+  refresh() {
+    let st;
+    try {
+      st = fs.statSync(this.file);
+    } catch (err) {
+      // Gone, or unreadable. Neither is a reason to drop what is in memory:
+      // the codes here are still the codes that were issued.
+      if (err.code !== 'ENOENT') {
+        this.warn(`[portal] cannot stat ${this.file}: ${err.code || err.message}`);
+      }
+      return false;
+    }
+    if (this.stamp
+      && st.ino === this.stamp.ino
+      && st.mtimeMs === this.stamp.mtimeMs
+      && st.size === this.stamp.size) return false;
+
+    try {
+      this.load();
+      return true;
+    } catch (err) {
+      this.warn(`[portal] ${this.file} changed but could not be re-read: ${err.message}`);
+      // Deliberately not stamped: a file we could not read is one to try again
+      // on the next request, not one we have accepted.
+      return false;
+    }
+  }
+
+  /**
+   * Fold anything the file holds that this process does not know about back
+   * into memory, immediately before writing it out.
+   *
+   * Two writers, one file, no lock. What makes a merge sound rather than a
+   * guess is that records here are only ever ADDED and only ever move one way:
+   * nothing is deleted, and a revocation is never undone. So:
+   *
+   *   - a record on disk we have never seen is kept (the CLI issued it);
+   *   - a revokedAt on either side wins, and the EARLIER one is the true one;
+   *   - lastUsedAt takes the LATER of the two readings.
+   *
+   * Every other field is written once at issue and never changed, so there is
+   * nothing to reconcile. ISO-8601 UTC strings from toISOString() compare
+   * correctly as strings, which is why these are `<` and `>` and not Date
+   * arithmetic.
+   */
+  _mergeFromDisk() {
+    let disk;
+    try {
+      disk = this._readFile();
+    } catch (err) {
+      // Unreadable. Writing ours over it is the lesser evil -- it is what this
+      // method did unconditionally before -- but say so, because it is the one
+      // case where something could be lost.
+      this.warn(`[portal] cannot merge ${this.file} before writing: ${err.message}`);
+      return;
+    }
+    if (disk === null) return;
+
+    for (const fp of Object.keys(disk)) {
+      const theirs = disk[fp];
+      if (theirs === null || typeof theirs !== 'object') continue;
+      const mine = this.state.tokens[fp];
+      if (!mine) {
+        this.state.tokens[fp] = theirs;
+        continue;
+      }
+      if (theirs.revokedAt && (!mine.revokedAt || theirs.revokedAt < mine.revokedAt)) {
+        mine.revokedAt = theirs.revokedAt;
+      }
+      if (theirs.lastUsedAt && (!mine.lastUsedAt || theirs.lastUsedAt > mine.lastUsedAt)) {
+        mine.lastUsedAt = theirs.lastUsedAt;
+      }
+    }
   }
 
   /** Atomic replace, mode 0600. The same discipline store.js uses. */
   save() {
     const dir = path.dirname(this.file);
-    const tmp = `${this.file}.${process.pid}.tmp`;
+    // Whatever the CLI has written since we last read goes back into memory
+    // first, or this write erases it.
+    this._mergeFromDisk();
+
+    // Random, not just the pid: a pid is reused, and a stale tmp left by a
+    // process that died mid-write made every later save fail EEXIST on the
+    // 'wx' open -- a state directory that silently stops accepting writes.
+    const tmp = `${this.file}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`;
     fs.mkdirSync(dir, { recursive: true, mode: 0o750 });
     let fd;
     try {
       fd = fs.openSync(tmp, 'wx', 0o600);
-      fs.writeSync(fd, `${JSON.stringify(this.state, null, 2)}\n`);
-      fs.fsyncSync(fd);
-    } finally {
-      if (fd !== undefined) fs.closeSync(fd);
+      try {
+        fs.writeSync(fd, `${JSON.stringify(this.state, null, 2)}\n`);
+        fs.fsyncSync(fd);
+      } finally {
+        fs.closeSync(fd);
+        fd = undefined;
+      }
+      fs.renameSync(tmp, this.file);
+    } catch (err) {
+      if (fd !== undefined) { try { fs.closeSync(fd); } catch (e) { /* a bad fd */ } }
+      try { fs.unlinkSync(tmp); } catch (e) { /* it may never have been created */ }
+      throw err;
     }
-    fs.renameSync(tmp, this.file);
+
+    // The rename itself has to reach the disk, not just the bytes it points at.
+    // Without this a power loss can leave the directory entry pointing at the
+    // old file while the new one is fully written and unreferenced. Best
+    // effort: opening a directory for read is not portable, and it is not worth
+    // failing a write that has already happened.
+    let dfd;
+    try {
+      dfd = fs.openSync(dir, 'r');
+      fs.fsyncSync(dfd);
+    } catch (err) {
+      /* not every platform allows it; the rename still happened */
+    } finally {
+      if (dfd !== undefined) { try { fs.closeSync(dfd); } catch (e) { /* ditto */ } }
+    }
+
+    this._stamp();
   }
 
   // ── Issuing ───────────────────────────────────────────────────────────────
@@ -202,6 +363,11 @@ class PortalTokens {
   verify(token, { now = Date.now() } = {}) {
     if (typeof token !== 'string' || !RE_TOKEN.test(token)) return null;
 
+    // After the shape check and before the lookup: a malformed body must not
+    // cost a stat, and a revoke made from the CLI a moment ago must be seen by
+    // this request rather than by the one after the next restart.
+    this.refresh();
+
     const record = this.state.tokens[fingerprint(token)];
     if (!record) return null;
     if (record.revokedAt) return null;
@@ -233,6 +399,7 @@ class PortalTokens {
 
   /** Every record, newest first; optionally for one user. Never the codes. */
   list(user = null) {
+    this.refresh();
     const out = [];
     for (const record of Object.values(this.state.tokens)) {
       if (user && record.user !== user) continue;
@@ -252,6 +419,9 @@ class PortalTokens {
    */
   revoke(id, { now = Date.now() } = {}) {
     if (!RE_ID.test(String(id))) return null;
+    // So that a code issued by the other process can be revoked by this one.
+    // Without it this scan cannot see the record and returns "no such code".
+    this.refresh();
     for (const record of Object.values(this.state.tokens)) {
       if (record.id !== id) continue;
       if (record.revokedAt) return { ...record };
@@ -264,6 +434,7 @@ class PortalTokens {
 
   /** Revoke every live code for one user. Returns how many were withdrawn. */
   revokeUser(user, { now = Date.now() } = {}) {
+    this.refresh();
     let n = 0;
     for (const record of Object.values(this.state.tokens)) {
       if (record.user !== user || record.revokedAt) continue;
@@ -276,6 +447,7 @@ class PortalTokens {
 
   /** How many live codes exist, in total or for one user. */
   count(user = null) {
+    this.refresh();
     let n = 0;
     for (const record of Object.values(this.state.tokens)) {
       if (user && record.user !== user) continue;

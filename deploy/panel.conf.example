@@ -49,14 +49,30 @@
 bind=127.0.0.1
 port=8055
 
-# Believe X-Forwarded-For from the reverse proxy.
+# Believe the reverse proxy's client-address header.
 #
-# ⚠ OFF by default, and that default is load-bearing rather than cautious. From
-# Phase 6 the login lockout is keyed on the client IP, so a caller who can set
-# this header freely has an unlimited supply of "different" clients and is never
-# locked out. Turn it on only in arrangement 1 above, where the panel is on
-# loopback and the vhost is the only thing that can reach it.
-trust_proxy=0
+# The panel reads X-Real-IP, and falls back to the LAST X-Forwarded-For hop.
+# Never the first: nginx APPENDS to X-Forwarded-For, so the first hop is whatever
+# the caller sent. X-Real-IP is set with proxy_set_header, which overwrites, so a
+# client cannot contribute to it.
+#
+# ⚠ ON by default, and REFUSED unless `bind` is loopback — the two go together:
+#
+#   bind=127.0.0.1 (the shipped arrangement) means the vhost is the only thing
+#   that can reach this socket, so the header is written by infrastructure and
+#   is worth believing. With trust_proxy=0 here, every request would arrive from
+#   127.0.0.1 and the whole internet would share ONE lockout bucket: five wrong
+#   passwords from anyone who can reach the vhost locks the operator out of
+#   their own panel. The panel refuses that combination.
+#
+#   On a reachable bind address the header is caller-controlled — an endless
+#   supply of identities to guess from, and the ability to aim a lockout at the
+#   operator by sending their address with their username. The panel refuses
+#   that combination too.
+#
+# So: loopback bind → trust_proxy=1. Reachable bind, no proxy → trust_proxy=0.
+# There is no third arrangement and config.js will tell you which one you are in.
+trust_proxy=1
 
 # Phase 5 has NO SIGN-IN AT ALL. Everyone who can reach the bind address can
 # read every user name, quota and traffic total on this host. Nothing here can
@@ -66,6 +82,29 @@ trust_proxy=0
 # ⚠ In Phase 6 this same setting means the OPPOSITE: sign-in exists there, and
 # setting this to 1 turns it OFF. Set it back to 0 when you upgrade.
 allow_unauthenticated=0
+
+# Require a second factor (TOTP) from every administrator.
+#
+# OFF by default, because turning it on before anybody has enrolled locks every
+# account out of the panel — and the fix is here, at this console. Enrol first,
+# then turn it on:
+#
+#   node /usr/local/lib/vpn55/panel/scripts/admin.js totp <name>
+#   node /usr/local/lib/vpn55/panel/scripts/admin.js list      # shows who has one
+#
+# With it off, a factor is per-account: an account that has enrolled one is
+# asked for it, and one created before this existed still signs in on a password
+# alone with nothing on screen to say so. This is the switch that makes it
+# policy. The panel warns at start-up, by name, about accounts that cannot sign
+# in because of it.
+#
+# ⚠ Enrolling, replacing and CLEARING a factor are all console actions. There is
+# no HTTP route for any of them and there are deliberately no remote recovery
+# codes: a stack of single-use secrets that skip the factor, stored on the same
+# host as the password hashes, is a bypass. If a phone is lost, clear the factor
+# here — `admin.js totp --clear <name>` — which needs root on this host, and
+# anyone who has that does not need the panel anyway.
+require_totp=0
 
 # ── State ───────────────────────────────────────────────────────────────────
 #
@@ -145,6 +184,126 @@ enforce_interval_seconds=300
 # enforcement that did not happen.
 enforce_quota_revoke=0
 enforce_expiry_revoke=0
+
+# ── Alerts ──────────────────────────────────────────────────────────────────
+#
+# Without this, nothing on the host tells anybody when something has gone wrong.
+# The enforcement job above already works out most of the conditions worth
+# knowing about and writes them into a summary that only exists if somebody
+# opens the panel — which is the one thing nobody is doing at the moment it
+# matters.
+#
+# Five things are announced, and no more:
+#
+#   the status read has failed repeatedly     the panel cannot see this host
+#   disabled accounts are still connected     what flag-only enforcement did not do
+#   accounts with a quota have no reading     their quota is not being checked
+#   a usage total went BACKWARDS              state.json was lost or restored
+#   a sign-in lockout tripped                 somebody is guessing
+#
+# ⚠ NO NAMES ARE SENT. Not a user's, not an administrator's, not an address —
+# a message carries a type and a count. A webhook URL is the least trusted place
+# anything about this host ends up, and the audit log has the whole record one
+# SSH session away.
+#
+# OFF by default, and inert with no URL: this is an outbound connection from a
+# host whose whole design is that it does not make any, so it is opt-in with an
+# address you typed.
+alert_enabled=0
+
+# http:// or https:// only. Anything else is refused at start-up AND again at
+# send time — a transport that would follow file: is a file reader with a URL
+# parameter.
+alert_webhook_url=
+
+# json      posts {source, host, type, state, severity, at, data} — one line in
+#           a receiving script.
+# telegram  posts {chat_id, text} to the Bot API, because a generic webhook body
+#           cannot be one. Point alert_webhook_url at
+#           https://api.telegram.org/bot<token>/sendMessage and set the chat id
+#           below. The text is rendered from the panel's own catalogs in
+#           default_locale, so an alert is translated like everything else.
+#
+# ⚠ The URL then contains the bot token. This file is 0640 root:vpn55-panel,
+# which is the same protection the api secrets already get, but it does mean the
+# token is on this host in a readable file — rotate it in BotFather if the host
+# is ever rebuilt from an untrusted backup.
+alert_webhook_format=json
+alert_telegram_chat_id=
+
+# ── The three layers that stop an alert storm ───────────────────────────────
+#
+# A flapping service is the normal way an alerting system destroys its own
+# usefulness: one restart at 3am produces forty messages, and whoever sees the
+# channel in the morning has already muted it.
+#
+#   1. A TRANSITION is announced, never a state. A condition that is still true
+#      an hour later is not news. That one is not a setting; it is how it works.
+#   2. CONFIRMATIONS — how many readings in a row must agree before a condition
+#      is believed, in BOTH directions, so one good poll in the middle of an
+#      outage does not send a spurious all-clear either.
+#   3. COOLDOWN — the shortest gap between two messages about the same
+#      condition, however many times it changes. A resolve is never held back by
+#      the cooldown its own firing message started.
+#
+# And a ceiling under all three, because a bug in any of them is a bug that
+# sends messages. If the ceiling is being reached, one of the two above is wrong
+# for this host rather than the ceiling being too low.
+alert_confirmations=2
+alert_cooldown_seconds=3600
+alert_max_per_hour=20
+
+# How many status reads must fail in a row before the panel says it cannot see
+# this host. One failure is a slow box; three at the default poll interval is 45
+# seconds of not being able to read anything.
+alert_status_failures=3
+
+# ── What the SETTINGS SCREEN can change, and what it cannot ─────────────────
+#
+# The panel has a Settings tab. It edits a fixed list of keys and writes them to
+# <state_dir>/settings.json — NOT to this file, which stays root-owned and is
+# only ever read. No verb was added to helper/vpnctl for it.
+#
+# ⚠ A key set there OVERRIDES this file. That is the surprising half and it is
+# the only choice that produces a usable screen, since this example sets almost
+# every key explicitly. The screen says, per key, when it is overriding the file
+# and what the file says, and every overridden key has a control that puts it
+# back. To clear one by hand, delete it from settings.json.
+#
+# The screen can change:  poll_seconds, event_limit, log_level, default_locale,
+#   session_ttl_minutes, session_idle_minutes, the four login_* limits,
+#   enforce_enabled, enforce_interval_seconds, and the four alert tuning numbers
+#   above (confirmations, cooldown, max per hour, status failures).
+#
+# The screen can NOT change, and these stay here:
+#
+#   allow_unauthenticated, require_totp   a screen that can switch off the
+#                                         authentication it sits behind is a
+#                                         bypass with a checkbox in front of it
+#   bind, port, portal_bind, portal_port, portal_enabled
+#                                         who can reach this process at all
+#   trust_proxy, portal_trust_proxy       whether a caller-supplied header names
+#                                         the caller — the lockout is keyed on it
+#   installer, helper, use_sudo, both timeouts
+#                                         what this panel asks root to run
+#   state_dir, user_dir                   moving state_dir does not move the
+#                                         traffic totals; every lifetime figure
+#                                         would read as zero at the new path
+#   enforce_quota_revoke, enforce_expiry_revoke
+#                                         one checkbox that irreversibly
+#                                         destroys every over-quota user's
+#                                         configuration on the next run
+#   alert_enabled, alert_webhook_url, alert_webhook_format, alert_telegram_chat_id
+#                                         where data about this host goes, and
+#                                         whether the alarms are on at all
+#   locales                               the catalogs are loaded once at start-up
+#   every other portal_*                  its limiters are the only thing between
+#                                         a public socket and this host's fork
+#                                         budget, and they are built at start-up
+#
+# An unreadable or out-of-range settings.json is IGNORED with a warning, never
+# fatal. A panel that refused to start over the file whose purpose was to save
+# an SSH session would be the worst possible failure for that feature to have.
 
 # ── The self-serve portal (Phase 8) ─────────────────────────────────────────
 #

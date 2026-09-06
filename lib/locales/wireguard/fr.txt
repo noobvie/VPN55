@@ -1,28 +1,70 @@
-@@ header
-Configuration client VPN55
-Identifiant {cred}  ·  utilisateur {user}
+@@ main
+VPN55 — instructions d'installation
+===================================
+
+  Identifiant  {cred}   (émis pour {user})
+  Serveur      {endpoint}:{port}
+  Votre adresse dans le tunnel  {ip}
+  DNS du tunnel  {dns}
+
+Le fichier à côté de celui-ci, vpn55-{cred}.conf, est votre identifiant tout
+entier. Il contient une clé privée. Quiconque en détient une copie peut utiliser
+votre accès : transmettez-le comme vous transmettriez un mot de passe, et
+supprimez-le partout où il n'a pas besoin de rester. Le serveur n'en garde pas
+de copie — s'il est perdu, la réponse est un nouvel identifiant, jamais un
+renvoi.
+
+Tout le trafic passe par le tunnel. L'IPv6 est capturé puis supprimé plutôt que
+routé : la défaillance est fermée, et rien ne sort en clair.
+
+Le DNS du tunnel est défini par le serveur. Ce résolveur voit chaque nom d'hôte
+que vous consultez pendant la connexion.
+
+
+Windows, macOS, Linux
+---------------------
+  1. Installez l'application client pour votre plateforme.
+  2. Importez vpn55-{cred}.conf — « Add Tunnel », ou « Import tunnel from file ».
+  3. Activez le tunnel.
+
+  Sous Linux, vous pouvez aussi utiliser la configuration directement :
+      sudo cp vpn55-{cred}.conf /etc/wireguard/
+      sudo wg-quick up vpn55-{cred}
+
+Android et iOS
+--------------
+  1. Installez l'application client depuis le Play Store ou l'App Store.
+  2. Scannez le code QR affiché lors de l'émission de cet identifiant, ou
+     importez vpn55-{cred}.conf depuis vos téléchargements.
+  3. Activez le tunnel.
+
+  Le code QR et le fichier sont le même identifiant. Scanner est plus simple ;
+  le fichier est ce qu'il faut utiliser lorsque le code n'est plus disponible.
 
 @@ custody.client
-GARDE DE LA CLÉ : générée par le client. Ce serveur n'a jamais détenu la
-  clé privée de cet identifiant et ne peut pas en produire une. Inscrivez
-  votre propre clé sur la ligne PrivateKey ci-dessous.
+Garde de la clé
+---------------
+  Cet identifiant a été créé à partir d'une clé publique que vous avez fournie.
+  Ce serveur n'a jamais détenu sa clé privée et ne peut pas en produire une. La
+  ligne PrivateKey de la configuration est un espace réservé — inscrivez-y votre
+  propre clé avant d'importer le fichier.
 
 @@ custody.server
-GARDE DE LA CLÉ : générée par le serveur. Ce serveur a créé la clé privée
-  ci-dessous et l'a conservée jusqu'à {ttl_hours} heures après émission,
-  puis l'a effacée.
-  Enregistrez ce fichier maintenant — il ne pourra plus être reproduit.
-
-@@ routing
-
-Tout le trafic passe par le tunnel. L'IPv6 est capturé puis supprimé
-  plutôt que routé : la défaillance est fermée, et rien ne sort en clair.
+Garde de la clé
+---------------
+  Ce serveur a créé la clé privée présente dans la configuration et l'a
+  conservée jusqu'à {ttl_hours} heures après émission afin qu'elle puisse être
+  récupérée, puis l'a effacée. Enregistrez le fichier maintenant : il ne pourra
+  plus être reproduit, et un identifiant dont la clé est perdue doit être révoqué
+  et réémis, non renvoyé.
 
 @@ transport.awg
+À propos du transport de ce serveur
+-----------------------------------
+  Ce serveur utilise une variante obfusquée : il vous faut une application
+  cliente qui la prenne en charge. L'application standard rejettera les lignes
+  Jc/S1/H1 de la configuration, et les supprimer ne revient pas au protocole
+  standard — la connexion cesse simplement de s'établir.
 
-TRANSPORT : AmneziaWG. Il faut un client qui le prenne en charge —
-  l'application WireGuard standard rejettera les lignes Jc/S1/H1
-  ci-dessous, et les supprimer ne revient pas à WireGuard : la connexion
-  cesse simplement de s'établir.
-  Ces valeurs appartiennent à ce serveur et doivent être reportées
-  exactement telles quelles ; elles ne sont ni secrètes ni réglables.
+  Ces valeurs appartiennent à ce serveur. Reportez-les exactement telles
+  quelles ; elles ne sont ni secrètes ni réglables.

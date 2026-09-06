@@ -30,7 +30,29 @@ vpn_<proto>_artifacts      # <cred_id> → what a client can be given
 vpn_<proto>_client_config  # <cred_id> [artifact] [locale] → that artifact on stdout
 vpn_<proto>_status         # service state + per-cred rx/tx + last handshake
 vpn_<proto>_restart        # cycle the daemon; NOT _install re-run
+vpn_<proto>_backup_paths   # absolute paths this protocol cannot be rebuilt without
 ```
+
+**`_backup_paths` is how `lib/core_backup.sh` stays protocol-blind.** It prints one
+absolute path per line — the files that cannot be regenerated on a replacement host,
+and nothing else. `/etc/wireguard`, `/etc/openvpn` and `/etc/swanctl` appear nowhere
+in `core_backup.sh`; each adapter names its own. An adapter that does not implement
+it is warned about **loudly** at backup time rather than skipped, because "your
+protocol's state is not in the archive" is not a footnote to discover on restore day.
+
+Three rules for what it may print:
+
+  - **Never a client private key, and never a hand-off spool.** Those are shredded
+    after delivery on purpose; an archive outlives that erasure by years.
+    `_bak_guard` refuses the whole backup if a path under `pki/private/` turns out to
+    be a credential id in the register, or if any path is under a spool.
+  - **The server's private key, by the CN the adapter recorded** — yes, deliberately.
+    An archive holding a server certificate without its key restores a daemon that
+    cannot load its own identity, and `_ovpn_server_cert_ensure` skips reissue when
+    the certificate looks valid, so nothing would fix it.
+  - **Not what `_install` regenerates.** A daemon config built deterministically from
+    `settings.conf` is not irreplaceable; it is rebuilt on the new host, where the
+    interface name and addresses may differ anyway.
 
 `_status` is the one that matters most: it is what the panel reads, and forcing all
 three protocols through one output shape is what stops the panel from growing
@@ -74,10 +96,15 @@ option    <key>  <prompt>  <required 0|1>  <help text>
 
 # _artifacts
 artifact  <id>  <label>  <filename>  <text|base64>  <qr 0|1>  <note>
+#   ⚠ the id vocabulary is the ADAPTER'S, and it is not fixed. WireGuard emits
+#   conf, conf2, conf3 … — one per registered endpoint, because that protocol
+#   has no client-side failover and the alternates have to be separate files.
+#   A reader must take the ids from _artifacts and pass them back verbatim,
+#   never assume the set.
 
 # _status
 service   <tag>  <state>  <enabled>  <listen>  <since>  <cred_count>
-cred      <tag>  <cred_id>  <user>  <state>  <address>  <rx>  <tx>  <handshake>  <endpoint>
+cred      <tag>  <cred_id>  <user>  <state>  <address>  <rx>  <tx>  <handshake>  <endpoint>  <connected 1|0|->
 note      <tag>  <info|warn|crit>  <message>
 
 # vpn55.sh --status only — the transport adds these, adapters do not emit them
@@ -94,18 +121,54 @@ nothing left to download, this has to be rotated", and a portal without it would
 download that can only fail. It costs one `_cred_list` per adapter per poll — three
 subprocess trees on a three-protocol host, not one per credential.
 
-Four rules that are not obvious from the shapes:
+Rules that are not obvious from the shapes:
 
 - **`-` means "no reading". It is not zero and it is not "never".** `rx`/`tx` of `-` must
   not be treated as a counter reset by the collector. `handshake` of `0` asserts the
   credential has never been used; `-` says the adapter cannot tell — a daemon that keeps
   no history must emit `-`, because reporting `0` claims a fact it does not have.
+- **`handshake 0` is scoped to the adapter's OWN observation window, and must be proved.**
+  Every one of these daemons forgets on restart, so "no handshake recorded" and "never
+  used" are the same reading unless the adapter can show the credential was issued *after*
+  the window opened. An adapter emits `0` only when it holds that proof — it has the
+  credential's issue time and the service's start time and the first is later. Otherwise
+  `-`. WireGuard's kernel reports `0` for every peer after the interface comes up, so a
+  bare pass-through would tell an operator that a fleet which connected an hour ago has
+  never connected, and a reader that persists "last seen" would overwrite the real date.
+  A reader must therefore also treat `never` as **fillable but not overwritable**: it may
+  fill an unknown, it may never downgrade a timestamp it already holds.
+- **`connected` is the liveness answer; `endpoint` is not.** `1` means the service is
+  carrying a session for this credential right now, `0` means it is not, `-` means the
+  adapter cannot tell (its daemon is stopped or unreadable). It exists because the obvious
+  substitutes are all protocol-shaped: `handshake` is a *time*, not a state, and answers
+  "when", not "now"; and `endpoint` is a *live* peer address on two of them but a **sticky
+  last-known** address on WireGuard, where it survives for the life of the interface and
+  would report a device that last connected in March as online. A peer-less protocol
+  (a listener-shaped one — see `docs/circumvention.md` §6) has no endpoint to report at
+  all and would otherwise be permanently invisible in a connections list. `endpoint`
+  remains what it says: the remote address of the CURRENT session, `-` when there is none.
+- **`handshake` is one quantity: the last moment the adapter OBSERVED this credential
+  live.** Not the moment a session started. A session opened three days ago and carrying
+  traffic right now was last seen *now*, and reporting its start time would show an active
+  device as three days idle. Each daemon exposes this differently — a completed handshake,
+  a status file's write time, a security association's last-use counter — and it is the
+  adapter's job to reduce whichever it has to that one meaning before emitting it.
+- **`address` is nullable, and `-` there means "this protocol has no per-credential
+  address".** Two adapters pin one from `net_pool_alloc` and carry it in `_cred_list`; the
+  third lets its daemon hand out a virtual IP at connect time, so it has nothing to report
+  until a session exists. A reader renders the absence, never a placeholder dash.
 - **`encoding: base64` is not decoration.** A caller reading a config through `$(…)`
   cannot carry binary — NULs are dropped and trailing newlines eaten. Anything not text
   goes base64 on the wire and the caller decodes.
 - **`qr: 1` means a camera will actually resolve it**, not "this is a string". A QR of
   eight kilobytes is a picture of nothing, and offering one is worse than offering none
-  because it looks like it should have worked.
+  because it looks like it should have worked. The caller encodes **exactly what
+  `_client_config` returns for that artifact**, so an adapter may not set `qr 1` on an
+  artifact whose size it does not control — in particular one carrying translated prose,
+  whose length is a property of the locale chosen at handover and not of anything the
+  adapter can measure. Prose belongs in its own `instructions` artifact; the scannable one
+  stays machine-facing and small. The caller enforces a ceiling as well, because an
+  adapter's promise here cannot be verified by the reader.
 - **`option`s are declared, never assumed.** An adapter that receives a `k=v` it did not
   declare must fail, not ignore it: silently dropping a field an operator filled in and
   then reporting success is the worst of the three available behaviours.
@@ -185,6 +248,43 @@ Related bash rules:
 
 ---
 
+## ⚠ `${!arr[@]+"${!arr[@]}"}` does not iterate a populated array
+
+The defensive idiom for "expand an array that may be empty under `set -u`" is
+
+```bash
+for x in ${arr[@]+"${arr[@]}"}; do        # VALUES — correct
+```
+
+The same shape for **indices is silently wrong**:
+
+```bash
+for i in ${!arr[@]+"${!arr[@]}"}; do      # KEYS — BROKEN
+```
+
+With an operator attached, bash stops reading the leading `!` as "the keys of" and
+reads it as **indirect expansion**: it takes the array's joined value as a variable
+NAME, fails with `alpha beta: invalid variable name`, and **the loop body never runs
+at all**. Not on an empty array — on a *populated* one, which is the only case that
+matters. Verified on bash 5.2.
+
+It shipped in two places and was found in 2026-09 while adding a third. `cli_adapters`
+printed nothing, which would have ended every `tests/vps-acceptance.sh` run with *"no
+tunnel service can run on this host"*; `vpn_adapter_label` returned the raw tag with
+rc 1 for every adapter, masked by the `|| true` at its call sites. Neither was noticed
+because nothing in this repository has ever run on a VPS.
+
+Use the count guard, which is what `cli_status` already did correctly:
+
+```bash
+[[ ${#arr[@]} -gt 0 ]] || return 0
+for i in "${!arr[@]}"; do
+```
+
+The value form is unaffected and stays as it is.
+
+---
+
 ## i18n — keyed catalogs, never phrase maps
 
 `t('peer.add.button')` resolving against `panel/locales/{vi,en,fr}.json`. **Never a map
@@ -257,6 +357,7 @@ lib/
   core_i18n.sh          # locale resolve + @@section render, for END-USER text only
   core_source.sh        # the ONLY lib that touches the network: fetch, revision, update
   core_pki.sh           # cert ops shared by OpenVPN + IKEv2
+  core_backup.sh        # the one archive that outlives the host, and its restore
   core_users.sh         # owns IDENTITY — the single user registry
   proto_wireguard.sh    # adapters own CREDENTIALS only
   proto_ipsec.sh
@@ -402,6 +503,29 @@ one), uninstalls, and diffs the host against the baseline taken before anything 
 
 ---
 
+## Versioning — the version IS the release date
+
+`VPN55_VERSION` in `vpn55.sh` is CalVer, `YYYY.MM.DD`. Go-live is **2026.09.09**; every
+release after it carries the day it was cut, and a second cut on the same day appends a
+counter (`2026.09.09.1`). `tools/release.sh` validates the shape and refuses to build
+unless the string in `vpn55.sh` equals the version it was given.
+
+- **A date answers the question an operator actually has** — *how old is this install?* —
+  on a box set up months ago with no changelog to hand. `0.9.0` never could.
+- **It is the RELEASE date, not today.** Between releases it reads behind or ahead of the
+  calendar. Never "correct" it to the current date: a version that moves on its own
+  identifies nothing.
+- **It does not identify the code.** Two trees can both say `2026.09.09` and differ, so
+  the revision (`src_revision` — `git:<sha>` in a checkout, `mf:<hash>` of
+  `MANIFEST.sha256` in an installed copy) is printed beside it everywhere the version
+  appears: the menu banner, `--version`, `--revision`. The self-update guard keys on the
+  revision, never on the version.
+- **The banner is drawn on every menu render**, not once at startup — `main_banner` in
+  `vpn55.sh`. Its rows are padded from `${#text}`, so the box only lines up while the
+  text stays ASCII: an em dash inside the box is three bytes and one column.
+
+---
+
 ## Networking
 
 One parent subnet, partitioned once, so NAT and routing stay a single rule set:
@@ -419,6 +543,14 @@ like a firewall bug and gets found in week three.
 **This table is the only place the slot assignment is written down.** `core_net.sh`
 deliberately does not contain it: an adapter claims its slot by an opaque owner tag,
 so the allocator never learns a protocol name.
+
+**An adapter that needs host IP forwarding must claim a pool slot**, even one it barely
+uses. The claim is not only an address allocation: every `_uninstall` asks
+`net_pool_claims` whether any OTHER tunnel service is still on the host before turning
+forwarding off, and that is the only protocol-neutral way to ask. A routed protocol that
+skipped the claim would have its traffic killed by the next uninstall of something else.
+A protocol that forwards nothing — a proxy-shaped one, `docs/circumvention.md` §6 — needs
+no slot and correctly does not count toward that question.
 
 ```bash
 net_pool_claim wireguard 0            # once, in _install; idempotent, refuses a conflict
@@ -498,7 +630,7 @@ tools/manifest.sh                 # rewrite MANIFEST.sha256
 tools/manifest.sh --check         # what CI runs
 
 # Release (dev machine, clean tree, minisign key present)
-tools/release.sh 1.0.0 --tag
+tools/release.sh 2026.09.09 --tag
 
 # Acceptance (ON A THROWAWAY VPS, as root, over SSH — never here)
 ./tests/vps-acceptance.sh --yes-destroy-this-host

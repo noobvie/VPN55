@@ -68,9 +68,21 @@ vpn_adapter_known() {
 }
 
 # vpn_adapter_label <tag> — the display label, or the tag itself when unknown.
+#
+# ⚠ The index loop is COUNT-GUARDED, and it must stay that way. The obvious
+# defensive idiom `${!arr[@]+"${!arr[@]}"}` — the one used a few lines above
+# for VALUES, where it is correct — is silently WRONG for INDICES. With an
+# operator attached, bash reads the leading `!` as indirect expansion rather
+# than as "the keys of": it takes the array's joined value as a variable NAME,
+# fails with "alpha beta: invalid variable name", and the loop body never runs
+# at all. Not on an empty array — on a POPULATED one, which is the case that
+# matters. Verified on bash 5.2.
+#
+# The value form ${arr[@]+"${arr[@]}"} is unaffected and stays as it is.
 vpn_adapter_label() {
     local tag="${1:-}" i
-    for i in ${!VPN55_ADAPTER_TAGS[@]+"${!VPN55_ADAPTER_TAGS[@]}"}; do
+    [[ ${#VPN55_ADAPTER_TAGS[@]} -gt 0 ]] || { printf '%s' "$tag"; return 1; }
+    for i in "${!VPN55_ADAPTER_TAGS[@]}"; do
         if [[ "${VPN55_ADAPTER_TAGS[$i]}" == "$tag" ]]; then
             printf '%s' "${VPN55_ADAPTER_LABELS[$i]}"
             return 0

@@ -84,6 +84,46 @@ VPN55_PKI_HOOKS="$VPN55_PKI/refresh.d"
 VPN55_PKI_REFRESH_BIN="/usr/local/lib/vpn55/pki-crl-refresh"
 VPN55_PKI_REFRESH_UNIT="vpn55-crl-refresh"
 
+# ── The authority is a single writer ─────────────────────────────────────────
+# `openssl ca` keeps its state in index.txt, serial and crlnumber, and it takes
+# no lock of its own. Two issues at once interleave their appends to index.txt;
+# an issue racing the weekly CRL refresh regenerates a list from a database
+# being written underneath it. `rand_serial = yes` removes the serial collision
+# and nothing else.
+#
+# Every entry point that WRITES takes this lock; every read path is left alone.
+# The bodies are split into _locked halves rather than nesting calls, because
+# flock is per open-file-description: a second `exec {fd}>` on the same path
+# from the same process blocks against the first, so pki_cert_revoke calling
+# pki_crl_refresh through the public name would deadlock itself. Same shape as
+# core_users.sh, for the same reason.
+VPN55_PKI_LOCK="$VPN55_PKI/.lock"
+
+_pki_locked() {
+    local rc=0
+    fs_ensure_dir "$VPN55_PKI" 0700 || return 1
+
+    if ! command -v flock >/dev/null 2>&1; then
+        "$@"
+        return $?
+    fi
+
+    local fd
+    exec {fd}>"$VPN55_PKI_LOCK" || { error "cannot open the certificate authority lock"; return 1; }
+    # Longer than the registry's 10s: an RSA-3072 keygen on a small VPS can take
+    # a few seconds on its own, and a second caller that gives up mid-issue
+    # would report a failure for work that is about to succeed.
+    if ! flock -w 60 "$fd"; then
+        error "timed out waiting for the certificate authority lock"
+        exec {fd}>&-
+        return 1
+    fi
+    "$@"
+    rc=$?
+    exec {fd}>&-
+    return $rc
+}
+
 # ── Tunables ─────────────────────────────────────────────────────────────────
 # RSA 3072 rather than an elliptic curve, and that is a deliberate downgrade of
 # elegance for reach. The whole reason a certificate protocol is in this product
@@ -232,6 +272,14 @@ basicConstraints       = critical,CA:TRUE,pathlen:0
 keyUsage               = critical,keyCertSign,cRLSign
 subjectKeyIdentifier   = hash
 
+# ⚠ This section is the FALLBACK, not the live policy, and reading it as the
+# live policy is the mistake it invites. Every certificate this file issues is
+# signed with an explicit -extfile written per issue by _pki_write_extfile,
+# because the SAN list changes per certificate — and -extfile overrides
+# x509_extensions entirely. So editing the two lines below changes nothing that
+# VPN55 issues. It is kept, and referenced above, so that an operator who runs
+# `openssl ca` against this config by hand still gets a sane certificate rather
+# than one with no basicConstraints at all.
 [ vpn55_ext_client ]
 basicConstraints       = critical,CA:FALSE
 keyUsage               = critical,digitalSignature
@@ -301,6 +349,10 @@ _pki_genkey() {
 }
 
 pki_ca_create() {
+    _pki_locked _pki_ca_create_locked "$@"
+}
+
+_pki_ca_create_locked() {
     local cn="${1:-VPN55 Certificate Authority}"
 
     pki_available || return 1
@@ -330,7 +382,7 @@ pki_ca_create() {
     fi
     chmod 0644 "$VPN55_PKI_CA_CERT" || { error "cannot set mode on $VPN55_PKI_CA_CERT"; return 1; }
 
-    pki_crl_refresh || return 1
+    _pki_crl_refresh_unlocked || return 1
     success "Certificate authority created — ${VPN55_PKI_CA_CERT}"
     return 0
 }
@@ -459,7 +511,7 @@ pki_server_cert_issue() {
         set -- "$cn"
     fi
 
-    _pki_issue "$cn" "$VPN55_PKI_SERVER_DAYS" "$VPN55_PKI_SERVER_EKU" "$@"
+    _pki_locked _pki_issue "$cn" "$VPN55_PKI_SERVER_DAYS" "$VPN55_PKI_SERVER_EKU" "$@"
 }
 
 # pki_client_cert_issue <common_name> [san …]
@@ -476,7 +528,7 @@ pki_client_cert_issue() {
         set -- "$cn"
     fi
 
-    _pki_issue "$cn" "$VPN55_PKI_CLIENT_DAYS" "$VPN55_PKI_CLIENT_EKU" "$@"
+    _pki_locked _pki_issue "$cn" "$VPN55_PKI_CLIENT_DAYS" "$VPN55_PKI_CLIENT_EKU" "$@"
 }
 
 # pki_client_key_discard <common_name>
@@ -677,6 +729,10 @@ pki_cert_state() {
 #   fired by pki_crl_refresh are what publish it, and even those only affect
 #   what happens at the next authentication.
 pki_cert_revoke() {
+    _pki_locked _pki_cert_revoke_locked "$@"
+}
+
+_pki_cert_revoke_locked() {
     local cn="${1:-}"
     pki_validate_cn "$cn" || return 1
     pki_ca_exists || { error "There is no certificate authority."; return 1; }
@@ -687,7 +743,7 @@ pki_cert_revoke() {
 
     if [[ "$state" == "revoked" ]]; then
         debug "certificate '${cn}' is already revoked"
-        pki_crl_refresh || return 1
+        _pki_crl_refresh_unlocked || return 1
         return 0
     fi
     if [[ "$state" == "absent" ]]; then
@@ -706,7 +762,7 @@ pki_cert_revoke() {
     # an artifact from, which is precisely what revocation is meant to end.
     fs_shred "$(pki_key_path "$cn")" || true
 
-    pki_crl_refresh || return 1
+    _pki_crl_refresh_unlocked || return 1
     return 0
 }
 
@@ -715,6 +771,10 @@ pki_cert_revoke() {
 #   after a revocation, because a CRL expires and a strict verifier rejects an
 #   expired one — see the header.
 pki_crl_refresh() {
+    _pki_locked _pki_crl_refresh_unlocked "$@"
+}
+
+_pki_crl_refresh_unlocked() {
     pki_ca_exists || { error "There is no certificate authority."; return 1; }
 
     local tmp="${VPN55_PKI_CRL}.new.$$"
@@ -776,12 +836,116 @@ pki_hook_remove() {
 # pki_crl_expires_in — seconds until the CRL's nextUpdate; negative once lapsed,
 # and 0 when there is no CRL at all. The number an adapter puts in front of an
 # operator BEFORE a strict verifier starts refusing everyone.
+#
+# ⚠ "Cannot tell" returns 1 and prints nothing; it does NOT return 0. `date -d`
+# is a GNU extension, so on a busybox host the conversion fails — and the old
+# code answered that with 0, which every caller reads as "expired". A perfectly
+# valid CRL was then reported as "EXPIRED — a strict client will refuse every
+# user", which is an unknown dressed up as an emergency. No CRL at all still
+# answers 0, because that genuinely is the state a strict verifier refuses.
 pki_crl_expires_in() {
     local line when
     [[ -f "$VPN55_PKI_CRL" ]] || { printf '0'; return 0; }
-    line="$(openssl crl -in "$VPN55_PKI_CRL" -noout -nextupdate 2>/dev/null)" || { printf '0'; return 0; }
-    when="$(date -u -d "${line#*=}" +%s 2>/dev/null)" || { printf '0'; return 0; }
+    line="$(openssl crl -in "$VPN55_PKI_CRL" -noout -nextupdate 2>/dev/null)" || return 1
+    when="$(date -u -d "${line#*=}" +%s 2>/dev/null)" || return 1
+    [[ "$when" =~ ^[0-9]+$ ]] || return 1
     printf '%s' "$(( when - $(fs_now_epoch) ))"
+    return 0
+}
+
+# pki_cert_expires_in <common_name> — seconds until that certificate's notAfter.
+#
+# ⚠ This exists because the CRL's expiry was guarded carefully and the SERVER
+# CERTIFICATE's was not guarded at all. It is issued for 825 days, the daemon
+# reads it once at start-up and never looks again, and when it lapses every new
+# handshake fails while the service goes on looking healthy. The error surfaces
+# on the client, so the operator is sent to debug the wrong machine.
+#
+# The number comes out of pki_cert_list's epoch column, which is already parsed
+# without spawning a process per certificate.
+pki_cert_expires_in() {
+    local cn="${1:-}" epoch
+    pki_validate_cn "$cn" || return 1
+    epoch="$(pki_cert_list | _pce_c="$cn" awk -F'\t' '$1 == ENVIRON["_pce_c"] { e = $3 } END { print e + 0 }')"
+    [[ "$epoch" =~ ^[0-9]+$ ]] && [[ "$epoch" -gt 0 ]] || return 1
+    printf '%s' "$(( epoch - $(fs_now_epoch) ))"
+    return 0
+}
+
+# pki_server_cert_renew <common_name> [san …]
+#   Reissue under the same common name, keeping the SAN list the caller passes.
+#   The old certificate is revoked first, which is what makes this safe to run
+#   before the old one has lapsed: index.txt.attr carries unique_subject = no
+#   precisely so a common name can be reissued.
+#
+#   It does NOT restart anything. The daemon holds the old certificate in memory
+#   until it is restarted, and only the adapter knows what restarting costs — on
+#   IKEv2 it drops every established security association. So this returns, the
+#   adapter decides, and the operator is told which.
+#
+#   ⚠ ISSUE FIRST, revoke second. The obvious order — revoke the old one, then
+#   issue its replacement — leaves the server with a revoked certificate and no
+#   replacement if the issue fails halfway, which is a total outage produced by
+#   a routine maintenance step. The old certificate and key are moved aside
+#   instead, and only once the new pair is on disk is the saved copy revoked by
+#   FILE (its serial is what index.txt matches, so the path it is read from does
+#   not matter). A failure anywhere puts the originals back and revokes nothing.
+pki_server_cert_renew() {
+    _pki_locked _pki_server_cert_renew_locked "$@"
+}
+
+_pki_server_cert_renew_locked() {
+    local cn="${1:-}"
+    shift || true
+    [[ -n "$cn" ]] || { error "pki_server_cert_renew <common_name> [san …]"; return 1; }
+    pki_validate_cn "$cn" || return 1
+    pki_ca_exists || { error "There is no certificate authority."; return 1; }
+
+    local state crt key old_crt old_key
+    state="$(pki_cert_state "$cn")"
+    case "$state" in
+        valid|expired|revoked) : ;;
+        *) error "No certificate has ever been issued for '${cn}' — issue one rather than renewing."
+           return 1 ;;
+    esac
+
+    crt="$(pki_cert_path "$cn")"
+    key="$(pki_key_path "$cn")"
+    old_crt="${crt}.renew.$$"
+    old_key="${key}.renew.$$"
+
+    if [[ -f "$crt" ]]; then
+        mv -f "$crt" "$old_crt" || { error "cannot set the outgoing certificate aside"; return 1; }
+    fi
+    if [[ -f "$key" ]]; then
+        mv -f "$key" "$old_key" || {
+            error "cannot set the outgoing key aside"
+            [[ -f "$old_crt" ]] && mv -f "$old_crt" "$crt"
+            return 1
+        }
+    fi
+
+    if [[ $# -eq 0 ]]; then
+        set -- "$cn"
+    fi
+    if ! _pki_issue "$cn" "$VPN55_PKI_SERVER_DAYS" "$VPN55_PKI_SERVER_EKU" "$@"; then
+        error "renewal failed — the certificate in use has been left exactly as it was."
+        fs_remove "$crt" || true
+        fs_remove "$key" || true
+        [[ -f "$old_crt" ]] && mv -f "$old_crt" "$crt"
+        [[ -f "$old_key" ]] && mv -f "$old_key" "$key"
+        return 1
+    fi
+
+    if [[ -f "$old_crt" && "$state" != "revoked" ]]; then
+        openssl ca -batch -config "$VPN55_PKI_CONF" -revoke "$old_crt" >/dev/null 2>&1 \
+            || warn "the replaced certificate for '${cn}' could not be added to the revocation list"
+    fi
+    fs_shred "$old_key" || true
+    fs_remove "$old_crt" || true
+
+    _pki_crl_refresh_unlocked || warn "the revocation list could not be regenerated after the renewal"
+    warn "The daemon is still presenting the OLD certificate until it is restarted."
     return 0
 }
 
@@ -808,6 +972,17 @@ DAYS="__DAYS__"
 
 [ -f "$CONF" ] || exit 0
 [ -f "$PKI/ca.crt" ] || exit 0
+
+# Take the same lock the libraries take. This runs on a timer, so without it a
+# weekly refresh can land in the middle of an operator's revocation and
+# regenerate the list from an index.txt that is being appended to underneath it.
+# Re-exec under flock rather than opening a descriptor, because this is /bin/sh
+# and has no {fd} redirection; the guard variable is what stops it looping.
+if [ -z "${VPN55_CRL_LOCKED:-}" ] && command -v flock >/dev/null 2>&1; then
+    VPN55_CRL_LOCKED=1
+    export VPN55_CRL_LOCKED
+    exec flock -w 60 "$PKI/.lock" "$0" "$@"
+fi
 
 tmp="$CRL.new.$$"
 if ! openssl ca -batch -config "$CONF" -gencrl -crldays "$DAYS" -out "$tmp" >/dev/null 2>&1; then
@@ -964,11 +1139,32 @@ pki_report() {
     ui_kv "  certificates"        "${valid} valid · ${revoked} revoked"
 
     local left
-    left="$(pki_crl_expires_in)"
-    if [[ "$left" -le 0 ]]; then
+    if ! left="$(pki_crl_expires_in)"; then
+        # Unknown is reported as unknown. Printing EXPIRED here because `date -d`
+        # is missing would send an operator to fix a revocation list that is fine.
+        ui_kv "  revocation list"  "cannot be read on this host — check it by hand"
+    elif [[ "$left" -le 0 ]]; then
         ui_kv "  revocation list"  "EXPIRED — a strict client will refuse every user"
     else
         ui_kv "  revocation list"  "valid for another $(( left / 86400 ))d"
+    fi
+
+    # The soonest-expiring live certificate, named. A server certificate that
+    # lapses takes every user with it, the daemon does not re-read it, and the
+    # failure appears on the client — so the number belongs in front of the
+    # operator here rather than in a support ticket 825 days from now.
+    local soonest
+    soonest="$(pki_cert_list | _pr_now="$(fs_now_epoch)" awk -F'\t' '
+        $4 == "valid" && $3 > 0 && (best == "" || $3 < best) { best = $3; who = $1 }
+        END { if (best != "") printf "%s\t%d", who, (best - ENVIRON["_pr_now"]) / 86400 }')"
+    if [[ -n "$soonest" ]]; then
+        local who days
+        IFS=$'\t' read -r who days <<< "$soonest"
+        if [[ "$days" -le 30 ]]; then
+            ui_kv "  next to expire"  "${who} in ${days}d — RENEW IT (a lapsed server cert refuses everyone)"
+        else
+            ui_kv "  next to expire"  "${who} in ${days}d"
+        fi
     fi
     return 0
 }

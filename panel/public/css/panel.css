@@ -12,15 +12,15 @@
    EVERY COLOUR COMES FROM A TOKEN. Not one hex value below. The vendored file
    defines --bg, --text, --primary and the rest four times over — once at :root
    and once per [data-theme] — so a rule written against the tokens is correct in
-   all four themes for free, and a rule written against a hex value is correct in
+   every theme for free, and a rule written against a hex value is correct in
    exactly one of them and unreadable in the others.
 
    The corollary, which is the part that actually gets missed: WHEREVER A RULE
    SETS `background`, IT SETS `color` TOO, and the other way round. A quiet
    element that overrides only its background inherits ink chosen for a different
    surface, and in a light theme that is dark-on-dark. Resolve the pair together,
-   per element, every time. (The four themes here range from a near-white page to
-   a near-black one, so this is not a hypothetical.)
+   per element, every time. (The themes here range from a near-white page to a
+   near-black one, so this is not a hypothetical.)
 
    ── Layout is sized against French ──────────────────────────────────────────
    French runs 15-25% longer than English and Vietnamese has taller diacritics.
@@ -39,23 +39,27 @@
    chosen face and half in something else. It reads as a fault on the reader's
    machine rather than a fault in this page, which is why it survives review.
 
-   The vendored theme's own stacks have two holes, and neither is visible on the
-   machine most likely to be used for development:
+   The vendored :root stack ends in a bare `sans-serif`, which is not a family
+   and is not a promise — it is whatever the reader's browser picks. So the
+   token is redefined below for every selector the vendored file defines it in,
+   with a family MEASURED to carry the whole repertoire in front of anything
+   that does not. vendor/office-tools.css is PINNED and is never edited; this
+   file loads second and wins by cascade, which is the entire mechanism.
 
-     matrix  'Courier New', Courier, monospace
-             A macOS or Linux reader without Windows-vintage Courier New lands
-             on Courier — URW Nimbus Mono or Apple's Courier — and neither
-             carries the block.
-     anime   'Segoe UI', 'Helvetica Neue', Arial, sans-serif
-             Segoe UI is Windows-only, so a macOS reader lands on Helvetica
-             Neue, whose Latin Extended Additional coverage is incomplete.
+   ── There used to be two more overrides here ────────────────────────────────
 
-   vendor/office-tools.css is PINNED and is never edited, so the fix is here:
-   panel.css loads second and the token is redefined for every selector the
-   vendored file defines it in. Each theme keeps its character — the matrix
-   theme is still monospaced, the anime theme is still a soft humanist sans —
-   what changes is that every stack now names a face measured to carry the whole
-   repertoire before it reaches anything that does not.
+   The vendored matrix and anime stacks each had a real hole — matrix fell
+   through to Courier (URW Nimbus Mono or Apple's Courier, neither of which
+   carries the block) and anime to Helvetica Neue, whose coverage is incomplete
+   — and this file carried an override for each. Both themes have since been
+   dropped from VPN55_THEMES in theme.js, so nothing can set the attribute their
+   rules are written against and the vendored stacks reach nobody. The overrides
+   went with them rather than staying on as rules for a theme that cannot be
+   selected, which is the kind of rule that exists only to keep a check quiet.
+
+   check-fonts.mjs reads that list rather than a copy of it, reports the two
+   vendored stacks as unreachable by name, and would go back to failing on them
+   the moment either name returned to it.
 
    Measured, not assumed. `.github/scripts/check-fonts.mjs --probe <dir>` parses
    a real font file's cmap and prints its coverage; the same script, run without
@@ -75,23 +79,233 @@
           'Noto Sans', Arial, sans-serif;
 }
 
-[data-theme="matrix"] {
-  /* Still monospaced. ui-monospace resolves to SF Mono on Apple and Cascadia
-     Mono on Windows; Consolas is the measured Windows fallback and DejaVu Sans
-     Mono the Linux one. Courier is NOT in this list — it is the family the
-     vendored stack fell through to, and it is the one that breaks. */
-  --font: ui-monospace, 'Cascadia Mono', Consolas, 'DejaVu Sans Mono',
-          Menlo, 'Courier New', monospace;
+
+/* ============================================================================
+   INK TOKENS — retuned here, measured, never guessed.
+   ============================================================================
+
+   The vendored palette was drawn for a marketing site, and four of its tokens
+   do not survive being read as small text in an operations console. Every value
+   below was COMPUTED, not eyeballed: WCAG 2.x relative luminance, against every
+   surface the selector in question actually sits on, in every theme.
+   `.github/scripts/check-contrast.mjs` recomputes the whole table and fails the
+   build on a regression — that is the only reason to trust a number here.
+
+   What was wrong, measured before the change:
+
+     --text-light   2.34-3.75:1 in ALL FOUR themes, on every surface it is used
+                    on. It carries `.is-unset` (every "no reading" cell in every
+                    table) and `.from-service__mark`. Not a matrix-and-anime
+                    problem: light was the WORST of the four at 2.34:1.
+     --text-muted   4.34:1 light on --bg-secondary (`.chip`, `.grid th`, the
+                    vendored `.tab-btn`) and 3.90:1 light / 4.42:1 anime on the
+                    banner tints. dark and matrix already passed and are left
+                    exactly as vendored.
+     status inks    --warning on --warning-dim was 1.93:1 in light AND anime.
+                    That badge was a coloured rectangle with an invisible word
+                    in it. --success 2.07-3.83, --danger 3.08, --primary 3.55.
+     accent fill    --bg ink on a --primary fill: 3.78-4.27:1. The comment on
+                    .btn--primary correctly says the ink must be --bg rather
+                    than --text; what it could not know is that the FILL is too
+                    light for either. So the fill moves, not the ink.
+
+   ── Why the status colours become SEPARATE tokens rather than a retune ──────
+
+   --warning is two things at once: the ink of a warning badge (needs 4.5:1 on
+   --warning-dim) and the fill of a quota meter (needs 3:1 on --bg-secondary,
+   and wants to stay recognisably amber). Retuning the one token to satisfy the
+   first drains the colour out of the second. So the ink gets its own token and
+   the vendored colour stays the colour. One token, one job.
+
+   ── The three-step ink ramp does not survive AA on two of these palettes ────
+
+   --text > --text-muted > --text-light is a three-step ramp, and on the light
+   and anime palettes there is not room for three legible steps: once both lower
+   steps clear 4.5:1 they are within 0.5 of a ratio point of each other and read
+   as the same grey. That is not a bug to fix by picking better hex values; it
+   is what a 4.5:1 floor costs on a near-white ground. The distinction is
+   carried where it always should have been — `.is-unset` is italic AND renders
+   an em dash, `.from-service__mark` is uppercase and letterspaced — which is
+   this file's own rule that colour is never the only signal, applied to itself.
+   ============================================================================ */
+
+:root {
+  /* :root is NOT "the light theme". It is every theme — it has the same
+     specificity as [data-theme="dark"] and, because this file loads after the
+     vendored one, it WINS there too. So a token set here and not restated in
+     each of the three blocks below silently repaints the other three themes
+     with the light theme's value. (The --font overrides above already carry
+     that shape, which is why dark restates a stack identical to :root's.)
+     check-contrast.mjs models the real cascade and caught exactly this: the
+     first draft of this block left --text-muted out of dark and matrix and
+     dropped both to 2.62:1. Every token here appears in all four blocks. */
+  --text-light:  #5c708b;   /* was #94a3b8 — 2.34:1 on --bg-secondary */
+  --text-muted:  #5a697e;   /* was #64748b — 4.34:1 on --bg-secondary */
+  --ink-ok:      #0b7c56;   /* --success  2.24:1 on --success-dim */
+  --ink-warn:    #996206;   /* --warning  1.93:1 on --warning-dim */
+  --ink-crit:    #d01212;   /* --danger   3.08:1 on --danger-dim */
+  --ink-accent:  #575bf0;   /* --primary  3.99:1 on --primary-dim */
+  /* 3:1 per WCAG 1.4.11: a text field whose only boundary is a 1.18:1 hairline
+     is a field a person cannot find. Applied to CONTROLS only — the vendored
+     --border stays the hairline for cards, rules and table lines, where it is a
+     decoration and not the thing that says "you may type here". */
+  --border-control: #718fb6;
+
+  /* Protocol markers — see the .proto block further down for why the SHAPE
+     carries this and the colour is redundant encoding. */
+  --proto-1: #0e7490;
+  --proto-2: #7c3aed;
+  --proto-3: #b45309;
+  --proto-more: #475569;
 }
 
-[data-theme="anime"] {
-  /* Still a soft humanist sans. Helvetica Neue is dropped rather than reordered:
-     listing it after a covering family only helps on a machine that HAS the
-     covering family, and on macOS — the only place Helvetica Neue exists — the
-     family in front of it, Segoe UI, is exactly what is missing. */
-  --font: 'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto,
-          'Noto Sans', Arial, sans-serif;
+[data-theme="dark"] {
+  --text-light:  #8290a5;   /* was #64748b — 3.07:1 on --bg-card */
+  /* The vendored value, restated. It is correct as vendored (5.71:1 at
+     worst) and it still has to be written here — see the note above. */
+  --text-muted:  #94a3b8;
+  --ink-ok:      #11c98c;
+  --ink-warn:    var(--warning);   /* 6.97:1 already — no change needed */
+  --ink-crit:    #f15e5e;
+  --ink-accent:  #8184f4;
+  --border-control: #5a7396;
+
+  --proto-1: #22d3ee;
+  --proto-2: #c4b5fd;
+  --proto-3: #fbbf24;
+  --proto-more: #94a3b8;
 }
+
+/* ============================================================================
+   MINA — a third theme, and the only one in this file that is ours.
+   ============================================================================
+
+   light and dark come from the vendored palette. This one does not: the pinned
+   file has no [data-theme="mina"] block, so every token it would otherwise
+   inherit from the vendored :root — which is the LIGHT palette — has to be
+   named here. Miss one and the theme renders a light-theme value on a
+   near-black ground. check-contrast.mjs is what catches that; it resolves the
+   real cascade (vendor :root → vendor theme → our :root → our theme) and there
+   is no vendor theme in the middle for this one.
+
+   ── White, not black ────────────────────────────────────────────────────────
+
+   Vietnamese mourning is WHITE — khăn tang, the white headband — where a
+   European funeral palette would reach for black. So the ground is near-black
+   because that is what an operations console wants at 2am, and the ACCENT is
+   ivory: the fills, the marker, the ribbon. Getting that the wrong way round
+   would be a Western funeral wearing a Vietnamese name.
+
+   It also happens to have more contrast headroom than any other theme here —
+   ivory on near-black clears 15:1 — which is why nothing in it needed the
+   retuning the vendored palettes did.
+
+   ── The theme carries no words ──────────────────────────────────────────────
+
+   The ribbon is drawn below and it is aria-hidden and decorative. There is no
+   dedication text, no name and no date anywhere in this stylesheet or in the
+   catalogs, and that is deliberate rather than unfinished: this panel ships to
+   operators who deploy it for their own users, in a country where it is read
+   over a circumvention tool. The visual meaning is the operator's to carry and
+   to explain; a sentence baked into the product would make it everyone's,
+   including people who never chose it. If a dedication is ever wanted it
+   belongs in the operator's own deployment notes, not in the shipped catalogs.
+   ============================================================================ */
+
+[data-theme="mina"] {
+  --bg:           #0b0b10;
+  --bg-secondary: #17171f;
+  --bg-card:      #13131a;
+  --border:       #2e2e3a;
+  --text:         #f4f1ea;
+  --text-muted:   #a9a6b4;
+  --text-light:   #8b8898;
+  /* The accent is ivory rather than a hue: it is the ribbon colour, and on this
+     ground it is also the highest-contrast fill available (15.06:1 with --bg as
+     its ink). */
+  --primary:      #e6e1d6;
+  --primary-h:    #fffaf0;
+  --primary-dim:  #20202b;
+  /* Status stays legible and stays desaturated. A saturated red alert on this
+     palette reads as decoration rather than as an alarm, because everything
+     around it is quiet. */
+  --success:      #7fd6a6;
+  --success-dim:  #10241a;
+  --danger:       #f0908f;
+  --danger-dim:   #2a1113;
+  --warning:      #e3c274;
+  --warning-dim:  #261e0e;
+  --shadow:       0 1px 3px rgba(0,0,0,.5);
+  --shadow-md:    0 6px 20px rgba(0,0,0,.55);
+  --primary-glow: rgba(230,225,214,.25);
+  --font: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto,
+          'Noto Sans', Arial, sans-serif;
+
+  /* Every pairing clears its floor without a retune — see above. The ink tokens
+     are restated all the same, because our :root carries the LIGHT theme's
+     values and :root wins in any theme that does not override it. */
+  --ink-ok:      var(--success);
+  --ink-warn:    var(--warning);
+  --ink-crit:    var(--danger);
+  --ink-accent:  var(--primary);
+  --border-control: #6a6a7e;
+
+  /* A luminance ladder rather than three hues — the only one of the three
+     themes whose marks are genuinely told apart by colour, and only because a
+     monochrome palette left no other option. */
+  --proto-1: #e6e1d6;
+  --proto-2: #a9a6b4;
+  --proto-3: #7d7a8c;
+  --proto-more: #6a6a7e;
+}
+
+/* The ribbon.
+   Drawn in CSS, like the flag in brand.css and for the same reasons: no request
+   to make, nothing to 404, and nothing to argue with a Content-Security-Policy
+   about. Two loops and two tails from one element, in the accent ivory.
+
+   Fixed to the top-right corner, BEHIND nothing: z-index is deliberately below
+   the flash stack (40) and the modal (60), so it can never sit over a message
+   or a confirmation. The vendored anime theme put its decoration at z-index
+   9999, which is how a 🌸 ended up on top of the Sign out button.
+
+   pointer-events: none, aria-hidden by construction (a ::before has no
+   accessible name), and it disappears entirely under prefers-reduced-motion
+   only if it were animated — it is not. It does not move. */
+[data-theme="mina"] body::before {
+  content: '';
+  position: fixed;
+  top: .9rem;
+  right: 1.1rem;
+  width: 2.1rem;
+  height: 1.5rem;
+  pointer-events: none;
+  z-index: 1;
+  opacity: .85;
+  background:
+    /* left loop */
+    radial-gradient(ellipse 46% 58% at 27% 38%, transparent 62%, var(--primary) 63%, var(--primary) 78%, transparent 79%),
+    /* right loop */
+    radial-gradient(ellipse 46% 58% at 73% 38%, transparent 62%, var(--primary) 63%, var(--primary) 78%, transparent 79%),
+    /* knot */
+    radial-gradient(circle at 50% 40%, var(--primary) 0 14%, transparent 15%),
+    /* the two tails, falling */
+    linear-gradient(196deg, transparent 47%, var(--primary) 48%, var(--primary) 55%, transparent 56%),
+    linear-gradient(164deg, transparent 47%, var(--primary) 48%, var(--primary) 55%, transparent 56%);
+  background-repeat: no-repeat;
+  background-size: 100% 70%, 100% 70%, 100% 70%, 42% 100%, 42% 100%;
+  background-position: 0 0, 0 0, 0 0, 22% 100%, 78% 100%;
+}
+
+/* A card in this theme gets a hairline of the accent along its top edge — the
+   ribbon motif carried into the layout rather than repeated as an ornament.
+   Both halves named: the background is the one .card already has. */
+[data-theme="mina"] .card {
+  background: var(--bg-card);
+  color: var(--text);
+  border-top: 2px solid var(--primary-dim);
+}
+
 
 .app {
   max-width: 1400px;
@@ -131,7 +345,7 @@
 /* A quiet button. Sets colour AND background together — see the header. */
 .chip {
   padding: .35rem .7rem;
-  border: 1.5px solid var(--border);
+  border: 1.5px solid var(--border-control);
   border-radius: var(--radius);
   background: var(--bg-card);
   color: var(--text-muted);
@@ -149,12 +363,111 @@
 }
 .chip--on,
 .chip[aria-pressed="true"] {
-  background: var(--primary);
+  /* --ink-accent, not --primary: the vendored accent is too light to carry --bg
+     ink at 4.5:1 (3.78-4.27 across the themes it shipped in). The ink was right;
+     it was the fill that had to move. */
+  background: var(--ink-accent);
   /* Ink on a filled accent must come from the page background token, not from
      --text: --text is the ink for --bg, and on a saturated fill in a light theme
      it is dark-on-dark. */
   color: var(--bg);
   border-color: var(--primary);
+}
+
+/* ---------- Tabs (vendored component, ink corrected here) ----------
+   .tabs / .tab-btn / .active are the pinned theme's own and stay that way — the
+   whole point of vendoring is that the tab strip looks like the tools site's tab
+   strip. Two of its colour pairings do not survive being read, so they are
+   corrected here rather than in the pinned file:
+
+     .tab-btn          --text-muted on --bg-secondary, 4.34:1 in light. Fixed by
+                       the --text-muted retune above; no rule needed.
+     .tab-btn.active   --primary on --bg-card, 3.27:1 in dark and 4.47:1 in
+                       light. This is the label of the view you are looking at,
+                       so it is the one tab label that must be legible.
+
+   The nav is also where a "quiet button that overrides only its background"
+   would hide: .tab-btn sets `background: transparent` and its own --text-muted,
+   so it is paired, and .active names both halves below. */
+.tab-btn.active {
+  background: var(--bg-card);
+  color: var(--ink-accent);
+  border-color: var(--ink-accent);
+}
+
+/* ============================================================================
+   PROTOCOL MARKERS — a colour AND a shape, and the shape is the one that works.
+   ============================================================================
+
+   Three services are distinguished by name only, at every size, and on a 412px
+   phone the service column is the first one to truncate. So each gets a mark
+   beside its label.
+
+   ── Why it is not three colours ─────────────────────────────────────────────
+
+   It was going to be. Three colours were chosen that each clear 3:1 against the
+   table surface in every theme — and then measured against EACH OTHER:
+
+     light   mutual separation 1.06 - 1.51 : 1
+     dark    mutual separation 1.02 - 1.54 : 1
+     mina    mutual separation 1.61 - 5.17 : 1
+
+   Colours picked to be equally dark against one background are, by
+   construction, near-identical in luminance to one another. A reader with any
+   red-green or blue-yellow deficiency sees three identical marks, and so does
+   anybody reading a greyscale print of the screenshot the README asks for. Only
+   mina separates, and only because its palette is monochrome and forced the
+   mark to be a LUMINANCE ladder rather than three hues — which is the answer
+   the other two themes should have arrived at as well.
+
+   So the SHAPE carries the distinction and the colour is redundant encoding:
+   square, diamond, triangle, and a circle for a fourth service this build has
+   never met. The shapes are drawn in CSS rather than set as glyphs — a bare
+   triangle or diamond character is not in every family in these stacks, and a
+   missing glyph falls back per character, which is the failure check-fonts.mjs
+   exists to prevent. Three drawn boxes cannot fall back to anything.
+
+   ── The mark does not know which protocol it is ─────────────────────────────
+
+   app.js may not learn which service is which — rule 3 at the top of that file.
+   The index comes from the adapter's position when the declared tags are
+   SORTED, so the mark means "the first service" and never "the WireGuard one",
+   and it does not shuffle just because the host listed the adapters in a
+   different order this poll. Adding or removing a service can still reassign
+   the marks, and that is liveable precisely because the mark is redundant: the
+   label is right beside it and always was.
+
+   ── Not in portal.css ───────────────────────────────────────────────────────
+
+   Deliberately. The portal names its service in a card title with room to
+   spare, so it has none of the problem this solves, and tokens defined for a
+   rule nobody wrote are how a stylesheet fills up with things that look load
+   bearing. It can be lifted across the day the portal grows a table.
+   ============================================================================ */
+
+.proto {
+  display: inline-block;
+  /* em, not rem: this sits beside a card title in one place and a table cell in
+     another, and the mark should be the size of the text it is marking. */
+  width: .62em;
+  height: .62em;
+  margin-inline-end: .45em;
+  flex: 0 0 auto;
+  vertical-align: baseline;
+  background: var(--proto-more);
+}
+.proto--1 { background: var(--proto-1); border-radius: 2px; }
+.proto--2 { background: var(--proto-2); transform: rotate(45deg); }
+.proto--3 { background: var(--proto-3); clip-path: polygon(50% 0, 100% 100%, 0 100%); }
+.proto--more { background: var(--proto-more); border-radius: 50%; }
+
+/* The service cell is the one that truncates first at 412px. The mark must not
+   be what gets truncated, so the cell is a flex row with the mark fixed and the
+   label taking the remainder. */
+.grid td.svc {
+  display: flex;
+  align-items: baseline;
+  gap: 0;
 }
 
 /* ---------- Layout ---------- */
@@ -225,12 +538,16 @@
   white-space: nowrap;
   vertical-align: baseline;
 }
-/* Each badge names both halves of the pair; the *-dim tokens are already
-   theme-aware backgrounds, and the solid token is the ink that belongs on them. */
-.badge--ok      { background: var(--success-dim); color: var(--success); border-color: var(--success); }
-.badge--warn    { background: var(--warning-dim); color: var(--warning); border-color: var(--warning); }
-.badge--crit    { background: var(--danger-dim);  color: var(--danger);  border-color: var(--danger); }
-.badge--info    { background: var(--primary-dim); color: var(--primary); border-color: var(--primary); }
+/* Each badge names both halves of the pair. The BACKGROUND is the vendored
+   *-dim tint, which is the theme's own; the INK is the measured --ink-* token,
+   because the vendored solid on the vendored tint was 1.93:1 for a warning badge
+   in the light and anime themes — a coloured rectangle with an invisible word in
+   it. The BORDER stays the vendored solid: it is a 1px boundary and not text,
+   and keeping it there is what preserves the badge's colour identity. */
+.badge--ok      { background: var(--success-dim); color: var(--ink-ok);     border-color: var(--success); }
+.badge--warn    { background: var(--warning-dim); color: var(--ink-warn);   border-color: var(--warning); }
+.badge--crit    { background: var(--danger-dim);  color: var(--ink-crit);   border-color: var(--danger); }
+.badge--info    { background: var(--primary-dim); color: var(--ink-accent); border-color: var(--primary); }
 .badge--idle    { background: var(--bg-secondary); color: var(--text-muted); border-color: var(--border); }
 .badge--unknown { background: var(--bg-secondary); color: var(--text-light); border-color: var(--border); }
 
@@ -258,7 +575,9 @@
 .disclosure__warn {
   flex-basis: 100%;
   font-size: .85rem;
-  color: var(--warning);
+  /* --warning is 1.96:1 on --bg-secondary in light and 1.80:1 in anime. This is
+     TEXT, so it takes the ink token; the border-left beside it keeps the amber. */
+  color: var(--ink-warn);
 }
 
 /* The filtering answer is the one an operator acts on, so its border carries the
@@ -355,7 +674,11 @@
   border-radius: var(--radius);
   font-size: .9rem;
 }
-.grid thead { background: var(--bg-secondary); }
+/* The ink for this surface is set on `.grid th` below rather than here. Named
+   here all the same: a background whose colour lives somewhere else is exactly
+   the shape this file's header warns about, and "it is on the child" is a fact a
+   reader should not have to go and verify. */
+.grid thead { background: var(--bg-secondary); color: var(--text-muted); }
 .grid th {
   padding: .55rem .7rem;
   text-align: left;
@@ -374,7 +697,9 @@
   vertical-align: baseline;
 }
 .grid tbody tr:last-child td { border-bottom: none; }
-.grid tbody tr:hover td { background: var(--bg-secondary); }
+/* Colour named with the background, per the header. Without it the hovered row
+   keeps `.grid td`'s --text — correct today, and one edit away from not being. */
+.grid tbody tr:hover td { background: var(--bg-secondary); color: var(--text); }
 
 /* A value that is absent, not zero. Dimmed and dashed rather than blank, so an
    empty-looking cell always has a reason attached to it. */
@@ -441,8 +766,8 @@
    PHASE 6 — the controls that change something
    ============================================================================
    Every colour below is a token, and every rule that sets a background also
-   sets a colour. Read the header: the four themes run from a near-white page to
-   a near-black one, so a control that overrides only its background inherits ink
+   sets a colour. Read the header: the themes run from a near-white page to a
+   near-black one, so a control that overrides only its background inherits ink
    chosen for the other end of that range and comes out unreadable in half of
    them. That is the failure this file exists to prevent, and buttons — small,
    quiet, easy to eyeball as "fine" — are exactly where it hides.
@@ -452,7 +777,7 @@
 .btn {
   display: inline-block;
   padding: .45rem .9rem;
-  border: 1.5px solid var(--border);
+  border: 1.5px solid var(--border-control);
   border-radius: var(--radius);
   background: var(--bg-card);
   color: var(--text);
@@ -475,15 +800,17 @@
 }
 
 /* Ink on an accent fill is the page background, not --text: --text is chosen to
-   sit on the page, and on a saturated fill it is the pairing that fails first. */
+   sit on the page, and on a saturated fill it is the pairing that fails first.
+   The FILL is --ink-accent rather than the vendored --primary, which could not
+   carry --bg ink at 4.5:1 in most of the themes it shipped in. */
 .btn--primary {
-  background: var(--primary);
+  background: var(--ink-accent);
   color: var(--bg);
-  border-color: var(--primary);
+  border-color: var(--ink-accent);
 }
 .btn--primary:hover:not(:disabled),
 .btn--primary:focus-visible {
-  background: var(--primary);
+  background: var(--ink-accent);
   color: var(--bg);
   border-color: var(--text);
 }
@@ -492,14 +819,14 @@
    next to two quiet ones is the one a hand lands on by accident. */
 .btn--danger {
   background: var(--bg-card);
-  color: var(--danger, var(--text));
-  border-color: var(--danger, var(--border));
+  color: var(--ink-crit, var(--text));
+  border-color: var(--ink-crit, var(--border));
 }
 .btn--danger:hover:not(:disabled),
 .btn--danger:focus-visible {
-  background: var(--danger, var(--bg-secondary));
+  background: var(--ink-crit, var(--bg-secondary));
   color: var(--bg);
-  border-color: var(--danger, var(--text-light));
+  border-color: var(--ink-crit, var(--text-light));
 }
 
 .btn--row {
@@ -523,7 +850,12 @@ td.actions,
   width: 100%;
   max-width: 26rem;
   padding: .45rem .6rem;
-  border: 1.5px solid var(--border);
+  /* --border-control, not --border: WCAG 1.4.11 asks for 3:1 on the boundary
+     that identifies a control, and the vendored hairline is 1.18:1 against the
+     light theme's page ground. A field whose edge cannot be seen is a field
+     nobody types in. Cards, rules and table lines keep the hairline — there it
+     is a decoration and not the thing saying "you may type here". */
+  border: 1.5px solid var(--border-control);
   border-radius: var(--radius);
   background: var(--bg);
   color: var(--text);
@@ -575,7 +907,7 @@ td.actions,
   font-size: .85rem;
 }
 .signin__form input { width: 100%; padding: .5rem .6rem;
-  border: 1.5px solid var(--border); border-radius: var(--radius);
+  border: 1.5px solid var(--border-control); border-radius: var(--radius);
   background: var(--bg); color: var(--text); font-family: var(--font); font-size: .95rem; }
 .signin__form .btn { margin-top: 1.1rem; width: 100%; }
 .signin__form .modal__buttons .btn { width: auto; }
@@ -583,7 +915,70 @@ td.actions,
   margin: .8rem 0 0;
   min-height: 1.2em;
   font-size: .85rem;
-  color: var(--danger, var(--text));
+  color: var(--ink-crit, var(--text));
+}
+/* The second factor. Hidden until the panel says the account has one — with
+   `hidden` on the element, not a class, so it stays hidden with no stylesheet at
+   all rather than appearing as a field nobody can fill in. */
+.signin__totp[hidden] { display: none; }
+.signin__totp .muted { margin: .3rem 0 0; font-size: .78rem; }
+/* Wide tracking on a six-digit code: it is read back off a phone one character
+   at a time, and 111111 in a proportional face is not six of anything. */
+.signin__form .signin__totp input {
+  letter-spacing: .35em;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---------- Settings ---------- */
+.settings {
+  display: grid;
+  /* auto-fit, like .facts: a French label is longer and gets the room without a
+     media query, and on a phone this collapses to one column on its own. */
+  grid-template-columns: repeat(auto-fit, minmax(19rem, 1fr));
+  gap: 1rem;
+  margin: .6rem 0 1.4rem;
+}
+.setting {
+  padding: .8rem .9rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-card);
+  color: var(--text);
+}
+.setting__label {
+  display: block;
+  font-size: .85rem;
+  font-weight: 700;
+  color: var(--text);
+}
+.setting__help { margin: .25rem 0 0; font-size: .78rem; }
+.setting__range { margin: .15rem 0 0; font-size: .74rem; }
+.setting__actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: .4rem;
+  margin-top: .6rem;
+}
+.setting__input {
+  flex: 1 1 7rem;
+  min-width: 0;
+  padding: .4rem .5rem;
+  border: 1.5px solid var(--border-control);
+  border-radius: var(--radius);
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font);
+  font-size: .9rem;
+}
+.setting__input:focus-visible { border-color: var(--primary); outline: none; }
+.setting__source {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: .4rem;
+  margin: .5rem 0 0;
+  font-size: .78rem;
 }
 
 /* ---------- Confirmation ---------- */
@@ -636,8 +1031,8 @@ td.actions,
   font-size: .85rem;
   line-height: 1.45;
 }
-.flash__item--ok { border-left-color: var(--success, var(--primary)); }
-.flash__item--error { border-left-color: var(--danger, var(--text-light)); }
+.flash__item--ok { border-left-color: var(--ink-ok, var(--primary)); }
+.flash__item--error { border-left-color: var(--ink-crit, var(--text-light)); }
 /* Adapter-authored text, quoted and attributed — the same treatment a note and a
    filtering explanation get, and for the same reason: this side did not write it
    and cannot translate it without learning which service did. */

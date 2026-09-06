@@ -59,6 +59,12 @@ That state lives in `/var/lib/vpn55/panel/state.json` and is **durable state, no
 a cache**. Losing it sets every user's lifetime usage to zero and nothing on the
 host can rebuild it. It belongs in the backup.
 
+The other files in that directory are the panel's own — the administrator
+records, the audit log, the enforcement state, the portal access codes, the
+settings-screen overlay and what the alerter has already announced. None of them
+is a second opinion about the host: they are things this process decided, which
+is why it is allowed to hold them.
+
 ---
 
 ## Layout
@@ -70,9 +76,13 @@ lib/
   status-read.js       the ONE privileged READ  (vpn55.sh --status)
   privileged.js        the ONLY caller of the root helper — the write path
   privileged-path.js   can we rewrite what we ask root to run? asked about both
-  auth.js              sessions, scrypt, the (username, IP) lockout
+  auth.js              sessions, scrypt, the (username, IP) lockout, TOTP
+  admins.js            the administrator file — ONE reader, ONE writer
+  totp.js              RFC 6238, on node:crypto. SHA-1/6/30 and nothing else
   audit.js             the panel's half of the audit trail
   routes-admin.js      sign-in + every write route
+  settings.js          the settings screen's half that touches disk
+  alerts.js            five conditions, three layers against a storm
   enforcement.js       the periodic quota / expiry job
   records.js           the TSV status stream → a structure
   collector.js         polls and ACCUMULATES  ← the centrepiece
@@ -93,6 +103,7 @@ locales/
 public/
   css/vendor/office-tools.css  PINNED copy of the tools theme — never edited
   css/panel.css                our layer, loaded second, wins by cascade
+  css/brand.css                the footer signature + flag; shared with the portal
   js/theme.js                  PINNED four-theme switcher
   js/i18n.js js/format.js
   js/actions.js                session, CSRF, confirm-then-call
@@ -121,9 +132,21 @@ could have expired it.
 - Writes carry a **CSRF token in a header**, not only the cookie. A cross-origin
   page can cause a cookie to be sent; it cannot read a response body or set a
   custom header.
-- `trust_proxy` is **off by default**, and that default is load-bearing: the
-  lockout is keyed on the client IP, so a caller who can set `X-Forwarded-For`
-  freely has an endless supply of identities.
+- `trust_proxy` is **on by default and refused unless `bind` is loopback**, and
+  the two halves are one decision. The lockout is keyed on the client IP, so on a
+  reachable bind a caller who can set the header has an endless supply of
+  identities — *and* can aim a lockout at the operator by sending the operator's
+  address. But `trust_proxy=0` behind the shipped loopback vhost is not the
+  cautious setting it looks like: every request then arrives from `127.0.0.1`,
+  the whole internet shares one bucket, and five wrong passwords lock the
+  operator out of their own panel. `config.js` refuses both combinations rather
+  than warning about either.
+- The client address comes from **`X-Real-IP`, or the LAST `X-Forwarded-For`
+  hop — never the first.** nginx *appends* to `X-Forwarded-For`, so the first hop
+  is the caller's own claim; `proxy_set_header X-Real-IP` overwrites, so that one
+  cannot be forged. A rate limiter keyed on caller-controlled input is not a rate
+  limiter, and "we only read the header when trust_proxy is on" does not fix it
+  if the part being read is the part the caller wrote.
 
 Accounts are created at the console, as root, and never over HTTP:
 
@@ -137,6 +160,161 @@ The password is read with echo off and never appears in argv — `/proc/<pid>/cm
 is world-readable for the life of a process. The panel **refuses to start** when
 sign-in is on and no account exists: a password prompt nobody can satisfy is
 indistinguishable, from the operator's side, from a forgotten password.
+
+---
+
+## The second factor
+
+TOTP — SHA-1, six digits, thirty seconds, which is the one shape every
+authenticator application actually implements. `lib/totp.js` computes it on
+`node:crypto` and there is no dependency and nothing tunable: an operator who
+picked SHA-256 would enrol successfully, see a code on their phone, and be
+unable to sign in, with both sides certain they were right.
+
+```bash
+node /usr/local/lib/vpn55/panel/scripts/admin.js totp nam            # enrol
+node /usr/local/lib/vpn55/panel/scripts/admin.js totp --clear nam    # break glass
+node /usr/local/lib/vpn55/panel/scripts/admin.js list                # who has one
+```
+
+- **It gates signing in, not each write.** Gating writes would protect the
+  actions and leak the intelligence: a session opened on one factor could still
+  read every user name, quota, endpoint address and traffic total on the host,
+  which is most of what somebody would want it for. And a code demanded six
+  times an hour teaches the reflex phishing needs — a person who enters a code
+  whenever they are asked is a person who can be asked.
+- **Enrolling stores nothing until a live code has been proved.** Writing the
+  secret first and trusting that the scan worked is how somebody is locked out
+  by a phone whose clock is wrong, an app that ignored the parameters, or a
+  mistyped key — and the symptom is identical in all three.
+- **The console draws a scannable QR,** using the portal's encoder rather than a
+  second copy of it — that one is already checked against published values in
+  CI, and a mistyped figure in a QR table produces a handsome square no phone can
+  read. It names its own colours (black on white) instead of inheriting the
+  terminal's, because a dark theme would otherwise invert it, and the key and the
+  `otpauth://` URI are printed either way for a connection that mangles block
+  characters.
+- **A code is accepted once.** The verifier returns the step it matched and
+  `auth.js` refuses a step already spent, so a code read off a shoulder or out of
+  a phishing page is not still usable for the rest of its window. That record is
+  in memory, like the sessions: persisting it would give the HTTP-facing process
+  a write path into the file holding every hash, on every login, to close a gap a
+  restart already bounds to ninety seconds.
+- **The panel never writes `admins.json`.** Enrolling, clearing and changing a
+  password are all console actions, so a stolen session can neither enrol a
+  factor of its own nor remove the one that is there.
+- **There are deliberately no recovery codes.** A stack of single-use secrets
+  that skip the factor, stored on the same host as the hashes, is the bypass this
+  was supposed to avoid — and it buys nothing, because whoever would use it is
+  whoever can already run `totp --clear` at this console. Requiring root for the
+  break-glass path is what stops it being a way in: root can already read the
+  hashes, stop the panel, and change every credential the panel could.
+- `require_totp=1` makes it policy rather than per-account. An account with no
+  factor is then refused, and the panel names those accounts at start-up rather
+  than leaving somebody to meet it as a refused login.
+
+A wrong code costs the same against the same `(username, IP)` counter as a wrong
+password. A *missing* code does not: the normal sign-in passes through that
+branch exactly once, and counting it would spend a fifth of the operator's own
+lockout budget every time they signed in.
+
+---
+
+## The settings screen
+
+`panel.conf` was SSH-only. A fixed list of keys is now editable from the panel,
+and the boundary is drawn by a rule rather than by taste:
+
+> A key is exposed if the worst an authenticated administrator can do with it is
+> make the panel **noisier, quieter, slower or stricter.**
+
+Everything that can reduce authentication, change who can reach the process or
+what it believes about a caller, redirect where data goes, move a path the panel
+reads or writes, or cause an irreversible action on somebody's credentials stays
+in the file. `lib/config.js`'s `EXPOSED` block names each one and says why —
+`allow_unauthenticated`, `require_totp`, `trust_proxy`, the bind addresses, the
+two privileged program paths, `state_dir`, the two revoke switches, and where
+alerts are sent.
+
+**How a write reaches a root-owned file: it does not.** `/etc/vpn55/panel.conf`
+stays root-owned and read-only from this process, and `vpnctl` gains no verb.
+Changes go to `<state_dir>/settings.json` — the directory the panel already owns
+and already writes — and `config.js` merges it over the file at load, restricted
+to that allowlist.
+
+- **The overlay wins over `panel.conf`,** which is the surprising half. The
+  alternative — the file wins, the overlay fills gaps — is unusable, because
+  `panel.conf.example` ships almost every key set explicitly and most controls on
+  the screen would silently do nothing. So the screen says per key when it is
+  overriding the file, shows what the file says, and gives every overridden key a
+  control that puts it back.
+- **Every change takes effect at once.** The panel cannot restart itself —
+  `service-restart` takes an adapter tag and the panel is not an adapter — so a
+  settings screen whose changes needed a restart would be a settings screen that
+  needs SSH. Each owning module has a setter and holds the live value; `cfg`
+  stays frozen and stays the record of what was *loaded*.
+- **A bad overlay is ignored, never fatal.** An out-of-range value, an unknown
+  key, unreadable JSON: dropped with a warning, `panel.conf` in effect. And if a
+  merged configuration is somehow unloadable, `load()` retries once without the
+  overlay. A panel that refused to start over the file whose purpose was to save
+  an SSH session would be the worst failure that feature could have.
+
+---
+
+## Alerting
+
+Nothing here notified anyone of anything. `lib/alerts.js` sends five conditions
+to one webhook — `alert_enabled` plus a URL, both off by default, because this is
+an outbound connection from a host whose whole design is that it does not make
+any.
+
+| | |
+|---|---|
+| `status.unreadable` | the status read has failed N times running |
+| `enforce.still_connected` | disabled accounts still hold working credentials |
+| `enforce.quota_skipped` | accounts with a quota have no usage reading |
+| `enforce.baselines_reset` | a lifetime total went **backwards** |
+| `auth.locked_out` | a sign-in lockout tripped |
+
+**No names are sent** — not a user's, not an administrator's, not an address. A
+message is a type and a count. The webhook URL is the least trusted place
+anything about this host ends up, and the audit log has the whole record one SSH
+session away.
+
+Format `json` posts `{source, host, type, state, severity, at, data}`. Format
+`telegram` posts what the Bot API accepts, because a generic body cannot be one;
+its text is rendered from the catalogs in `default_locale`, so an alert is
+translated like every other string in the project rather than being the one
+English sentence in it.
+
+Three layers stop a flapping service turning the channel into something nobody
+reads:
+
+1. **A transition is announced, never a state.** Still true an hour later is not
+   news.
+2. **Confirmations** — N readings in a row must agree, in *both* directions, so
+   one good poll in the middle of an outage does not send a spurious all-clear
+   either.
+3. **A cooldown** per condition, with a ceiling per hour underneath it, because a
+   bug in either of the first two is a bug that sends messages. A *resolve* is
+   never held back by the cooldown its own firing message started — an alert that
+   fires and never says it is over fills a channel with conditions nobody can
+   tell are stale.
+
+⚠ Whether a condition is a **level** or an **edge** decides whether it can ever
+be sent, and it is not obvious from the name. `baselines_reset` reads like a
+level and is an edge: one run re-takes the baseline and the next finds nothing to
+re-take, so as a level it would need two consecutive runs to agree and would be
+silent for exactly the event it was written for. `quota_skipped` reads like an
+edge and is a level: an account with no usage reading still has none an hour
+later.
+
+The wiring lives in `server.js`, not in the collector or the enforcer. Those two
+keep knowing only about counters and quotas; the decision about what is worth
+telling somebody sits in one file beside the logic that stops it becoming noise.
+⚠ An enforcement run that could not read the host is skipped there rather than
+resolving anything — its counters are all zero, and zero means "did not look",
+not "nothing to report".
 
 ---
 

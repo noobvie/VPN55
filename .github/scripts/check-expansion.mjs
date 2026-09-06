@@ -112,6 +112,18 @@ const LABEL = [
   [/^portal\.token\.(issue|revoke|copy)$/, 'action'],
   [/^portal\.state\.(active|disabled|expired|expiry_unreadable)$/, 'badge'],
   [/^portal\.(connected|notconnected)$/, 'badge'],
+
+  // The settings screen. BUTTON CAPTIONS, SELECT OPTIONS AND ONE BADGE, and
+  // nothing else from it — same reasoning as the portal block above. Its group
+  // headings, its per-key labels and all its help text sit in block elements
+  // that wrap, so listing them would report non-problems.
+  //
+  // The select options matter more than they look: an option's text sets the
+  // width of the closed control, which sits in a flex row beside a Save button
+  // on a card that is one of several in a grid.
+  [/^settings\.(save|revert|on|off)$/, 'action'],
+  [/^settings\.log_level\.(error|warn|info|debug)$/, 'action'],
+  [/^settings\.source\.panel$/, 'badge'],
 ];
 
 /** Which class a key belongs to, or null for prose. */

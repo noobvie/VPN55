@@ -84,13 +84,33 @@ const ACTOR = 'enforcer';
  */
 function usageFromStore(store) {
   const totals = new Map();
+  const spoiled = new Set();
   const counters = (store && store.state && store.state.counters) || {};
+
   for (const slot of Object.values(counters)) {
     if (!slot || !slot.user) continue;
-    const rx = typeof slot.rxTotal === 'number' ? slot.rxTotal : 0;
-    const tx = typeof slot.txTotal === 'number' ? slot.txTotal : 0;
+
+    // ⚠ A total that is not a finite number is a total we do not have, and this
+    // used to coerce it to 0 — which is the very mistake the header of this file
+    // warns about, made one level further in. A truncated or hand-edited
+    // state.json would then hand the caller a small REAL-LOOKING figure instead
+    // of an absent one, the quota check would run against it, and enforcement
+    // would quietly under-count with nothing in the summary to say so. The
+    // caller is already built to handle "no reading"; give it one.
+    //
+    // One bad slot spoils the whole user rather than just itself: the sum of the
+    // slots we could read is still a number, and a number is exactly what must
+    // not be believed here.
+    const rx = slot.rxTotal;
+    const tx = slot.txTotal;
+    if (!Number.isFinite(rx) || !Number.isFinite(tx)) {
+      spoiled.add(slot.user);
+      continue;
+    }
     totals.set(slot.user, (totals.get(slot.user) || 0) + rx + tx);
   }
+
+  for (const user of spoiled) totals.delete(user);
   return totals;
 }
 
@@ -149,7 +169,7 @@ class Enforcer {
    * @param {object} deps.privileged  panel/lib/privileged.js — the only root path
    * @param {object} deps.audit       panel/lib/audit.js
    */
-  constructor({ cfg, collector, store, privileged, audit }) {
+  constructor({ cfg, collector, store, privileged, audit, onRun = null }) {
     this.cfg = cfg;
     this.collector = collector;
     this.store = store;
@@ -159,6 +179,19 @@ class Enforcer {
     this.timer = null;
     this.running = false;
     this.lastRun = null;
+
+    // Live values, owned here rather than read from the frozen cfg. The
+    // settings screen changes both without a restart — see panel/lib/settings.js
+    // — and the panel cannot restart itself. What the job is ALLOWED to do when
+    // it finds something (enforce_quota_revoke, enforce_expiry_revoke) is NOT
+    // here and is not exposed: one checkbox that irreversibly destroys every
+    // over-quota user's configuration on the next run is not a web control.
+    this.enabled = cfg.enforce_enabled;
+    this.intervalMs = cfg.enforce_interval_ms;
+
+    // Called with the summary after every run. Alerting is wired in server.js
+    // rather than here, so this file keeps knowing only about quotas.
+    this.onRun = onRun;
 
     // Two things, persisted:
     //
@@ -212,7 +245,7 @@ class Enforcer {
   }
 
   start() {
-    if (!this.cfg.enforce_enabled) {
+    if (!this.enabled) {
       log.warn('quota and expiry enforcement is switched off in the configuration');
       return;
     }
@@ -220,15 +253,54 @@ class Enforcer {
     // Once at start-up, so a restart does not leave an expired account live for
     // a whole interval.
     this.runOnce().catch((err) => log.error('enforcement run failed', err.message));
+    this._schedule();
+  }
+
+  _schedule() {
+    if (this.timer) clearInterval(this.timer);
     this.timer = setInterval(() => {
       this.runOnce().catch((err) => log.error('enforcement run failed', err.message));
-    }, this.cfg.enforce_interval_ms);
+    }, this.intervalMs);
     if (typeof this.timer.unref === 'function') this.timer.unref();
   }
 
   stop() {
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
+  }
+
+  /**
+   * Switch the job on or off while the panel is running.
+   *
+   * Turning it ON runs a pass immediately rather than waiting an interval: an
+   * operator who has just switched enforcement on is asking about right now, and
+   * five minutes of nothing happening reads as a control that did not work.
+   *
+   * Turning it off does NOT re-enable anything the job disabled. Those accounts
+   * stay off and the state file still records that this job is the one that
+   * switched them off, so switching enforcement back on later can still tell
+   * them apart from accounts an operator disabled by hand.
+   */
+  setEnabled(on) {
+    const wanted = Boolean(on);
+    if (wanted === this.enabled) return;
+    this.enabled = wanted;
+    if (wanted) {
+      log.info('quota and expiry enforcement switched on');
+      this.start();
+    } else {
+      log.warn('quota and expiry enforcement switched OFF — quotas and expiry ' +
+               'dates are no longer acted on, and nothing else on this host acts ' +
+               'on them either');
+      this.stop();
+    }
+  }
+
+  /** Change the interval, in effect from the next tick. */
+  setIntervalMs(ms) {
+    if (!Number.isFinite(ms) || ms < 1000) return;
+    this.intervalMs = Math.floor(ms);
+    if (this.timer) this._schedule();
   }
 
   /**
@@ -257,6 +329,17 @@ class Enforcer {
       // Distinguishes "nothing to do" from "could not look", which a summary of
       // all zeroes otherwise cannot.
       snapshotAge: null,
+      // ⚠ And `snapshotAge` alone cannot carry that distinction: it is null both
+      // when there was no snapshot AND when there was one with no stamp on it.
+      // A host with no users legitimately produces `checked: 0` with no errors,
+      // so nothing else in this summary separates the two either.
+      //
+      // It matters because a consumer that reads a run of zeroes as "all clear"
+      // would report the all-clear on the strength of a reading that was never
+      // taken — which is the failure that looks exactly like success, one level
+      // up from the one this file already guards against. server.js checks this
+      // flag before it lets a run resolve an alert.
+      looked: false,
     };
 
     try {
@@ -270,6 +353,7 @@ class Enforcer {
           'enforcement has no status snapshot yet, so nothing was checked');
         return summary;
       }
+      summary.looked = true;
       summary.snapshotAge = snapshot.stamp
         ? Math.max(0, Math.floor(Date.now() / 1000) - snapshot.stamp) : null;
 
@@ -297,14 +381,25 @@ class Enforcer {
               const held = Object.hasOwn(this.baselines, user.name)
                 ? this.baselines[user.name] : null;
 
-              if (!held || held.windowStart !== start) {
-                this.baselines[user.name] = { windowStart: start, bytes: lifetime };
+              // The window's IDENTITY is (reset, start), not start alone.
+              //
+              // `daily` and `monthly` produce the SAME start on the first of a
+              // month, so a baseline keyed on the timestamp alone would let a
+              // monthly account silently inherit a daily baseline taken that
+              // morning — a month's allowance reset to that day's figure, once a
+              // month, with nothing to show for it. Carrying `reset` also makes
+              // a mid-window change of quota_reset a deliberate new window
+              // rather than a coincidence of arithmetic.
+              const reset = user.quotaReset || null;
+
+              if (!held || held.windowStart !== start || (held.reset ?? null) !== reset) {
+                this.baselines[user.name] = { windowStart: start, reset, bytes: lifetime };
                 stateDirty = true;
                 used = 0;
               } else if (lifetime < held.bytes) {
                 // See the header: the durable total went backwards, so the
                 // baseline is describing a history that no longer exists.
-                this.baselines[user.name] = { windowStart: start, bytes: lifetime };
+                this.baselines[user.name] = { windowStart: start, reset, bytes: lifetime };
                 stateDirty = true;
                 summary.baselinesReset += 1;
                 used = 0;
@@ -356,10 +451,47 @@ class Enforcer {
         }
       }
 
+      // ── Forget users the register no longer has ──────────────────────────
+      //
+      // Both maps are keyed on a user name and neither had anything that
+      // removed an entry, so a host that has come and gone through a few
+      // hundred accounts carried all of them forever — in memory and in a file
+      // rewritten on every change.
+      //
+      // Safe here and only here: `snapshot.users` is the register's own list,
+      // read through the single privileged read, and the run has already
+      // refused to proceed without a snapshot. An adapter being down does not
+      // shorten this list — it is not built per adapter — so an absent name
+      // means the account is gone rather than momentarily unreadable.
+      //
+      // `disabled` is pruned too. It exists to stop this job re-enabling an
+      // account an operator switched off by hand, and a user who no longer
+      // exists cannot be re-enabled by anybody.
+      const present = new Set(snapshot.users.map((u) => u.name));
+      for (const name of Object.keys(this.baselines)) {
+        if (present.has(name)) continue;
+        delete this.baselines[name];
+        stateDirty = true;
+      }
+      for (const name of Object.keys(this.disabled)) {
+        if (present.has(name)) continue;
+        delete this.disabled[name];
+        stateDirty = true;
+      }
+
       if (stateDirty) this._saveState();
     } finally {
       this.running = false;
       this.lastRun = summary;
+      if (this.onRun) {
+        // Guarded. A monitoring hook that could throw out of an enforcement run
+        // would be a monitoring system that stops enforcement.
+        try {
+          this.onRun(summary);
+        } catch (err) {
+          log.warnOnce('enforce-onrun', `the enforcement hook threw: ${err.message}`);
+        }
+      }
     }
 
     if (summary.stillConnected > 0) {

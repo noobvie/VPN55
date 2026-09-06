@@ -54,14 +54,55 @@
     return A.session.authenticated || A.session.unauthenticatedMode;
   }
 
-  var VIEWS = ['services', 'users', 'connections', 'events'];
+  var VIEWS = ['overview', 'services', 'users', 'connections', 'events', 'settings'];
   var state = {
-    view: 'services',
+    view: 'overview',
     data: null,
     error: null,
     loading: false,
     now: Math.floor(Date.now() / 1000),
+
+    /* The settings screen's own data. It is NOT part of the status payload:
+     * everything else on this page is read from the host on a timer, and this
+     * is the panel's own configuration, which changes only when somebody
+     * changes it. Fetched when the tab is opened and after each save. */
+    settings: null,
+    settingsAlerts: null,
+    settingsPaths: null,
+    settingsError: null,
+
+    /* Whether remote addresses in the Connections table are masked.
+     *
+     * DEFAULT ON, and the default is the whole point: docs/launch.md asks for a
+     * screenshot of that table for the README, and a default of "off" means the
+     * safe state depends on somebody remembering to reach for it before taking
+     * the picture. Read from storage below, where an absent or unreadable value
+     * also means masked. */
+    maskEndpoints: true,
   };
+
+  var MASK_KEY = 'vpn55-mask-endpoints';
+
+  /* Only the exact string 'off' unmasks. A private window, blocked site data
+   * and a value somebody hand-edited all land on masked, which is the direction
+   * a failure here has to fall. */
+  function loadMaskPreference() {
+    try {
+      state.maskEndpoints = localStorage.getItem(MASK_KEY) !== 'off';
+    } catch (err) {
+      state.maskEndpoints = true;
+    }
+  }
+
+  function setMaskEndpoints(on) {
+    state.maskEndpoints = !!on;
+    try {
+      localStorage.setItem(MASK_KEY, on ? 'on' : 'off');
+    } catch (err) {
+      /* It still applies to this page view; it just will not be remembered.
+         Same handling as the theme, and for the same reason. */
+    }
+  }
 
   /* ── Tiny DOM helpers ────────────────────────────────────────────────────
    * `el` takes text, never markup. That is the whole point of it. */
@@ -105,6 +146,36 @@
     return el('span', { class: 'badge badge--' + kind, text: label, title: title || null });
   }
 
+  /* ── The protocol marker ──────────────────────────────────────────────────
+   *
+   * A shape and a colour beside each service label, because three services
+   * distinguished by name alone are three services nobody can tell apart at a
+   * glance — and on a 412px phone the service column is the first one the table
+   * truncates. Why the SHAPE rather than the colour does the work is measured
+   * in the .proto block in panel.css: three colours picked to be readable on
+   * one background are 1.02-1.54:1 apart FROM EACH OTHER in two of the three
+   * themes, which is one mark as far as a colour-blind reader is concerned.
+   *
+   * The index is the adapter's position among the SORTED declared tags, so this
+   * file still does not know which protocol it is holding — rule 3 at the top.
+   * Sorted rather than as-listed because the host's ordering is not a promise,
+   * and a mark that changes meaning between two polls is worse than no mark.
+   *
+   * aria-hidden, and deliberately: the mark says exactly what the label beside
+   * it says. Announcing it would read the service twice.
+   */
+  function protoIndex(data) {
+    var tags = (data.services || []).map(function (s) { return s.tag; }).sort();
+    var map = {};
+    tags.forEach(function (tag, i) { map[tag] = i < 3 ? String(i + 1) : 'more'; });
+    return map;
+  }
+
+  function protoMark(index, tag) {
+    var slot = (index && index[tag]) || 'more';
+    return el('span', { class: 'proto proto--' + slot, 'aria-hidden': 'true' });
+  }
+
   /* ── Service state, filtering level: adapter words, translated if known ────
    * The adapter's own word is the fallback. A state or level this build has
    * never heard of renders as that word rather than as a blank or as "unknown" —
@@ -128,6 +199,171 @@
   }
 
   /* ══════════════════════════════════════════════════════════════════════════
+     VIEW 0 — Overview
+     ══════════════════════════════════════════════════════════════════════════
+
+     The four views below this one are lists, and a list does not answer the
+     question somebody opens an operations console to ask, which is "is anything
+     wrong right now". Answering it meant reading four screens and knowing what
+     normal looked like on each.
+
+     ── It reads nothing new ────────────────────────────────────────────────
+
+     Every finding below comes out of the payload the other views already
+     render: service state, the adapters' own notes, orphaned credentials,
+     quota fractions, expiry, and the collector's health. No new endpoint, no
+     new field, nothing added to the durable store. That is deliberate and it
+     is why this screen exists now rather than after a rollup: the "what is
+     wrong" half of an overview needs no history at all.
+
+     ⚠ WHAT IS NOT HERE, AND WHY. There is no chart and no trend. collector.js
+     keeps LIFETIME TOTALS ONLY — freshSlot() is rxTotal/txTotal/rxLast/txLast
+     and a handful of marks, with no time series anywhere — and state.events is
+     capped by COUNT rather than by age, so it cannot carry one either. A chart
+     needs an hourly rollup on the server first. Deciding to ship this half
+     without it was the point; do not fake the other half by plotting lifetime
+     totals against the clock, which draws a line that only ever goes up and
+     says nothing.
+
+     ── It refuses to say "all well" when it does not know ──────────────────
+
+     If the status read is failing or the first reading has not arrived, the
+     screen says the answer is unavailable. A green "nothing is wrong" drawn
+     from data that stopped updating an hour ago is worse than no screen: it is
+     the same reassurance, with none of the evidence, at exactly the moment
+     somebody most needs the difference.
+  */
+
+  function finding(severity, message, viewName) {
+    var box = el('div', { class: 'note note--' + (severity === 'crit' ? 'crit' : 'warn') });
+    box.appendChild(badge(severity === 'crit' ? 'crit' : 'warn',
+      tOr('note.severity.' + severity, 'note.severity.other', { severity: severity })));
+    box.appendChild(el('span', { text: message }));
+    if (viewName) {
+      var go = el('button', {
+        type: 'button',
+        class: 'btn btn--row',
+        text: t('overview.open', { view: t('view.' + viewName) }),
+      });
+      go.addEventListener('click', function () {
+        state.view = viewName;
+        try { location.hash = viewName; } catch (err) { /* no history: not fatal */ }
+        render();
+      });
+      box.appendChild(go);
+    }
+    return box;
+  }
+
+  /* Everything wrong, worst first. Returns an array of nodes so the caller can
+     ask how many there are before deciding what to say. */
+  function findings(data) {
+    var out = [];
+    var crit = [];
+    var warn = [];
+
+    // The panel is running with sign-in switched off. Not a fault of the host
+    // and not transient, which is exactly why it belongs on the screen someone
+    // looks at first rather than only in a corner of the top bar.
+    if (A.session.unauthenticatedMode) crit.push(finding('crit', t('auth.off.body'), null));
+
+    (data.services || []).forEach(function (svc) {
+      if (svc.available === false) {
+        crit.push(finding('crit', t('overview.service.unavailable', { service: svc.label }), 'services'));
+      } else if (svc.state !== 'running' && svc.state !== 'absent') {
+        crit.push(finding('crit', t('overview.service.down', {
+          service: svc.label, state: serviceStateLabel(svc.state),
+        }), 'services'));
+      }
+      if (svc.enabled === false) {
+        warn.push(finding('warn', t('overview.service.bootdisabled', { service: svc.label }), 'services'));
+      }
+      // An adapter's own warning about itself. The sentence is the service's
+      // and is shown as its words, attributed — the same treatment it gets on
+      // the Services screen, because this side still cannot translate it.
+      (svc.notes || []).forEach(function (n) {
+        if (n.severity !== 'warn' && n.severity !== 'crit') return;
+        var node = finding(n.severity, t('overview.service.note', { service: svc.label }), 'services');
+        node.appendChild(fromService(n.message));
+        (n.severity === 'crit' ? crit : warn).push(node);
+      });
+    });
+
+    if (data.orphanCredentials && data.orphanCredentials.length) {
+      crit.push(finding('crit', t('overview.orphans', {
+        count: F.numeric(data.orphanCredentials.length),
+      }), 'users'));
+    }
+
+    var over = 0;
+    var expired = 0;
+    var unparseable = 0;
+    (data.users || []).forEach(function (u) {
+      if (u.quotaUsedFraction !== null && u.quotaUsedFraction >= 1) over += 1;
+      if (u.expired === true) expired += 1;
+      if (u.expired === null) unparseable += 1;
+    });
+    if (over) warn.push(finding('warn', t('overview.overquota', { count: F.numeric(over) }), 'users'));
+    if (expired) warn.push(finding('warn', t('overview.expired', { count: F.numeric(expired) }), 'users'));
+    if (unparseable) {
+      warn.push(finding('warn', t('overview.expiry.unparseable', { count: F.numeric(unparseable) }), 'users'));
+    }
+
+    return out.concat(crit, warn);
+  }
+
+  function renderOverview(data) {
+    var wrap = el('div', { class: 'stack' });
+    var card = el('section', { class: 'card' });
+    card.appendChild(el('header', { class: 'card__head' }, [
+      el('h2', { class: 'card__title', text: t('overview.title') }),
+    ]));
+
+    var h = data.health || {};
+
+    /* The three answers, and the order matters: "I cannot tell" comes before
+       both of the others, because a screen that answers a question it cannot
+       answer is the failure this whole file is written against. */
+    if (!data.ready) {
+      card.appendChild(el('p', { class: 'muted', text: t('overview.unknown.waiting') }));
+    } else if (h.consecutiveFailures) {
+      // The staleness banner above already says how long and why; this says
+      // what it means for the question this screen exists to answer.
+      card.appendChild(el('p', { class: 'muted', text: t('overview.unknown.stale') }));
+    } else {
+      var issues = findings(data);
+      if (!issues.length) {
+        card.appendChild(el('p', { class: 'empty', text: t('overview.allwell') }));
+      } else {
+        card.appendChild(el('p', { class: 'muted', text: t('overview.issues', {
+          count: F.numeric(issues.length),
+        }) }));
+        issues.forEach(function (node) { card.appendChild(node); });
+      }
+    }
+
+    /* What is true right now, under the answer rather than above it. These are
+       counts, not a verdict, and a reader who has just been told everything is
+       fine should not have to scan a row of numbers to believe it. */
+    if (data.ready) {
+      var running = 0;
+      (data.services || []).forEach(function (svc) { if (svc.state === 'running') running += 1; });
+      var dl = el('dl', { class: 'facts' });
+      fact(dl, t('overview.fact.services'),
+        F.numeric(running) + ' / ' + F.numeric(data.counts.services));
+      fact(dl, t('overview.fact.connected'), F.numeric(data.counts.reported));
+      fact(dl, t('overview.fact.users'), F.numeric(data.counts.users));
+      fact(dl, t('overview.fact.reading'),
+        F.relative(data.stamp || data.generatedAt, state.now),
+        F.absolute(data.stamp || data.generatedAt));
+      card.appendChild(dl);
+    }
+
+    wrap.appendChild(card);
+    return wrap;
+  }
+
+  /* ══════════════════════════════════════════════════════════════════════════
      VIEW 1 — Services
      ══════════════════════════════════════════════════════════════════════════ */
   function renderServices(data) {
@@ -138,11 +374,14 @@
       return wrap;
     }
 
+    var marks = protoIndex(data);
+
     data.services.forEach(function (s) {
       var card = el('section', { class: 'card' });
 
       card.appendChild(el('header', { class: 'card__head' }, [
-        el('h2', { class: 'card__title', text: s.label }),
+        el('h2', { class: 'card__title' }, [protoMark(marks, s.tag),
+                                            document.createTextNode(s.label)]),
         badge(stateKind(s.state), serviceStateLabel(s.state)),
         s.available === false
           ? badge('crit', t('service.unavailable'), t('service.unavailable.help'))
@@ -397,6 +636,13 @@
 
     wrap.appendChild(el('p', { class: 'muted', text: t('connections.explain') }));
 
+    /* ── The address mask ──────────────────────────────────────────────────
+     * Display only, and the control says so. The collector does not store
+     * endpoints — freshSlot() in panel/lib/collector.js has no field for one —
+     * so this changes what is on the screen and nothing else. It is worth
+     * having anyway: the screen is the thing that gets photographed. */
+    wrap.appendChild(maskControl());
+
     if (!data.connections.length) {
       wrap.appendChild(emptyNote(t('connections.none')));
       return wrap;
@@ -411,10 +657,15 @@
     if (canWrite()) connCols.push('');
     table.appendChild(headRow(connCols));
 
+    var marks = protoIndex(data);
     var tbody = el('tbody');
     data.connections.forEach(function (c) {
       var tr = el('tr');
-      tr.appendChild(el('td', { text: c.serviceLabel }));
+      // .svc is a flex row so the mark keeps its size while the label takes the
+      // remainder — at 412px this cell is the first one to run out of room, and
+      // the mark must not be the part that goes.
+      tr.appendChild(el('td', { class: 'svc' }, [protoMark(marks, c.tag),
+                                                 document.createTextNode(c.serviceLabel)]));
       tr.appendChild(cell(c.user, c.user === null ? t('orphans.nouser.help') : null));
       tr.appendChild(el('td', {}, [el('span', { class: 'ident', text: c.id })]));
       tr.appendChild(cell(c.address));
@@ -422,7 +673,12 @@
       // The endpoint is the remote address of a person. It is shown because an
       // operator diagnosing a connection needs it, and it is marked as personal
       // data because it is: see docs/security-model.md on what the panel keeps.
-      tr.appendChild(cell(c.endpoint, t('conn.col.endpoint.help')));
+      //
+      // Masked to a /24 or /48 unless the operator has asked to see it. An
+      // address that will not parse is HIDDEN rather than passed through:
+      // showing an unmasked value in a column labelled as masked is worse than
+      // showing nothing, and the reveal control is one click away.
+      tr.appendChild(endpointCell(c.endpoint));
 
       // Session counters versus accumulated totals, side by side and never
       // confused: the left pair resets under you, the right pair does not.
@@ -456,6 +712,63 @@
     table.appendChild(tbody);
     wrap.appendChild(table);
     return wrap;
+  }
+
+  /*
+   * The reveal control. A toggle, not a checkbox in a settings screen: the
+   * decision is "am I about to show this to someone" and it belongs on the
+   * screen where the addresses are, next to them, at the moment it is made.
+   *
+   * The revealed state is stated in words as well as by the button's pressed
+   * look, because "these are the real addresses" is not something anyone should
+   * have to infer from a button's shading — least of all in a theme where that
+   * shading is a green-on-green they have not learned yet.
+   */
+  function maskControl() {
+    var row = el('div', { class: 'card__actions' });
+    var on = state.maskEndpoints;
+
+    var b = el('button', {
+      type: 'button',
+      class: 'chip' + (on ? ' chip--on' : ''),
+      'aria-pressed': on ? 'true' : 'false',
+      text: on ? t('conn.mask.reveal') : t('conn.mask.hide'),
+      title: t('conn.mask.help'),
+    });
+    b.addEventListener('click', function () {
+      setMaskEndpoints(!state.maskEndpoints);
+      render();
+    });
+    row.appendChild(b);
+
+    row.appendChild(el('span', {
+      class: on ? 'muted' : null,
+      text: on ? t('conn.mask.state.on') : t('conn.mask.state.off'),
+    }));
+    if (!on) row.appendChild(badge('warn', t('conn.mask.revealed')));
+    return row;
+  }
+
+  /*
+   * One endpoint cell. Three outcomes, and they are three so that the middle
+   * one cannot be mistaken for either of the others:
+   *   masked      the /24 or /48, in the monospace an address is read in
+   *   unmaskable  the dash, with a title saying it was hidden because it could
+   *               not be masked — NOT the raw value, and not silence
+   *   revealed    the value as the host reported it
+   */
+  function endpointCell(value) {
+    if (!state.maskEndpoints) {
+      return cell(value, t('conn.col.endpoint.help'));
+    }
+    var m = F.maskEndpoint(value);
+    if (!m.masked) {
+      var hidden = el('td', { class: 'is-unset', text: F.DASH, title: m.title });
+      return hidden;
+    }
+    var td = el('td', { title: t('conn.col.endpoint.masked.help') });
+    td.appendChild(el('span', { class: 'ident', text: m.text }));
+    return td;
   }
 
   /* ══════════════════════════════════════════════════════════════════════════
@@ -580,6 +893,14 @@
       b.addEventListener('click', function () {
         state.view = name;
         try { location.hash = name; } catch (err) { /* no history: not fatal */ }
+        // Fetched on arrival rather than kept fresh on a timer: this is the
+        // panel's own configuration and it changes only when somebody changes
+        // it. Re-fetching every fifteen seconds would also rebuild a form
+        // somebody is typing into.
+        if (name === 'settings') loadSettings();
+        // Leaving the settings screen: poll at once rather than showing numbers
+        // frozen at the moment the tab was opened until the next interval.
+        else poll();
         render();
       });
       nav.appendChild(b);
@@ -673,7 +994,25 @@
     var f = el('footer', { class: 'footer' });
     f.appendChild(el('p', { class: 'muted', text: t('app.source') }));
     f.appendChild(el('p', { class: 'muted', text: t('audit.second_log') }));
+    f.appendChild(madeIn());
     return f;
+  }
+
+  /* The signature, and the one string here that is not about the host.
+
+     It is a catalog key like every other sentence on this page — a hard-coded
+     English line would be the only one in the panel, and it would still be
+     English on the surface most of these users read in Vietnamese.
+
+     The flag is drawn in CSS (brand.css) rather than fetched or inlined as an
+     image, and it is `aria-hidden` because it is decorative: the place is
+     already named in the sentence beside it, and a screen reader announcing it
+     twice is worse than not announcing it at all. */
+  function madeIn() {
+    return el('p', { class: 'muted made' }, [
+      el('span', { text: t('app.madewith') }),
+      el('span', { class: 'made__flag', 'aria-hidden': 'true' })
+    ]);
   }
 
   /* ══════════════════════════════════════════════════════════════════════════
@@ -1025,7 +1364,13 @@
 
     var name = el('input', { type: 'text', id: 'add-name', class: 'field', autocapitalize: 'off', spellcheck: 'false' });
     var quota = el('input', { type: 'text', id: 'add-quota', class: 'field', inputmode: 'numeric' });
-    var expires = el('input', { type: 'text', id: 'add-expires', class: 'field', placeholder: 'YYYY-MM-DD' });
+    // From the catalog, not a literal: the help text under this field is
+    // user.field.expires.help, which says AAAA-MM-JJ in French. A hardcoded
+    // YYYY-MM-DD made the box and its own caption disagree on the same screen.
+    var expires = el('input', {
+      type: 'text', id: 'add-expires', class: 'field',
+      placeholder: t('user.field.expires.placeholder'),
+    });
     var conn = el('input', { type: 'text', id: 'add-conn', class: 'field', inputmode: 'numeric' });
 
     var reset = el('select', { id: 'add-reset', class: 'field' });
@@ -1097,6 +1442,224 @@
   }
 
   /* ══════════════════════════════════════════════════════════════════════════
+     Settings
+     ══════════════════════════════════════════════════════════════════════════
+
+     What this screen is, and what it deliberately is not.
+
+     It edits the keys panel/lib/config.js lists in EXPOSED, and nothing else.
+     The rest of panel.conf stays SSH-only, and the ones that matter are named
+     on screen rather than left as an absence somebody has to notice: the
+     sign-in switch, the second-factor requirement, the bind addresses, the
+     proxy-trust pair, the two privileged program paths, the revoke switches and
+     the alert destination. A screen that could turn off the authentication it
+     sits behind is a bypass with a checkbox in front of it.
+
+     Nothing here is written to /etc/vpn55/panel.conf, which stays root-owned.
+     A change goes to the panel's own state directory and is merged over the
+     file at load — so the file is still the operator's, and this screen says
+     per key whether it is currently overriding it.
+
+     ── Why saving is a button and not a change event ─────────────────────────
+     An input that saved as it was typed would save `1`, then `15`, then `150`
+     on the way to `1500`, and two of those three are real settings that briefly
+     took effect. Each row saves when it is asked to. */
+
+  var SETTING_GROUPS = ['reading', 'sessions', 'login', 'enforcement', 'alerts'];
+
+  function loadSettings() {
+    return A.request('GET', '/api/admin/settings').then(function (data) {
+      state.settings = data.settings || [];
+      state.settingsAlerts = data.alerts || null;
+      state.settingsPaths = { conf: data.confPath, overlay: data.settingsFile };
+      state.settingsError = null;
+      render();
+    }, function (err) {
+      state.settings = null;
+      state.settingsError = err.error || 'action.failed';
+      render();
+    });
+  }
+
+  /* One row. The control, where the value came from, and the way back. */
+  function settingRow(row) {
+    var wrap = el('div', { class: 'setting' });
+
+    var control;
+    if (row.type === 'bool' || row.type === 'choice' || row.type === 'locale') {
+      control = el('select', { class: 'setting__input', id: 'set-' + row.key });
+      var options = row.type === 'bool' ? ['1', '0'] : row.choices || [];
+      options.forEach(function (opt) {
+        var label;
+        if (row.type === 'bool') label = t(opt === '1' ? 'settings.on' : 'settings.off');
+        else if (row.type === 'locale') label = t('locale.name.' + opt);
+        else label = t('settings.' + row.key + '.' + opt);
+        var o = el('option', { value: opt, text: label });
+        if (String(row.value) === opt) o.setAttribute('selected', 'selected');
+        control.appendChild(o);
+      });
+    } else {
+      control = el('input', {
+        class: 'setting__input',
+        id: 'set-' + row.key,
+        type: 'number',
+        inputmode: 'numeric',
+        min: row.min === null ? null : String(row.min),
+        max: row.max === null ? null : String(row.max),
+        value: String(row.value),
+      });
+    }
+
+    var save = el('button', { type: 'button', class: 'btn btn--row', text: t('settings.save') });
+    save.disabled = true;
+
+    function markDirty() {
+      save.disabled = String(control.value) === String(row.value);
+    }
+    control.addEventListener('input', markDirty);
+    control.addEventListener('change', markDirty);
+
+    save.addEventListener('click', function () {
+      save.disabled = true;
+      A.request('PUT', '/api/admin/settings/' + encodeURIComponent(row.key),
+                { value: String(control.value) })
+        .then(function (data) {
+          state.settings = data.settings || state.settings;
+          A.flash('ok', t('settings.saved', { name: t('settings.key.' + row.key) }), null);
+          render();
+        }, function (err) {
+          A.flash('error', tOr(err.error, 'action.failed'), null);
+          save.disabled = false;
+        });
+    });
+
+    var actions = el('div', { class: 'setting__actions' }, [control, save]);
+
+    /* The way back. Only drawn when this key IS overriding the file, because a
+       revert control on a key that is not overriding anything would suggest it
+       is. */
+    if (row.source === 'panel') {
+      var revert = el('button', { type: 'button', class: 'btn btn--row', text: t('settings.revert') });
+      revert.addEventListener('click', function () {
+        revert.disabled = true;
+        A.request('DELETE', '/api/admin/settings/' + encodeURIComponent(row.key))
+          .then(function (data) {
+            state.settings = data.settings || state.settings;
+            render();
+          }, function (err) {
+            A.flash('error', tOr(err.error, 'action.failed'), null);
+            revert.disabled = false;
+          });
+      });
+      actions.appendChild(revert);
+    }
+
+    wrap.appendChild(el('label', { class: 'setting__label', for: 'set-' + row.key,
+                                   text: t('settings.key.' + row.key) }));
+    wrap.appendChild(el('p', { class: 'muted setting__help',
+                               text: t('settings.key.' + row.key + '.help') }));
+    if (row.type === 'int' && row.min !== null && row.max !== null) {
+      wrap.appendChild(el('p', { class: 'muted setting__range',
+                                 text: t('settings.range', {
+                                   min: F.numeric(row.min), max: F.numeric(row.max),
+                                 }) }));
+    }
+    wrap.appendChild(actions);
+
+    /* Where this value came from. The one on the left is the important one: an
+       operator who edits panel.conf and sees nothing change has to be told, in
+       the place they are looking, that this screen is overriding it. */
+    var source = el('p', { class: 'setting__source' });
+    if (row.source === 'panel') {
+      source.appendChild(badge('warn', t('settings.source.panel'),
+                               t('settings.source.panel.help')));
+      if (row.fileValue !== null) {
+        source.appendChild(el('span', {
+          class: 'muted', text: t('settings.source.file.is', { value: row.fileValue }),
+        }));
+      }
+    } else if (row.source === 'file') {
+      source.appendChild(el('span', { class: 'muted', text: t('settings.source.file') }));
+    } else {
+      source.appendChild(el('span', { class: 'muted', text: t('settings.source.default') }));
+    }
+    wrap.appendChild(source);
+    return wrap;
+  }
+
+  /* What alerting is currently doing. Shown beside the tuning so the numbers are
+     not being adjusted blind — and no URL and no chat id, because those are
+     SSH-only settings and are also the two worth keeping out of a response. */
+  function alertStatus(a) {
+    var box = el('div', { class: 'disclosure' });
+    var line;
+    if (!a.enabled) line = t('alerts.state.off');
+    else if (!a.configured) line = t('alerts.state.unconfigured');
+    else line = t('alerts.state.on', { format: a.format });
+    box.appendChild(el('p', { text: line }));
+    box.appendChild(el('p', { class: 'muted', text: t('alerts.sent', {
+      count: F.numeric(a.sentLastHour), max: F.numeric(a.maxPerHour),
+    }) }));
+    box.appendChild(el('p', {
+      class: 'muted',
+      text: a.firing.length
+        ? t('alerts.firing', { types: a.firing.join(', ') })
+        : t('alerts.firing.none'),
+    }));
+    if (a.lastError) {
+      box.appendChild(el('p', { class: 'muted', text: t('alerts.lasterror') }));
+      box.appendChild(el('pre', { class: 'diag', text: a.lastError.message }));
+    }
+    return box;
+  }
+
+  function renderSettings() {
+    // .card, like every other view's wrapper. It is a vendored class and the
+    // pinned theme gives each of the four themes its own treatment of it;
+    // inventing a container beside one that already exists is how an admin
+    // screen stops matching itself.
+    var wrap = el('section', { class: 'card' });
+
+    if (state.settingsError) {
+      var b = el('div', { class: 'banner banner--crit', role: 'alert' });
+      b.appendChild(el('p', { text: tOr(state.settingsError, 'action.failed') }));
+      wrap.appendChild(b);
+      return wrap;
+    }
+    if (!state.settings) {
+      wrap.appendChild(emptyNote(t('app.loading')));
+      return wrap;
+    }
+
+    wrap.appendChild(el('p', { class: 'muted', text: t('settings.intro') }));
+    /* The SSH-only keys, named. An absence nobody notices is not a boundary
+       anybody can respect — somebody looking for `bind` here needs to be told
+       where it is, not left to conclude the screen is broken. */
+    wrap.appendChild(el('p', { class: 'muted', text: t('settings.sshonly', {
+      file: state.settingsPaths ? state.settingsPaths.conf : '',
+    }) }));
+
+    SETTING_GROUPS.forEach(function (group) {
+      var rows = state.settings.filter(function (r) { return r.group === group; });
+      if (!rows.length) return;
+      wrap.appendChild(el('h2', { class: 'card__title', text: t('settings.group.' + group) }));
+      if (group === 'alerts' && state.settingsAlerts) {
+        wrap.appendChild(alertStatus(state.settingsAlerts));
+      }
+      var grid = el('div', { class: 'settings' });
+      rows.forEach(function (r) { grid.appendChild(settingRow(r)); });
+      wrap.appendChild(grid);
+    });
+
+    if (state.settingsPaths) {
+      wrap.appendChild(el('p', { class: 'muted', text: t('settings.stored', {
+        file: state.settingsPaths.overlay,
+      }) }));
+    }
+    return wrap;
+  }
+
+  /* ══════════════════════════════════════════════════════════════════════════
      Render + poll
      ══════════════════════════════════════════════════════════════════════════ */
   var root = null;
@@ -1124,10 +1687,20 @@
     if (state.data) {
       var health = renderHealth(state.data);
       if (health) main.appendChild(health);
+    }
 
+    /* Settings first, and outside the `state.data` check on purpose: it is the
+       PANEL's configuration, not the host's state, so it is the one screen that
+       still has something to show when the host cannot be read at all — which
+       is a moment when changing the poll interval or the log level is exactly
+       what somebody wants to do. */
+    if (state.view === 'settings') {
+      main.appendChild(renderSettings());
+    } else if (state.data) {
       if (!state.data.ready) {
         main.appendChild(emptyNote(t('app.waiting')));
-      } else if (state.view === 'services') main.appendChild(renderServices(state.data));
+      } else if (state.view === 'overview') main.appendChild(renderOverview(state.data));
+      else if (state.view === 'services') main.appendChild(renderServices(state.data));
       else if (state.view === 'users') main.appendChild(renderUsers(state.data));
       else if (state.view === 'connections') main.appendChild(renderConnections(state.data));
       else main.appendChild(renderEvents(state.data));
@@ -1142,6 +1715,17 @@
 
   function poll() {
     if (state.loading) return;
+
+    /* Not while the settings screen is open.
+     *
+     * Every poll replaces the view's nodes wholesale — which is right for a
+     * handful of tables and wrong for a form: the input somebody is halfway
+     * through typing into would be rebuilt from the server's value, and the
+     * caret would jump, every fifteen seconds. Nothing is lost by pausing, since
+     * the settings screen shows the panel's own configuration and not the
+     * host's state; the next tab switch polls immediately. */
+    if (state.view === 'settings') return;
+
     state.loading = true;
     fetch('/api/state', { headers: { Accept: 'application/json' }, credentials: 'same-origin' })
       .then(function (r) {
@@ -1183,6 +1767,11 @@
     var hash = String(location.hash || '').replace('#', '');
     if (VIEWS.indexOf(hash) >= 0) state.view = hash;
 
+    // Before the first render, not after: a table that paints unmasked and then
+    // masks itself has already shown the addresses, and on a slow machine it has
+    // shown them long enough to be photographed.
+    loadMaskPreference();
+
     render();
 
     // The session is resolved BEFORE the first poll, so the first paint already
@@ -1190,7 +1779,12 @@
     // then removing them a moment later is how a button gets clicked in the gap.
     A.start().then(function () {
       render();
-      poll();
+      // The settings screen needs a session before it can ask for anything, so
+      // its fetch waits for A.start() like the first poll does. Opening the
+      // panel straight at #settings would otherwise fire a request that is
+      // certain to come back 401.
+      if (state.view === 'settings') loadSettings();
+      else poll();
     });
 
     // Any completed write re-reads the host and repaints, so what is on screen

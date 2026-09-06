@@ -396,13 +396,29 @@ vpn_openvpn_capabilities() {
     printf 'revoke\tcrl\t%s\n' "$(_ovpn_revoke_bound)"
     printf 'custody\tserver\t%s\n' \
         "The server generates this credential's private key, packages it into the client file, and erases it ${VPN55_OVPN_KEY_TTL_HOURS}h after issue."
-    # Two independent properties, and only one is unconditional here. The
-    # handshake is always hidden; whether the traffic also ARRIVES somewhere
-    # unremarkable is the install-time transport choice, so the level moves.
-    local _f_transport _f_port
+    # Two independent properties, and BOTH are read rather than assumed.
+    #
+    # The handshake being hidden is structurally guaranteed — install refuses a
+    # daemon below 2.4, _ovpn_tls_key_ensure always records a mode, and the
+    # config render hard-fails on an empty one — so this branch could simply
+    # assert it, and used to. It does not any more. The badge is the one thing
+    # on the panel an operator acts on when deciding what to hand somebody on a
+    # filtered network, and a level that is DERIVED everywhere except one clause
+    # is a level nobody can audit by reading it. If the recorded mode is ever
+    # missing, this reports `exposed` and says why, which is the answer that
+    # costs an operator nothing if it is wrong.
+    #
+    # Whether the traffic also ARRIVES somewhere unremarkable is the
+    # install-time transport choice, so the level moves with it.
+    local _f_transport _f_port _f_tls
     _f_transport="$(_ovpn_transport)"
     _f_port="$(_ovpn_port)"
-    if [[ "$_f_transport" == "tcp" && "$_f_port" == "443" ]]; then
+    _f_tls="$(_ovpn_tls_mode)"
+
+    if [[ -z "$_f_tls" ]]; then
+        printf 'filtering\texposed\t%s\n' \
+            "This service has no control-channel key recorded, so nothing here can say its handshake is hidden. Treat it as identifiable until the install is re-run and the key is in place."
+    elif [[ "$_f_transport" == "tcp" && "$_f_port" == "443" ]]; then
         printf 'filtering\tresistant\t%s\n' \
             "This service hides its handshake, and carries it over the same port and transport as ordinary web traffic. A filter can separate it from a website neither by shape nor by destination."
     else
@@ -2079,15 +2095,51 @@ _ovpn_build_profile() {
         proto_line="udp"
     fi
 
+    # One identifying line and nothing else. What this file is, why it has to be
+    # handled like a password and what to do when it is lost are all things a
+    # PERSON needs told, in their own language — so they are told in the
+    # `instructions` artifact, which is rendered at handover and translated.
+    # A paragraph of English written into a parser's input file is a string no
+    # translator will ever see, and this one was frozen at issue on top of that:
+    # the profile is spooled, so the language would have been a property of
+    # whoever pressed the button rather than of whoever reads it.
     printf '# VPN55 client profile — %s\n' "$cred"
-    printf '#\n'
-    printf '# Everything this needs is inside this one file, including a PRIVATE KEY.\n'
-    printf '# Treat it the way you would treat a password: it is the credential, not a\n'
-    printf '# description of one. The server erased its copy and cannot send it again.\n'
     printf 'client\n'
     printf 'dev tun\n'
     printf 'proto %s\n' "$proto_line"
-    printf 'remote %s %s\n' "$endpoint" "$port"
+    # ── Every endpoint, not just this host's own ────────────────────────────
+    #
+    # docs/circumvention.md §4: one blocked address must degrade the service,
+    # never end it. This protocol is the one of the three that answers that
+    # natively — the client walks its `remote` list on its own, with no user
+    # action and no second profile, so a blocked first address costs a
+    # reconnect delay instead of an outage.
+    #
+    # The list is fixed at issue and cannot be revisited: the private key below
+    # is erased after hand-off, so this file can never be rebuilt. That is why
+    # the emitter asks for the whole list here rather than the one address the
+    # server happens to be answering on today.
+    #
+    # `remote-random` matters at more than one endpoint. Without it every client
+    # dials entry one, so the second address carries nothing until the first is
+    # blocked — at which point the entire user base arrives at it at once, and
+    # the untested endpoint gets its first traffic during an incident. It is
+    # emitted only when there is something to shuffle, so a single-endpoint
+    # profile is byte-identical to what this wrote before.
+    local _ep _ep_count=0
+    while IFS= read -r _ep; do
+        [[ -n "$_ep" ]] || continue
+        printf 'remote %s %s\n' "$_ep" "$port"
+        _ep_count=$(( _ep_count + 1 ))
+    done < <(net_endpoints_all "$endpoint")
+    (( _ep_count >= 1 )) || { error "no endpoint to write into the profile"; return 1; }
+    if (( _ep_count > 1 )); then
+        printf 'remote-random\n'
+        # Without a bound the client spends a long time on a blackholed address
+        # before trying the next one, which is what a blocked endpoint looks
+        # like: not a refusal, silence.
+        printf 'server-poll-timeout 10\n'
+    fi
     printf 'resolv-retry infinite\n'
     printf 'nobind\n'
     printf 'persist-key\n'
@@ -2297,8 +2349,8 @@ _ovpn_status_stamp() {
 # concatenate every adapter's output into one stream.
 #
 #   service   <tag>  <state>  <enabled>  <listen>  <since>  <cred_count>
-#   cred      <tag>  <cred_id>  <user>  <state>  <address>  <rx>  <tx>  <handshake>  <endpoint>
-#   note      <tag>  <severity>  <message>
+#   cred      <tag>  <cred_id>  <user>  <state>  <address>  <rx>  <tx>  <handshake>  <endpoint>  <connected>
+#   note      <tag>  <info|warn|crit>  <message>
 #
 #   rx / tx    bytes as the daemon reports them RIGHT NOW, and they reset on
 #              every reconnection. "-" is NOT zero and must not be treated as a
@@ -2311,6 +2363,11 @@ _ovpn_status_stamp() {
 #   endpoint   the peer's current remote address, or "-". LIVE state only, never
 #              retained — docs/security-model.md §2 says VPN55 keeps no per-user
 #              connection IP history.
+#   connected  1 | 0 | -. This daemon does count connections, so the answer is
+#              simply whether the status file is carrying a row for this
+#              credential. "-" while the daemon is stopped, because a stopped
+#              daemon has not established that nobody is connected — it has
+#              established nothing.
 vpn_openvpn_status() {
     _ovpn_spool_sweep || true
 
@@ -2367,7 +2424,7 @@ vpn_openvpn_status() {
         done < <(_ovpn_status_records)
     fi
 
-    local cred user address cstate row handshake
+    local cred user address cstate row handshake connected endpoint
     while IFS= read -r cred; do
         [[ -n "$cred" ]] || continue
         user="$(_ovpn_cred_get "$cred" user)"
@@ -2378,19 +2435,22 @@ vpn_openvpn_status() {
             cstate="${row##*$'\t'}"
         fi
 
-        # Only a credential the daemon is currently reporting gets a reading.
-        # Handing every other one the file's timestamp would say the whole fleet
-        # was seen a moment ago.
-        if [[ -n "${st_rx[$cred]:-}" ]]; then
-            handshake="$seen"
+        # A credential the daemon is not currently reporting has no live reading
+        # of any kind. Handing every other one the file's timestamp would say the
+        # whole fleet was seen a moment ago; handing them connected=0 while the
+        # daemon is stopped would claim knowledge this adapter does not have.
+        if [[ "$state" != "running" ]]; then
+            connected='-'; handshake='-'; endpoint='-'
+        elif [[ -n "${st_rx[$cred]:-}" ]]; then
+            connected=1; handshake="$seen"; endpoint="${st_ep[$cred]:--}"
         else
-            handshake="-"
+            connected=0; handshake='-'; endpoint='-'
         fi
 
-        printf 'cred\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        printf 'cred\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
             "$tag" "$cred" "$user" "$cstate" "${address:--}" \
             "${st_rx[$cred]:--}" "${st_tx[$cred]:--}" \
-            "$handshake" "${st_ep[$cred]:--}"
+            "$handshake" "$endpoint" "$connected"
     done <<< "$ids"
     return 0
 }
@@ -2400,6 +2460,16 @@ vpn_openvpn_status() {
 # specific without the panel learning what a revocation list is.
 _ovpn_notes() {
     local tag="$VPN55_OVPN_TAG" transport held
+
+    # This is the one protocol of the three whose clients walk the list
+    # themselves, which is worth stating rather than leaving an operator to
+    # assume the other two behave the same way.
+    local _extra
+    _extra="$(net_endpoints_count)"
+    if [[ "$_extra" != "0" ]]; then
+        printf 'note	%s	info	%s
+' "$tag" \n            "Client profiles issued from now on list ${_extra} address(es) beyond this host's own, in random order. A client moves to the next one by itself when the first stops answering — no second file and nothing for the user to do. Profiles issued earlier are unchanged and cannot be rebuilt."
+    fi
 
     transport="$(_ovpn_transport)"
     if [[ "$transport" == "tcp" ]]; then
@@ -2455,6 +2525,54 @@ _ovpn_notes() {
     if [[ "${held:-0}" -gt 0 ]]; then
         printf 'note\t%s\tinfo\t%s\n' "$tag" \
             "${held} client profile(s) are still retrievable, which means this server is still holding those private keys. Each is erased ${VPN55_OVPN_KEY_TTL_HOURS}h after it was issued."
+    fi
+    return 0
+}
+
+# ─── What must survive this host ──────────────────────────────────────────────
+# The backup contract: one absolute path per line, on stdout. core_backup.sh
+# names no protocol, so this is the only place that knows what OpenVPN keeps.
+#
+# ⚠ tls-crypt.key is not regenerable in any useful sense. It is baked into every
+# .ovpn ever handed out; a new one is a new key that no existing profile has, so
+# every client on the fleet fails its control-channel handshake at once — and
+# fails it BEFORE any certificate is examined, so the failure looks like "the
+# server is not answering" rather than like a credential problem.
+#
+# ⚠ The server's PRIVATE KEY is named here, deliberately, by the CN this adapter
+# recorded for it. docs/backup.md's first draft excluded every key under
+# pki/private except ca.key; that would restore a host holding this server's
+# certificate without its key, and _ovpn_server_cert_ensure skips reissue when
+# the certificate is present and valid — so the daemon would come up unable to
+# read a key nothing on the box would think to replace. The rule that matters is
+# "no CLIENT key, ever", and core_backup enforces it by refusing any key whose
+# CN turns out to be a credential in the user register.
+#
+# NOT here, and each for its own reason:
+#   the spool                 client profiles awaiting collection, private keys
+#                             and all, erased on purpose hours after issue
+#   /etc/openvpn/server/*.conf  regenerated deterministically from settings.conf
+#                             by the next --install, on a host whose interface
+#                             name and addresses may differ from this one's
+vpn_openvpn_backup_paths() {
+    local p cn
+
+    [[ -f "$VPN55_OVPN_CONF" ]] && printf '%s\n' "$VPN55_OVPN_CONF"
+
+    p="$(_ovpn_tls_key)"
+    [[ -f "$p" ]] && printf '%s\n' "$p"
+
+    # Per-credential metadata: which profile belongs to which credential id.
+    if [[ -d "$VPN55_OVPN_CREDS" ]]; then
+        for p in "$VPN55_OVPN_CREDS"/*; do
+            [[ -f "$p" ]] && printf '%s\n' "$p"
+        done
+    fi
+
+    cn="$(fs_conf_default "$VPN55_OVPN_CONF" server_cn "")"
+    if [[ -n "$cn" ]]; then
+        p="$(pki_key_path "$cn")"
+        [[ -f "$p" ]] && printf '%s\n' "$p"
     fi
     return 0
 }

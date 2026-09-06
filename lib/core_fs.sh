@@ -229,8 +229,13 @@ fs_remove_tree() {
     done
     [[ "$trimmed" == "/" ]] && trimmed=""
 
+    # Every entry here is a directory whose removal is an outage rather than a
+    # teardown. The list covers the FHS top level rather than only the paths
+    # this project happens to touch today: the guard is worth having precisely
+    # for the call nobody predicted, and a list that tracks current callers is
+    # a list that is one refactor behind.
     case "$trimmed" in
-        ""|.|..|*/..|/etc|/usr|/var|/opt|/root|/home|/boot|/lib|/lib64|/bin|/sbin)
+        ""|.|..|*/..|/etc|/usr|/usr/local|/usr/lib|/usr/share|/var|/var/lib|/var/log|/var/tmp|/opt|/srv|/tmp|/root|/home|/boot|/lib|/lib64|/bin|/sbin|/dev|/proc|/sys|/run)
             error "fs_remove_tree: refusing to remove '${d}'"
             return 1 ;;
     esac

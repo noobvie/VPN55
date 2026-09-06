@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>VPN55</title>
+<!--
+  Served by nginx when the panel or the portal is not answering — a 502 while
+  the service restarts, a 503, a 504 on a slow host.
+
+    install: install -o root -g root -m 0644 vpn55-offline.html \
+                     /var/www/vpn55/offline.html
+             (install -d -o root -g root -m 0755 /var/www/vpn55 first)
+
+  ── Why this file exists, and why it carries all three languages at once ─────
+
+  Every other string in VPN55 comes from panel/locales/. This one cannot: it is
+  displayed precisely when the process that owns those catalogs is the thing
+  that is down, so there is nothing to negotiate a locale against and no
+  Accept-Language handling available. nginx's built-in page is English, and the
+  default locale here is Vietnamese — so a Vietnamese user whose portal is
+  restarting was getting "502 Bad Gateway / nginx" and nothing else.
+
+  Three short paragraphs, Vietnamese first, is the whole answer. No JavaScript,
+  no external request — the same rule site/index.html follows, and for the same
+  reasons: this has to render from an onion service and from a filtered network,
+  and a page about a privacy tool must not phone anyone.
+
+  ⚠ It says the SERVICE is not answering. It does not say the tunnel is down,
+  because nginx cannot know that and an already-established tunnel keeps working
+  perfectly well while this page is being served.
+-->
+<style>
+  :root {
+    --bg: #f4f6f8; --surface: #fff; --ink: #14181d; --ink-2: #55606b;
+    --line: #d8dee4;
+    /* Measured to carry Vietnamese; no "Helvetica Neue". See
+       .github/scripts/check-fonts.mjs, which reads this file. */
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #12151a; --surface: #191d23; --ink: #e5e9ed; --ink-2: #9ba5b0;
+      --line: #2b323b;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 8vh 20px; background: var(--bg); color: var(--ink);
+    font: 16px/1.6 var(--sans); -webkit-font-smoothing: antialiased;
+  }
+  main {
+    max-width: 34rem; margin: 0 auto; background: var(--surface);
+    border: 1px solid var(--line); border-radius: 10px; padding: 28px 26px;
+  }
+  h1 { margin: 0 0 6px; font-size: 1.15rem; letter-spacing: .01em; }
+  p { margin: 0 0 4px; }
+  section { padding: 14px 0; border-top: 1px solid var(--line); }
+  section:first-of-type { border-top: 0; padding-top: 4px; }
+  .lang { display: block; margin-bottom: 4px; font-size: .75rem;
+          text-transform: uppercase; letter-spacing: .08em; color: var(--ink-2); }
+  .note { color: var(--ink-2); font-size: .92rem; }
+</style>
+</head>
+<body>
+<main>
+  <h1>VPN55</h1>
+
+  <section lang="vi">
+    <span class="lang">Tiếng Việt</span>
+    <p>Dịch vụ này hiện không phản hồi. Đây là sự cố tạm thời của máy chủ, không phải do thiết bị của bạn.</p>
+    <p class="note">Hãy đợi một lát rồi tải lại trang. Nếu bạn đang kết nối VPN thì kết nối đó vẫn hoạt động bình thường. Nếu tình trạng này kéo dài, hãy báo cho người quản trị máy chủ.</p>
+  </section>
+
+  <section lang="en">
+    <span class="lang">English</span>
+    <p>This service is not answering. That is a problem on the server, not on your device.</p>
+    <p class="note">Wait a moment and reload. If you are connected through the VPN, that connection is unaffected. If this lasts, tell whoever runs this server.</p>
+  </section>
+
+  <section lang="fr">
+    <span class="lang">Français</span>
+    <p>Ce service ne répond pas. Le problème vient du serveur, pas de votre appareil.</p>
+    <p class="note">Patientez un instant et rechargez la page. Si vous êtes connecté au VPN, cette connexion n’est pas affectée. Si cela dure, prévenez la personne qui gère ce serveur.</p>
+  </section>
+</main>
+</body>
+</html>

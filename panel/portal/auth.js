@@ -247,8 +247,18 @@ class PortalAuth {
    */
   checkCsrf(req, session) {
     const sent = req.headers[CSRF_HEADER];
-    if (!session || typeof sent !== 'string' || sent.length !== session.csrf.length) return false;
-    return crypto.timingSafeEqual(Buffer.from(sent), Buffer.from(session.csrf));
+    if (!session || typeof sent !== 'string') return false;
+
+    // ⚠ BYTE lengths, not character lengths — timingSafeEqual measures bytes and
+    // THROWS when they differ, so a header of the right character count carrying
+    // multi-byte UTF-8 got past the guard and threw inside the compare. On this
+    // socket that matters more than on the admin one: it is a 500 instead of a
+    // 403, reachable by anyone who can load the page, and the refused-CSRF audit
+    // line never gets written. lib/auth.js carries the same fix.
+    const a = Buffer.from(sent, 'utf8');
+    const b = Buffer.from(session.csrf, 'utf8');
+    if (a.length !== b.length) return false;
+    return crypto.timingSafeEqual(a, b);
   }
 
   /** May this user rotate again right now? Consumes one from the budget. */

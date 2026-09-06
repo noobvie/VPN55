@@ -123,6 +123,10 @@ var VPN55_ACTIONS = (function () {
           error: data.error || 'action.failed',
           detail: data.detail || null,
           retryAfterSeconds: data.retryAfterSeconds || null,
+          // Set by the sign-in route when the account holds a second factor.
+          // Carried through as a flag rather than inferred from the error key,
+          // so the field appears for a MISSING code and stays for a WRONG one.
+          needsTotp: data.needsTotp === true,
         };
         throw err;
       });
@@ -153,9 +157,9 @@ var VPN55_ACTIONS = (function () {
     });
   }
 
-  function signIn(username, password) {
+  function signIn(username, password, totp) {
     return request('POST', '/api/admin/session', {
-      username: username, password: password,
+      username: username, password: password, totp: totp || '',
     }).then(function (data) {
       session.known = true;
       session.authenticated = true;
@@ -206,12 +210,34 @@ var VPN55_ACTIONS = (function () {
     var problem = el('p', { class: 'signin__problem', role: 'alert' });
     var submit = el('button', { type: 'submit', class: 'btn btn--primary', text: t('auth.signin') });
 
+    /* The second factor.
+     *
+     * Hidden until the panel says this account has one, because most of these
+     * deployments have one administrator and asking everybody for a code they
+     * do not have would be a field that is always wrong. `inputmode numeric`
+     * rather than `type number`: a number input strips a leading zero, and a
+     * TOTP code beginning 0 is one code in ten.
+     *
+     * `autocomplete one-time-code` is what lets a phone offer the code from a
+     * notification, which is the difference between this being convenient and
+     * being the reason somebody turns it off. */
+    var code = el('input', {
+      type: 'text', id: 'signin-code', inputmode: 'numeric', autocomplete: 'one-time-code',
+      maxlength: '6', pattern: '[0-9]*', autocapitalize: 'off', spellcheck: 'false',
+    });
+    var codeLabel = el('label', { for: 'signin-code', text: t('auth.totp') });
+    var codeHint = el('p', { class: 'muted', text: t('auth.totp.help') });
+    var codeRow = el('div', { class: 'signin__totp', hidden: 'hidden' }, [
+      codeLabel, code, codeHint,
+    ]);
+
     var form = el('form', { class: 'signin__form', novalidate: 'novalidate' }, [
       el('h1', { class: 'signin__title', text: t('auth.title') }),
       el('label', { for: 'signin-name', text: t('auth.username') }),
       name,
       el('label', { for: 'signin-pass', text: t('auth.password') }),
       pass,
+      codeRow,
       problem,
       submit,
     ]);
@@ -222,11 +248,23 @@ var VPN55_ACTIONS = (function () {
       submit.disabled = true;
       submit.textContent = t('action.working');
 
-      signIn(name.value, pass.value).catch(function (err) {
+      signIn(name.value, pass.value, code.value).catch(function (err) {
         // The password field is cleared and the name is not: whoever just
         // mistyped a long passphrase should not also have to retype their name,
         // and leaving the password in the box is how it ends up in a screenshot.
+        //
+        // The code is cleared too, and always — one is only ever valid for
+        // thirty seconds, so a code left in the box is a code that will be
+        // wrong by the time anybody presses the button again.
         pass.value = '';
+        code.value = '';
+
+        if (err.needsTotp) {
+          codeRow.removeAttribute('hidden');
+          // Focus goes to the code, not back to the password: the password was
+          // right, and putting the cursor in it would read as if it was not.
+          code.focus();
+        }
         problem.textContent = tOr(err.error, 'action.failed', {
           minutes: err.retryAfterSeconds
             ? Math.max(1, Math.ceil(err.retryAfterSeconds / 60)) : 0,

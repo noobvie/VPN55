@@ -35,6 +35,7 @@ const express = require('express');
 
 const log = require('./log');
 const { CSRF_HEADER } = require('./auth');
+const { makeRateLimiter } = require('./rate-limit');
 
 // The register's nullable policy fields, and nothing else. `enabled` is absent
 // on purpose: it has two verbs of its own, and a field assignment that quietly
@@ -65,7 +66,8 @@ function statusForHelperCode(code) {
   }
 }
 
-function build({ cfg, auth, audit, privileged, enforcer, collector, portalTokens, portalAuth }) {
+function build({ cfg, auth, audit, privileged, enforcer, collector, portalTokens, portalAuth,
+                 settings = null, alerter = null }) {
   const router = express.Router();
   router.use(express.json({ limit: '32kb' }));
 
@@ -152,14 +154,29 @@ function build({ cfg, auth, audit, privileged, enforcer, collector, portalTokens
   // deployment the browser would DISCARD a Secure cookie, and the panel would
   // appear to accept a login and instantly forget it — a failure with nothing in
   // any log to explain it.
+  //
+  // ⚠ X-Forwarded-Proto is read only when `trust_proxy` says a proxy is the sole
+  // way in — the same rule the client address already follows, because it is the
+  // same class of header. Reading it unconditionally let any caller assert the
+  // connection was https and decide whether the panel's own session cookie
+  // carried `Secure`. (`req.secure` needs express's own `trust proxy` setting,
+  // which this app deliberately does not enable — we do the header handling in
+  // one place rather than two.)
   const isSecure = (req) => req.secure
-    || String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim() === 'https';
+    || (cfg.trust_proxy
+        && String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim() === 'https');
 
   router.post('/session', async (req, res) => {
     const body = req.body || {};
     const outcome = auth.login(req, {
       username: typeof body.username === 'string' ? body.username : '',
       password: typeof body.password === 'string' ? body.password : '',
+      // The second factor arrives in the SAME request as the password rather
+      // than through a second endpoint holding a half-authenticated ticket. A
+      // pending-login store would be one more piece of server-side state an
+      // unauthenticated caller can create, and it buys nothing: the page simply
+      // asks again with both fields once the panel says a code is wanted.
+      totp: typeof body.totp === 'string' ? body.totp : '',
     });
 
     if (!outcome.ok) {
@@ -168,6 +185,10 @@ function build({ cfg, auth, audit, privileged, enforcer, collector, portalTokens
       const status = (outcome.error === 'auth.locked' || outcome.error === 'auth.rate_limited')
         ? 429 : 401;
       const payload = { ok: false, error: outcome.error };
+      // Whether to draw the code field. A flag rather than something the page
+      // infers from the error key, so the two stay in step in one place: the
+      // field has to appear for a MISSING code and stay for a WRONG one.
+      if (outcome.needsTotp) payload.needsTotp = true;
       if (outcome.retryAfterMs) {
         payload.retryAfterSeconds = Math.ceil(outcome.retryAfterMs / 1000);
         res.set('Retry-After', String(payload.retryAfterSeconds));
@@ -190,10 +211,37 @@ function build({ cfg, auth, audit, privileged, enforcer, collector, portalTokens
     });
   });
 
+  /**
+   * Sign out.
+   *
+   * Logout is a state change, so it takes the CSRF header like every other one —
+   * it was the single mutating route without it. In practice a cross-origin
+   * DELETE carrying a JSON content type needs a preflight this app never answers,
+   * and SameSite=Strict stands behind that, so this closes a completeness gap
+   * rather than a live hole. It is still worth closing: "every mutating route is
+   * CSRF-checked" is a rule that survives the next person adding a route, and
+   * "every mutating route except one" is not.
+   *
+   * The cookie is cleared EITHER WAY. A caller holding a stale or unreadable
+   * cookie has no session to check a token against, and refusing to clear it
+   * would strand them: the browser would keep sending a cookie the panel will
+   * never accept, and the visible symptom is a sign-in page that does nothing.
+   */
   router.delete('/session', (req, res) => {
+    const session = cfg.allow_unauthenticated
+      ? null : auth.resolve(req, { interactive: false });
+
+    if (session && !auth.checkCsrf(req, session)) {
+      audit.write({
+        actor: session.user, ip: auth.ip(req), verb: 'csrf', target: req.path,
+        result: 'denied', message: 'auth.csrf_failed',
+      });
+      return res.status(403).json({ ok: false, error: 'auth.csrf_failed' });
+    }
+
     auth.logout(req);
     res.set('Set-Cookie', auth.clearCookieHeader({ secure: isSecure(req) }));
-    res.json({ ok: true });
+    return res.json({ ok: true });
   });
 
   router.get('/session', (req, res) => {
@@ -386,8 +434,13 @@ function build({ cfg, auth, audit, privileged, enforcer, collector, portalTokens
   router.get('/enforcement', requireSession, (req, res) => {
     res.json({
       ok: true,
-      enabled: cfg.enforce_enabled,
-      intervalSeconds: Math.floor(cfg.enforce_interval_ms / 1000),
+      // From the enforcer, not from cfg. The settings screen changes both
+      // without a restart, so cfg is the record of what was LOADED and the
+      // enforcer is the record of what is RUNNING. Reporting the frozen value
+      // would tell an operator their change had not taken effect.
+      enabled: enforcer ? enforcer.enabled : cfg.enforce_enabled,
+      intervalSeconds: Math.floor(
+        (enforcer ? enforcer.intervalMs : cfg.enforce_interval_ms) / 1000),
       quotaRevoke: cfg.enforce_quota_revoke,
       expiryRevoke: cfg.enforce_expiry_revoke,
       lastRun: enforcer ? enforcer.lastRun : null,
@@ -492,15 +545,147 @@ function build({ cfg, auth, audit, privileged, enforcer, collector, portalTokens
     return res.json({ ok: true, record, sessionsEnded: ended });
   });
 
+  // ── Settings ──────────────────────────────────────────────────────────────
+  //
+  // These do NOT go through vpnctl and they do not touch /etc/vpn55/panel.conf,
+  // which stays root-owned and read-only from this process. A change is written
+  // to <state_dir>/settings.json — the directory the panel already owns and
+  // already writes — and config.js merges it over panel.conf at load, restricted
+  // to the keys in its own EXPOSED allowlist. panel/lib/settings.js carries the
+  // whole reasoning, including the keys that stay SSH-only and why each does.
+  //
+  // The allowlist is the control, and it is not enforced here. A key outside it
+  // cannot be reached from this route at any URL, in any body, by any session:
+  // this asks settings.js, settings.js asks config.js, and config.js answers
+  // about a frozen object.
+
+  const RE_SETTING = /^[a-z][a-z0-9_]{0,63}$/;
+
+  /** Every exposed key, its value, and WHERE that value came from. */
+  router.get('/settings', requireSession, (req, res) => {
+    if (!settings) return res.status(404).json({ ok: false, error: 'settings.unavailable' });
+    return res.json({
+      ok: true,
+      confPath: cfg.confPath,
+      settingsFile: cfg.settings_file,
+      settings: settings.list(),
+      // Shown beside the alert tuning so those numbers are not adjusted blind.
+      // No URL and no chat id: both are SSH-only settings, and they are also the
+      // two values in that group worth keeping out of a response.
+      alerts: alerter ? alerter.status() : null,
+    });
+  });
+
+  /**
+   * Change one setting.
+   *
+   * The key is in the PATH and the value in the body, so a malformed key is a
+   * 400 from this router rather than something settings.js has to guess at. The
+   * value is validated against that key's own spec before anything is written,
+   * and the write is atomic — a value applied to a running module but not
+   * persisted would revert silently at the next restart, which is the worst of
+   * both outcomes.
+   */
+  router.put('/settings/:key', requireWrite, (req, res) => {
+    if (!settings) return res.status(404).json({ ok: false, error: 'settings.unavailable' });
+    const key = String(req.params.key || '');
+    if (!RE_SETTING.test(key)) {
+      return res.status(400).json({ ok: false, error: 'settings.unknown_key' });
+    }
+    const body = req.body || {};
+    if (body.value === undefined || body.value === null) {
+      return res.status(400).json({ ok: false, error: 'settings.invalid_value' });
+    }
+
+    let result;
+    try {
+      result = settings.set(key, body.value);
+    } catch (err) {
+      const bad = err.code === 'unknown' || err.code === 'invalid';
+      const error = err.code === 'unknown' ? 'settings.unknown_key'
+        : (err.code === 'invalid' ? 'settings.invalid_value' : 'action.failed');
+      audit.write({
+        actor: req.session.user, ip: auth.ip(req), verb: 'settings-set', target: key,
+        result: 'denied', message: error, detail: { value: String(body.value).slice(0, 200) },
+      });
+      return res.status(bad ? 400 : 500).json({ ok: false, error });
+    }
+
+    // The value is audited in full. Every key reachable here is tuning — an
+    // interval, a level, a count — so there is nothing in one worth withholding,
+    // and a settings change nobody can trace is the change somebody would make.
+    audit.write({
+      actor: req.session.user, ip: auth.ip(req), verb: 'settings-set', target: key,
+      result: 'ok', code: 0, detail: { value: result.value },
+    });
+    return res.json({ ok: true, setting: result, settings: settings.list() });
+  });
+
+  /**
+   * Stop overriding a key: whatever panel.conf says takes effect again.
+   *
+   * This is what makes the overlay-wins precedence honest. Without it a value
+   * set once here would shadow the file forever, and the way back would be to
+   * delete a JSON file over SSH — which is the situation this screen exists to
+   * remove.
+   */
+  router.delete('/settings/:key', requireWrite, (req, res) => {
+    if (!settings) return res.status(404).json({ ok: false, error: 'settings.unavailable' });
+    const key = String(req.params.key || '');
+    if (!RE_SETTING.test(key)) {
+      return res.status(400).json({ ok: false, error: 'settings.unknown_key' });
+    }
+
+    let result;
+    try {
+      result = settings.clear(key);
+    } catch (err) {
+      const error = err.code === 'unknown' ? 'settings.unknown_key' : 'action.failed';
+      return res.status(err.code === 'unknown' ? 400 : 500).json({ ok: false, error });
+    }
+
+    audit.write({
+      actor: req.session.user, ip: auth.ip(req), verb: 'settings-clear', target: key,
+      result: 'ok', code: 0, detail: { value: result.value },
+    });
+    return res.json({ ok: true, setting: result, settings: settings.list() });
+  });
+
   /**
    * Force a status re-read, so the UI is not showing a stale snapshot straight
    * after a write. It is a POST because it costs a subprocess, and it is behind
    * requireWrite for the same reason — an unauthenticated caller must not be
    * able to make this host fork on demand.
+   *
+   * It is also the only write route that costs a subprocess WITHOUT changing
+   * anything, so nothing else bounds how often it may be asked for: the helper
+   * verbs are self-limiting because an operator only has so many users to
+   * disable, and this one can be held down. The limiter is per administrator
+   * rather than per address — the cost is caused by whoever is signed in, and a
+   * mobile operator changing networks must not collect a fresh budget by moving.
+   * Generous enough that a real person clicking refresh after each write never
+   * meets it; low enough that a loop does. The portal's config fetch is limited
+   * for exactly this reason (portal/auth.js) and this is the same shape.
    */
+  const refreshLimiter = makeRateLimiter({
+    windowMs: 60_000,
+    max: 20,
+    message: 'action.rate_limited',
+  });
+
   router.post('/refresh', requireWrite, async (req, res) => {
+    const who = req.session.user || 'anonymous';
+    if (!refreshLimiter.allow(who)) {
+      const retryAfterMs = refreshLimiter.retryAfterMs(who);
+      res.set('Retry-After', String(Math.ceil(retryAfterMs / 1000)));
+      return res.status(429).json({
+        ok: false,
+        error: 'action.rate_limited',
+        retryAfterSeconds: Math.ceil(retryAfterMs / 1000),
+      });
+    }
     await collector.poll();
-    res.json({ ok: true, health: collector.health() });
+    return res.json({ ok: true, health: collector.health() });
   });
 
   return router;

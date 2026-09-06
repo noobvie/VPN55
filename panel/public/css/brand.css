@@ -1,0 +1,63 @@
+/* ============================================================================
+   brand.css — the global footer signature, shared by the admin panel and the
+   self-serve portal.
+
+   ── Why this is its own file ───────────────────────────────────────────────
+
+   Two invariants would otherwise have to be broken to fit it in.
+
+   `panel.css` contains NO hex value at all: every colour there is a theme
+   token, defined four times over by the vendored stylesheet, so a rule written
+   against the tokens is correct in all four themes for free. The flag below is
+   not a theme colour — it is a flag, and it is the same yellow and the same red
+   on a near-white page and on a near-black one. Putting those two literals in
+   `panel.css` would end that rule for every rule after it.
+
+   And `portal.css` deliberately does not load `panel.css`: the portal is one
+   column on a phone, the panel is a wide operations console, and neither should
+   be one stylesheet away from the other's layout. But the signature IS shared —
+   it is the same sentence in the same place on both — so a third copy of the
+   flag geometry, drifting quietly from the other two, is the wrong answer.
+
+   `site/index.html` carries its own copy, and that one is unavoidable: that
+   page is deliberately a single file that makes no external request of any
+   kind. Keep the two in step by hand; the geometry is the six percentages
+   below and nothing else.
+
+   ── The flag ───────────────────────────────────────────────────────────────
+
+   Drawn in CSS rather than fetched or inlined as an image. There is nothing to
+   load, nothing to 404, nothing to add to a manifest, and no `data:` URI to
+   argue with a Content-Security-Policy about.
+
+   Three red stripes on yellow, in a 3:2 field, centred: five bands of 7.5% each
+   spanning 31.25%–68.75%, which is what makes the middle stripe land exactly on
+   the centre line. Change one percentage and change all six.
+   ========================================================================= */
+
+.made {
+  display: flex;
+  align-items: center;
+  gap: .45rem;
+  flex-wrap: wrap;
+}
+
+.made__flag {
+  /* Sized in em so it tracks whatever font-size the footer around it uses. */
+  width: 1.35em;
+  height: .9em;
+  flex: none;
+  border-radius: 2px;
+  background: linear-gradient(
+    #ffcd00 0 31.25%,
+    #da251d 0 38.75%,
+    #ffcd00 0 46.25%,
+    #da251d 0 53.75%,
+    #ffcd00 0 61.25%,
+    #da251d 0 68.75%,
+    #ffcd00 0 100%);
+  /* An inset hairline, not a border: the box is sized, and a border on a sized
+     box in these stylesheets pushes it past its line box. It is there because
+     a yellow field on the light theme has no edge of its own. */
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, .25);
+}

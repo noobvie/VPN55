@@ -57,6 +57,8 @@ const { Audit } = require('./lib/audit');
 const { Auth } = require('./lib/auth');
 const { Privileged } = require('./lib/privileged');
 const { Enforcer } = require('./lib/enforcement');
+const { Alerter } = require('./lib/alerts');
+const { Settings } = require('./lib/settings');
 const adminRoutes = require('./lib/routes-admin');
 const { PortalTokens } = require('./portal/tokens');
 const { PortalAuth } = require('./portal/auth');
@@ -121,9 +123,12 @@ function main() {
     return;
   }
 
-  // ── The one privileged path ───────────────────────────────────────────────
-  // A READER, not the write helper. This build calls helper/vpnctl nowhere at
-  // all; panel/lib/privileged.js is Phase 6's and is not loaded here.
+  // ── The first of the two privileged paths ─────────────────────────────────
+  // The READER. It is constructed first because the collector needs it and
+  // because a panel that cannot see the host has nothing to show, but it is not
+  // the only one: the write helper is built a few lines below and both are
+  // preflighted before anything listens. docs/security-model.md §6E.7 is the
+  // record that this surface is two programs, not one.
   const reader = new StatusReader({ config: cfg, warn: (m) => log.warn(m) });
   const problems = reader.preflight();
   if (problems.length) {
@@ -140,7 +145,43 @@ function main() {
     return;
   }
 
-  const collector = new Collector({ privileged: reader, store, cfg });
+  // ── Alerting ──────────────────────────────────────────────────────────────
+  //
+  // Built before the collector and the enforcer because both hand it their
+  // results, and wired HERE rather than inside either of them. That is the whole
+  // arrangement: collector.js keeps knowing only about counters, enforcement.js
+  // keeps knowing only about quotas, and the decision about what is worth
+  // telling somebody lives in one file with the suppression logic that stops it
+  // becoming noise.
+  //
+  // Inert unless alert_enabled is on AND a URL is set. With neither, every
+  // observation below is a few comparisons and a return.
+  const alerter = new Alerter({ cfg, catalogs });
+  if (alerter.active) {
+    log.info(`alerts: ${cfg.alert_webhook_format} webhook, ` +
+             `${alerter.confirmations} confirmation(s), ` +
+             `${Math.floor(alerter.cooldownMs / 1000)}s cooldown, ` +
+             `at most ${alerter.maxPerHour}/hour`);
+  }
+
+  const collector = new Collector({
+    privileged: reader,
+    store,
+    cfg,
+    // The panel cannot see the host at all while this is true, which makes every
+    // other alert unknowable rather than false — so this one is separate from
+    // them and is the only one raised from the read path.
+    onPoll: (health) => {
+      alerter.observe(
+        'status.unreadable',
+        health.consecutiveFailures >= alerter.statusFailures,
+        // `count` rather than `failures`: every alert renders through one
+        // template that fills {count}, so a differently named field would come
+        // out as a literal `{count}` in the message.
+        { count: health.consecutiveFailures },
+      );
+    },
+  });
 
   // ── The write path ────────────────────────────────────────────────────────
   // Constructed here and passed down, so there is exactly one Privileged in the
@@ -149,7 +190,7 @@ function main() {
   // rather than a property.
   const audit = new Audit({ file: cfg.audit_file, warn: (m) => log.warn(m) });
   const privileged = new Privileged({ config: cfg, warn: (m) => log.warn(m) });
-  const auth = new Auth({ config: cfg, audit, warn: (m) => log.warn(m) });
+  const auth = new Auth({ config: cfg, audit, warn: (m) => log.warn(m), alerter });
 
   // The same question the status reader asks about the installer, asked about
   // the helper: can this process replace the file it is about to ask root to
@@ -176,7 +217,65 @@ function main() {
     return;
   }
 
-  const enforcer = new Enforcer({ cfg, collector, store, privileged, audit });
+  // Sign-in is on, `require_totp` is on, and somebody has no second factor: they
+  // cannot sign in, and the fix is at this console. Said at start-up rather than
+  // left for them to discover as a refused login with a message about a terminal
+  // they may not be sitting at.
+  if (!cfg.allow_unauthenticated && cfg.require_totp) {
+    const bare = auth.adminsWithoutTotp();
+    if (bare.length) {
+      log.warn(`require_totp=1 and ${bare.length} account(s) have no second factor ` +
+               'enrolled. They CANNOT sign in until they do. Enrol each of them here:',
+               bare.join(', '));
+      log.warn('  node /usr/local/lib/vpn55/panel/scripts/admin.js totp <name>');
+    }
+  }
+
+  const enforcer = new Enforcer({
+    cfg,
+    collector,
+    store,
+    privileged,
+    audit,
+    onRun: (summary) => {
+      // ⚠ A run that could not read the host must not RESOLVE anything. Its
+      // counters are all zero, and zero here means "did not look", not "nothing
+      // to report" — resolving on it would send an all-clear derived from a
+      // reading that was never taken. `looked` is the flag that separates the
+      // two; a summary of zeroes cannot.
+      if (!summary.looked) return;
+
+      alerter.observe('enforce.still_connected', summary.stillConnected > 0,
+                      { count: summary.stillConnected });
+      alerter.observe('enforce.quota_skipped', summary.quotaSkipped > 0,
+                      { count: summary.quotaSkipped });
+      // An EDGE, not a level: a baseline is re-taken by one run and the next run
+      // finds nothing to re-take. See the warning at the top of lib/alerts.js.
+      if (summary.baselinesReset > 0) {
+        alerter.event('enforce.baselines_reset', { count: summary.baselinesReset });
+      }
+    },
+  });
+
+  // ── The settings screen's live values ─────────────────────────────────────
+  //
+  // Built last of the runtime modules, because it pushes a value into each of
+  // them. cfg stays frozen and stays the record of what was LOADED; from here
+  // on, what is RUNNING is whatever these modules hold, and this is the only
+  // thing that changes them.
+  //
+  // applyAll() is not optional. config.js has already merged the overlay for its
+  // own purposes, so without this the loader and a module that read cfg once at
+  // construction would disagree — and the screen would be showing a value that
+  // was not the one in use.
+  const settings = new Settings({ cfg });
+  settings.bind({ collector, auth, enforcer, catalogs, alerter });
+  settings.applyAll();
+  if (cfg.overridden.length) {
+    log.info(`settings screen is overriding ${cfg.overridden.length} key(s) from ` +
+             `${cfg.confPath}`, cfg.overridden.join(', '));
+  }
+  for (const note of cfg.notes) log.warn(note);
 
   const app = express();
   app.disable('x-powered-by');
@@ -211,7 +310,9 @@ function main() {
   });
 
   app.get('/api/locale', (req, res) => {
-    res.json({ locale: req.locale, available: cfg.locales, default: cfg.default_locale });
+    // `catalogs.defaultLocale`, not `cfg.default_locale` — the settings screen
+    // can change it without a restart, and cfg is the record of what was loaded.
+    res.json({ locale: req.locale, available: cfg.locales, default: catalogs.defaultLocale });
   });
 
   app.get('/api/i18n/:locale', (req, res) => {
@@ -257,6 +358,7 @@ function main() {
 
   app.use('/api/admin', adminRoutes.build({
     cfg, auth, audit, privileged, enforcer, collector, portalTokens, portalAuth,
+    settings, alerter,
   }));
 
   // Reads are behind the session too. Phase 5 could leave them open because it
@@ -286,7 +388,11 @@ function main() {
   // Fetching it afterwards would show a flash of key names, which is the
   // hardcoded-English problem wearing a different hat.
   app.get('/', (req, res) => {
-    res.type('html').send(renderShell(req.locale, cfg, catalogs));
+    // The poll interval comes from the collector, which is what actually polls.
+    // A page told 15s while the collector runs at 60s would count down to a
+    // refresh that does not come.
+    res.type('html').send(
+      renderShell(req.locale, cfg, catalogs, { pollSeconds: collector.pollSeconds }));
   });
 
   app.use('/assets', express.static(path.join(__dirname, 'public'), {
@@ -528,14 +634,25 @@ function esc(s) {
  * The shell page. It carries no sentence of its own — every visible string is a
  * catalog key resolved by the client script, and the catalog is inlined so the
  * first paint is already correct.
+ *
+ * Two strings are ALSO rendered server-side, into the markup rather than only
+ * as a data-i18n key: the <title> and the <noscript>. Both are read before
+ * app.js runs, or when it never runs at all — an empty <title> shows the URL in
+ * the tab, and a body with no <noscript> is a blank page in no language. The
+ * data-i18n attribute stays on the title so the language picker still reaches
+ * it without a reload.
  */
-function renderShell(locale, cfg, catalogs) {
+function renderShell(locale, cfg, catalogs, { pollSeconds = null } = {}) {
   const boot = {
     locale,
     locales: cfg.locales,
-    defaultLocale: cfg.default_locale,
+    // Both of these are live values the settings screen can change without a
+    // restart, so they come from the modules that own them rather than from the
+    // frozen cfg. The fallbacks keep this function callable with three arguments
+    // in a test that has no collector.
+    defaultLocale: catalogs.defaultLocale || cfg.default_locale,
     cookieName: LOCALE_COOKIE,
-    pollSeconds: cfg.poll_seconds,
+    pollSeconds: pollSeconds === null ? cfg.poll_seconds : pollSeconds,
     strings: catalogs.catalog(locale),
   };
   // </script> inside JSON would close the tag early; the escape is the standard
@@ -548,11 +665,13 @@ function renderShell(locale, cfg, catalogs) {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex, nofollow">
-<title data-i18n="app.title"></title>
+<title data-i18n="app.title">${esc(catalogs.t(locale, 'app.title'))}</title>
 <link rel="stylesheet" href="/assets/css/vendor/office-tools.css">
 <link rel="stylesheet" href="/assets/css/panel.css">
+<link rel="stylesheet" href="/assets/css/brand.css">
 </head>
 <body>
+<noscript><p>${esc(catalogs.t(locale, 'app.noscript'))}</p></noscript>
 <script id="boot" type="application/json">${json}</script>
 <script src="/assets/js/theme.js"></script>
 <script src="/assets/js/i18n.js"></script>

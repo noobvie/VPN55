@@ -87,8 +87,14 @@ function build({ cfg, portalAuth, audit, privileged, collector, catalogs }) {
   // how to spend.
   router.use(express.json({ limit: '4kb' }));
 
+  // X-Forwarded-Proto is read only when `portal_trust_proxy` says a proxy is the
+  // sole way in — the same rule the client address follows, because it is the
+  // same class of header. Unconditionally, any caller could assert the
+  // connection was https and decide whether this socket's own session cookie
+  // carried `Secure`. lib/routes-admin.js carries the same fix.
   const isSecure = (req) => req.secure
-    || String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim() === 'https';
+    || (cfg.portal_trust_proxy
+        && String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim() === 'https');
 
   // ── Guards ────────────────────────────────────────────────────────────────
 
@@ -271,7 +277,11 @@ function build({ cfg, portalAuth, audit, privileged, collector, catalogs }) {
     // downloading it are usually not the same person and often do not read the
     // same language, so the locale is decided here and now rather than having
     // been frozen at issue.
-    const locale = catalogs.has(req.locale) ? req.locale : cfg.default_locale;
+    // catalogs.defaultLocale rather than cfg.default_locale — the settings
+    // screen can change the default without a restart, and a handed-over file
+    // written in the language the panel was STARTED in would be the one place
+    // that change did not reach.
+    const locale = catalogs.has(req.locale) ? req.locale : catalogs.defaultLocale;
 
     const ip = portalAuth.ip(req);
     try {
@@ -380,11 +390,36 @@ function build({ cfg, portalAuth, audit, privileged, collector, catalogs }) {
       });
     }
 
+    // The helper refuses to report success without a credential id, so this is
+    // an inconsistency rather than a normal outcome — but it must be handled
+    // here, because the alternative is the one path in this route that can end
+    // with the user holding nothing: revoking the working credential on the
+    // strength of a replacement this process cannot name.
+    //
+    // Reported as "nothing changed, the one you have still works". That is true
+    // whichever way the ambiguity resolves, which is what makes it the right
+    // thing to say; if a credential WAS created, the audit line and the panel's
+    // own list are where an operator finds it.
+    if (!issued) {
+      audit.write({
+        actor: user, ip, verb: 'portal-rotate-revoke', target: owned.meta.id,
+        result: 'denied', message: 'no credential id was returned; not revoking',
+      });
+      log.warn(`portal rotate for ${user}: the helper reported success with no `
+        + `credential id, so ${owned.meta.id} was left alone`);
+      return res.status(500).json({ ok: false, error: 'portal.rotate_failed_kept' });
+    }
+
     let revoked = false;
     let latency = null;
     try {
+      // expectUser is the second ownership check, and on this path it is the
+      // one that does not depend on any code in this process being right. The
+      // resolver above read a snapshot of the register that is up to a poll
+      // interval old; the helper re-derives the holder from the registry as
+      // root and refuses if it disagrees.
       const { details } = await privileged.credRevoke(
-        owned.meta.id, owned.service.tag, { actor: user });
+        owned.meta.id, owned.service.tag, { actor: user, expectUser: user });
       revoked = true;
       // The adapter's own answer about what it achieved, passed through
       // untouched. An adapter that ended the live session says so and is

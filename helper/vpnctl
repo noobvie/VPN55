@@ -780,7 +780,7 @@ verb_cred_add() {
     ctl_ok "credential issued"
 }
 
-# cred-revoke <cred_id> [adapter-tag]
+# cred-revoke <cred_id> [adapter-tag] [user=<name>]
 #
 # The owning adapter is resolved from the REGISTRY, not from the caller: the
 # credential rows carry the tag of whichever adapter created them, so the panel
@@ -789,29 +789,88 @@ verb_cred_add() {
 # it still has to be a registered tag, and it is only consulted when the lookup
 # found nothing.
 #
+# `user=` is an optional OWNERSHIP ASSERTION and it is what makes this verb
+# match cred-config. cred-config has always re-derived the holder from the
+# registry as root, which is why the panel's ownership layer is documented as
+# the friendlier of two checks rather than the only one. That was never true of
+# this verb: it took an id and revoked it, so on the self-serve rotation path
+# — the destructive half — the panel was the sole check, against a snapshot of
+# the register that is up to a poll interval old.
+#
+# It is optional because an operator revoking on somebody's behalf is the whole
+# point of the verb, and the admin panel and the enforcement sweep both do
+# exactly that. It is the SELF-SERVE caller that has a user to name, and it
+# names it; when the assertion is present it is re-derived here rather than
+# trusted, and a mismatch fails as E_TARGET with the same words cred-config
+# uses — the caller learns that the credential is not theirs, not whose it is.
+#
 # One verb, three genuinely different operations. The adapter reports what it
 # actually achieved and that is passed through verbatim: an adapter that managed
 # to end the live session says so and is believed, because over-warning on the
 # days it is instant is how an operator learns to ignore the warning on the day
 # it is not.
 verb_cred_revoke() {
-    local cred="${1:-}" tag="${2:-}"
-    [[ $# -ge 1 && $# -le 2 ]] || ctl_fail "$E_USAGE" "cred-revoke <cred_id> [service]"
+    local cred="${1:-}" tag="" expect_user="" have_user=0 arg=""
+    [[ $# -ge 1 && $# -le 3 ]] || ctl_fail "$E_USAGE" "cred-revoke <cred_id> [service] [user=<name>]"
+    shift
+
+    # A tag can never contain '=' (ctl_valid_tag), so the two optional
+    # arguments are told apart by shape and may arrive in either order.
+    #
+    # `have_user` is tracked SEPARATELY from the value, and that is not
+    # pedantry: keying on `[[ -n "$expect_user" ]]` meant a bare `user=` — an
+    # assertion whose value came out empty — skipped the ownership check
+    # entirely and revoked. An assertion that cannot be evaluated has to fail,
+    # never quietly become an absent one, because the caller that sent it
+    # believed it was asking for a check.
+    for arg in "$@"; do
+        case "$arg" in
+            user=*)
+                [[ $have_user -eq 0 ]] || ctl_fail "$E_USAGE" "cred-revoke <cred_id> [service] [user=<name>]"
+                have_user=1
+                expect_user="${arg#user=}"
+                ;;
+            *)
+                [[ -z "$tag" ]] || ctl_fail "$E_USAGE" "cred-revoke <cred_id> [service] [user=<name>]"
+                tag="$arg"
+                ;;
+        esac
+    done
 
     ctl_valid_cred "$cred" || ctl_fail "$E_ARG" "invalid credential id"
     if [[ -n "$tag" ]]; then
         ctl_valid_tag "$tag" || ctl_fail "$E_ARG" "invalid service tag"
+    fi
+    if [[ $have_user -eq 1 ]]; then
+        # ctl_valid_user rejects the empty string, so a bare `user=` lands here.
+        ctl_valid_user "$expect_user" || ctl_fail "$E_ARG" "invalid user name"
     fi
     VPNCTL_TARGET="$cred"
 
     _ctl_load_libs || ctl_fail "$E_FAILED" "cannot load the VPN55 libraries"
     _ctl_load_adapters || ctl_fail "$E_FAILED" "cannot load the protocol adapters"
 
-    local row owner=""
+    # users_cred_find prints  name<TAB>service<TAB>created<TAB>state, so field 1
+    # is the HOLDER and field 2 is the adapter tag. `owner` below is the tag.
+    local row="" holder="" owner=""
     if row="$(users_cred_find "$cred" 2>/dev/null)"; then
+        holder="$(printf '%s' "$row" | cut -f1)"
         owner="$(printf '%s' "$row" | cut -f2)"
-        ctl_detail user "$(printf '%s' "$row" | cut -f1)"
+        ctl_detail user "$holder"
     fi
+
+    # ─── Ownership, when the caller asserts one ──────────
+    # Re-derived from the registry as root, the same way cred-config does it and
+    # for the same reason: so that a caller which got its own ownership check
+    # wrong cannot revoke somebody else's credential. Refusing outright when the
+    # id is in no registry record is deliberate — an unregistered credential has
+    # no holder to compare against, and "I could not check" must not read as
+    # "the check passed".
+    if [[ $have_user -eq 1 ]]; then
+        [[ -n "$row" ]] || ctl_fail "$E_TARGET" "no such credential for this user"
+        [[ "$holder" == "$expect_user" ]] || ctl_fail "$E_TARGET" "no such credential for this user"
+    fi
+
     if [[ -z "$owner" ]]; then
         owner="$tag"
     fi
@@ -1053,7 +1112,9 @@ Verbs:
   user-enable     <name>
   user-disable    <name>            a policy flag; it does NOT end a live tunnel
   cred-add        <name> <service> [key=value …]
-  cred-revoke     <cred_id> [service]
+  cred-revoke     <cred_id> [service] [user=<name>]
+                         user= asserts the holder; the revoke is refused unless
+                         the registry agrees. Self-serve callers pass it.
   service-restart <service>         <service> is a registered adapter tag
 
 Read:

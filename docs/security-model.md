@@ -5,7 +5,7 @@ this document rather than the document written to excuse the code. Anything belo
 marked **OPEN** is a decision that has not been made yet; anything marked **DECIDED**
 is binding on every later phase.
 
-Last revised: 2026-08-30 (Phase 6).
+Last revised: 2026-08-30 (privileged-path review, after Phase 8).
 
 ---
 
@@ -78,9 +78,24 @@ The panel service runs as an unprivileged user. It can:
 
 - **Read** on-disk server configuration and adapter `_status` output — which is
   itself privileged, and reaches root by its own pinned route (§3.1).
-- **Read and write** its own state directory — sessions, accumulated traffic
-  counters, audit log, portal tokens.
+- **Read and write** its own state directory — accumulated traffic counters,
+  audit log, portal tokens, enforcement state, the settings-screen overlay, and
+  what the alerter has already announced. (Sessions are in memory, not there.)
+- **Read, and never write,** the administrator file in that directory. Creating
+  an account, changing a password and enrolling or clearing a second factor are
+  console actions as root (`panel/scripts/admin.js`), so a stolen session can
+  neither enrol a factor of its own nor remove the one that is there.
+- **Make one outbound connection,** to the alert webhook, and only when an
+  operator has switched alerting on and typed a URL. It carries a condition type
+  and a count — no user name, no administrator name, no address.
 - **Call `helper/vpnctl`**, and only that, for anything that CHANGES the host.
+  ⚠ The settings screen added in Phase 9 does **not** change that: it writes to
+  the panel's own state directory, `/etc/vpn55/panel.conf` stays root-owned and
+  is only ever read, and no verb was added for it. The keys it may reach are an
+  allowlist in `panel/lib/config.js`; the ones it may not include
+  `allow_unauthenticated`, `require_totp`, `trust_proxy`, the bind addresses, the
+  paths of both privileged programs, `state_dir`, both revoke switches, and where
+  alerts are sent.
 
 The complete privileged surface is eight verbs, and this list is the security model
 in one line:
@@ -176,7 +191,19 @@ credential spool as it reports, which is how the 24-hour hand-off window in §6.
 enforced at all. Nothing in service changes; something already past its expiry may be
 tidied away.
 
-#### One deployment trap that disables this route entirely
+#### Three deployment traps that disable this route entirely
+
+All three share a shape worth naming before the detail: **the unit hardens the panel,
+but every one of these settings binds the root process sudo starts as well.** A
+namespace and a capability set are properties of the unit, not of a uid, and root does
+not step outside either. Hardening the service therefore constrains the helper, and
+the helper is the half that has to be able to act.
+
+None of the three fails at start-up. The unit comes up, the panel serves pages, and
+the failure appears only at the first privileged call — which is why each is written
+down here rather than left to be rediscovered.
+
+**1. `no_new_privs`, set for you.**
 
 sudo is setuid, and a setuid binary cannot raise privileges once the kernel's
 `no_new_privs` bit is set. systemd sets that bit **without being asked** whenever any
@@ -191,6 +218,58 @@ system with the 'nosuid' option set…"*, which sends whoever is debugging it to
 at mount options while the panel reports every service as unreadable. The unit in
 `deploy/` omits those options and says why; after any change to it,
 `systemctl show -p NoNewPrivileges vpn55-panel` must print `no`.
+
+**2. An emptied capability bounding set, which does not do what it reads as.**
+
+`CapabilityBoundingSet=` (empty) reads like "this service needs no capabilities", and
+for the panel that is true. But the bounding set is inherited across `execve` and can
+only ever be **dropped** — never re-acquired. On a setuid-root exec the kernel
+computes the new permitted set as `pP' = bset | pI`, so an empty bounding set means
+the process sudo starts has euid 0 and **zero capabilities**. sudo fails first, at the
+`setgroups`/`setresgid(0)` it performs before exec: the binary is setuid, not setgid,
+so gid 0 is not already in its saved set and the change needs `CAP_SETGID`. Had sudo
+survived it, `wg set` would have failed next for want of `CAP_NET_ADMIN`. This is the
+same setting that empties `ping`.
+
+The unit carried it, with a comment asserting the bounding set was "re-established for
+the new process". It is not, and the assertion is the reason nobody checked. It has
+been removed rather than narrowed to a hand-picked list: such a list goes stale the
+day an adapter shells out to something new, and it goes stale silently. Nothing is
+lost — the panel runs as an unprivileged user with no file capabilities, so its own
+sets are empty whatever the bounding set says.
+
+**3. `ProtectSystem=strict` with no `ReadWritePaths=`.**
+
+A mount namespace is per-unit and every descendant is inside it, root included. With
+`ProtectSystem=strict` and nothing granted back, `/etc/vpn55` and `/var/log/vpn55` are
+read-only **to the helper**, so all seven write verbs fail on their first write.
+
+The second half is worse than the first. `_ctl_audit` is deliberately non-fatal — an
+unwritable log must never block a revocation — so `/var/log/vpn55/vpnctl.log` would
+simply never be created, and nothing would say so. That is the log §6E.4 describes as
+the one a panel compromise cannot rewrite and §5 tells you to read afterwards; its
+absence would be discovered on the day it was needed.
+
+The unit now lists the paths the helper writes, and the list is deliberately not
+uniform. The three adapter directories are prefixed `-`, because a host running only
+WireGuard has no `/etc/swanctl` and that is normal. `/etc/vpn55` and `/var/log/vpn55`
+are **not** prefixed: for those, absent means the registry or the audit log has
+nowhere to live, and the helper's own `mkdir -p` cannot rescue it from inside a
+read-only namespace. A start-up refusal naming the directory is the whole failure,
+said while somebody is looking.
+
+`/var/log/vpn55` is therefore created by the install, `root:root 0700`, and **not**
+by `LogsDirectory=`, which would create it owned by the service user — a log the
+panel can rewrite is not a log that survives a panel compromise, and that is the only
+property that file has.
+
+After any change to the unit, both of these are worth the same two lines as the first
+trap:
+
+```
+systemctl show -p CapabilityBoundingSet vpn55-panel   # must NOT be empty
+systemctl show -p ReadWritePaths vpn55-panel          # must list /etc/vpn55
+```
 
 ---
 
@@ -236,21 +315,40 @@ Stated per level, because "it's hardened" is not information.
 
 ### A compromised panel service (level 3)
 
-**An attacker gains:** the seven verbs. They can create users, delete users, disable
-users, issue credentials and revoke them, and restart services. Issuing a credential
-means they can grant themselves VPN access. They can read the user registry — names,
-quotas, expiry, traffic totals — and the audit log.
+**An attacker gains:** all eight verbs — the seven that write and `cred-config`. They
+can create users, delete users, disable users, issue credentials and revoke them, and
+restart services. Issuing a credential means they can grant themselves VPN access.
+They can read the user registry — names, quotas, expiry, traffic totals — and the
+audit log.
 
-**They do not gain:** root on the VPS; the CA private key; existing users' private
-keys; the ability to read traffic; the ability to run arbitrary commands; persistence
-outside the panel's own state directory.
+**And they gain every client key still inside its hand-off window.** This is the one
+that is easy to state too favourably, so it is stated flatly. `cred-config` returns
+the spooled configuration for a credential, which on the server-custody path
+**contains the client's private key** until it is shredded (§6.1, §6A.5 — 24 hours by
+default). The helper's ownership check is that the *named user* holds the *named
+credential*; a compromised panel supplies both halves and already knows every pair
+from the status read. So for the length of that window, every credential issued on
+this host is readable, not only the attacker's own.
 
-**Your response:** revoke the issued credentials, rotate the admin password, and read
-the audit log — every write is logged with actor, verb, target and result, which is
-why that log is not optional for a VPN. **Read the HELPER's log, not the panel's**:
-the panel's copy is written by the process the attacker owned and can be rewritten by
-it, while `/var/log/vpn55/vpnctl.log` is root's and cannot (§6E.4). **The CA does not
-need replacing**, and that is the single most valuable property of this design.
+**They do not gain:** root on the VPS; the CA private key; a client key whose
+hand-off window has closed; the ability to read traffic; the ability to run arbitrary
+commands; persistence outside the panel's own state directory.
+
+**Your response:** rotate the admin password, and read the audit log — every call is
+logged with actor, verb, target and result, which is why that log is not optional for
+a VPN. **Read the HELPER's log, not the panel's**: the panel's copy is written by the
+process the attacker owned and can be rewritten by it, while
+`/var/log/vpn55/vpnctl.log` is root's and cannot (§6E.4).
+
+Then revoke, and revoke wider than instinct suggests. Revoking the credentials the
+attacker *added* is the obvious half and it is not sufficient: **every `cred-config`
+in the helper's log is a credential to treat as compromised and reissue**, and those
+belong to ordinary users, were issued legitimately, and look untouched in the
+register. A read leaves no trace anywhere else. Grep the helper's log for
+`cred-config` before deciding the incident is over.
+
+**The CA does not need replacing**, and that is the single most valuable property of
+this design.
 
 ### A compromised root helper (level 2)
 
@@ -751,7 +849,7 @@ Phase 0 decided the model and §3 published it. This section records what Phase 
 actually built against it, including the two places where reality is narrower than
 the wording suggested and the one place it is wider.
 
-### 6E.1 The helper is seven verbs, and CI counts them
+### 6E.1 The helper is eight verbs, and CI counts them
 
 `helper/vpnctl` implements exactly the list in §3 and refuses everything else. Four
 properties make the narrowness real rather than decorative, and each is checked
@@ -777,7 +875,9 @@ rather than asserted:
 path traversal, command substitution, a leading dash that would be read as an option,
 a newline that would forge a log record — plus the well-formed ones that must still
 be accepted. **CI runs it on every push**, along with a check that the helper and the
-panel agree on the verb list and that it still has exactly seven entries. A validator
+panel agree on the verb list and that it still has exactly eight entries — seven
+writes and one read, counted separately, so a WRITE verb cannot arrive hidden inside
+a total that also covers the read. A validator
 checked only by reading it is a validator that regresses silently, and this one stands
 between an unprivileged web process and root.
 
@@ -786,13 +886,26 @@ between an unprivileged web process and root.
 | Rule | Pinned | Why |
 |---|---|---|
 | `vpn55.sh --status` | The whole command line | The same file with **no** argument is the interactive installer: unrestricted root. There, the argument *is* the control. |
-| `helper/vpnctl` | The path only | There is no dangerous argument to pin against — the helper refuses anything outside its seven verbs, and sudoers cannot express "user-add followed by a name matching this pattern" anyway. Here, the **program** is the control. |
+| `helper/vpnctl` | The path only | There is no dangerous argument to pin against — the helper refuses anything outside its eight verbs, and sudoers cannot express "user-add followed by a name matching this pattern" anyway. Here, the **program** is the control. |
 
 Both rules are worth nothing if the panel can rewrite the file the rule names: a
 NOPASSWD rule on a writable path is root with a delay. `panel/lib/privileged-path.js`
 checks the file **and every directory above it** at start-up and refuses to run if any
 of them is writable by the panel's user. That is a backstop for a deployment mistake,
 not a substitute for `chown -R root:root /usr/local/lib/vpn55`.
+
+**Neither program is one file, and the check now says so.** `vpnctl` sources eight
+libraries out of `lib/` and then every `lib/proto_*.sh` adapter beside them — as
+root, before a verb does anything — and `vpn55.sh` sources the same tree. Being able
+to write `lib/ui.sh` is being able to run anything as root, by exactly the argument
+above. But `lib/` is a **sibling** of `helper/`, not an ancestor of the binary, so
+walking the target's parents never reached it: until this was noticed the libraries
+were not checked at all, and a group-writable install tree passed the check that
+exists to catch precisely that. Each caller now names the directory its own program
+sources from — they resolve it differently, so neither a shared guess nor a
+derivation here would be right for both — and every `*.sh` in it is checked
+individually rather than by the directory's mode, because a root-owned `0755`
+directory holding one group-writable file is the case a directory-only check misses.
 
 ### 6E.3 Admin sessions
 
@@ -1070,6 +1183,99 @@ The default arrangement is loopback plus the nginx vhost in
 
 ---
 
+## 6G. Phase 9 as built — a second factor, a settings screen, alerts
+
+Three gaps, closed without widening the eight verbs.
+
+### 6G.1 TOTP gates signing in, and enrolment is a console action
+
+RFC 6238, computed on `node:crypto`, fixed at SHA-1 / 6 digits / 30 seconds — the
+one shape every authenticator actually implements. `require_totp=1` makes it
+policy rather than per-account.
+
+**It gates the session, not each write.** Gating writes would protect the actions
+and leak the intelligence: a session opened on one factor still reads every user
+name, quota, endpoint address and traffic total on the host. And a code demanded
+several times an hour trains the reflex phishing needs.
+
+Three properties carry the rest of it:
+
+- **The panel never writes the administrator file.** Enrolling, clearing and
+  changing a password are all root at the console (`panel/scripts/admin.js`), so
+  a stolen session can neither enrol a factor of its own nor remove the one that
+  is there.
+- **A code is spent once.** The verifier returns the time step it matched and the
+  caller refuses a step already used, so a code observed over a shoulder or
+  relayed through a phishing page is not still valid for the rest of its window.
+  That record is in memory, like the sessions — persisting it would give the
+  HTTP-facing process a write path into the file holding every password hash, on
+  every login, to close a gap a restart already bounds to ninety seconds.
+- **There are no recovery codes, deliberately.** A stack of single-use secrets
+  that skip the factor, on the same host as the hashes, is a bypass. The
+  break-glass path is `admin.js totp --clear <name>` as root, which grants
+  nothing: root can already read the hashes, stop the panel and change every
+  credential the panel could.
+
+A wrong code costs the same against the same `(username, IP)` counter as a wrong
+password. A *missing* code costs nothing — the normal sign-in passes through that
+branch once, and charging it would spend the operator's own lockout budget every
+time they signed in.
+
+### 6G.2 The settings screen writes to the panel's own directory
+
+`/etc/vpn55/panel.conf` stays root-owned, is only ever read, and `vpnctl` gained
+no verb. Changes go to `<state_dir>/settings.json` and are merged over the file
+at load, restricted to an allowlist in `panel/lib/config.js`.
+
+The rule the allowlist is built on: **a key is exposed if the worst an
+authenticated administrator can do with it is make the panel noisier, quieter,
+slower or stricter.** A key stays SSH-only if changing it can reduce
+authentication, change who can reach the process or what it believes about a
+caller, redirect where data goes, move a path the panel reads or writes, or cause
+an irreversible action on somebody's credentials.
+
+So `allow_unauthenticated` and `require_totp` are not there — a screen that can
+switch off the authentication it sits behind is a bypass with a checkbox in front
+of it, and whoever held a stolen session would reach for them first. Neither are
+`trust_proxy`/`portal_trust_proxy` (they decide whether a caller-supplied header
+names the caller, and the lockout is keyed on that), the bind addresses, both
+privileged program paths, `state_dir` (moving it does not move the durable
+traffic totals), `enforce_quota_revoke`/`enforce_expiry_revoke` (one checkbox that
+irreversibly destroys every over-quota user's configuration on the next run), or
+where alerts are sent.
+
+**The overlay wins over the file**, and the screen says so per key and offers a
+control that puts it back — the alternative precedence makes most of the screen
+silently inert, because the shipped example sets nearly every key. An unreadable
+or out-of-range overlay is dropped with a warning and is never fatal: a panel
+refusing to start over the file whose purpose was to save an SSH session would be
+the worst failure that feature could have.
+
+### 6G.3 Alerting sends a type and a count, and nothing else
+
+Five conditions, one webhook, off by default and inert with no URL — this is the
+only outbound connection the panel makes.
+
+**No names are sent.** Not a user's, not an administrator's, not an address. The
+destination is a URL in a settings file that may well be a third-party chat
+service, and it is the least trusted place anything about this host ends up; the
+panel's own audit log has the whole record one SSH session away.
+
+Three layers stop a flapping service from turning the channel into something
+nobody reads: a **transition** is announced rather than a state, a condition must
+be **confirmed** by N agreeing readings in *both* directions, and a **cooldown**
+per condition sits under a global ceiling per hour. A resolve is never held back
+by the cooldown its own firing message started.
+
+⚠ Two operational notes that are easy to get wrong. `alert_webhook_url` accepts
+only `http:`/`https:`, checked at start-up *and* again at send time — a transport
+that would follow `file:` is a file reader with a URL parameter. And an
+`IPAddressDeny=any` added to the unit as generic hardening silently kills
+delivery, because a blocked connect looks exactly like a webhook that did not
+answer.
+
+---
+
 ## 7. What this software cannot promise you
 
 The limits worth stating plainly, because a security document that lists only
@@ -1111,6 +1317,8 @@ strengths is marketing.
 
 | Date | Phase | Change |
 |---|---|---|
+| 2026-08-31 | 9 | **§6G added, and §3 rewritten to match — a second factor, a settings screen, alerts. None of the three widened the eight verbs.** TOTP gates SIGNING IN rather than each write, because a session opened on one factor still reads every user name, quota, endpoint and traffic total on the host, and a code demanded several times an hour trains the reflex phishing needs (§6G.1). Enrolling, clearing and password changes are root at the console, so the panel now READS the administrator file and never writes it; a stolen session can neither enrol a factor of its own nor remove the one that is there. A code is spent once, with the record held in memory rather than persisted — writing it would hand the HTTP-facing process a write path into the file holding every hash, on every login. There are deliberately NO recovery codes: a stack of single-use secrets that skip the factor, stored beside the hashes, is a bypass, and the break-glass path needs root, which grants nothing root did not already have. A wrong code costs the same as a wrong password against the same (username, IP) counter; a MISSING code costs nothing, because the normal sign-in passes through that branch exactly once. §6G.2: the settings screen writes to the panel's own state directory and not to /etc/vpn55/panel.conf, which stays root-owned and read-only, and no verb was added for it. The exposed keys are an allowlist built on one rule — a key is exposed if the worst an authenticated administrator can do with it is make the panel noisier, quieter, slower or stricter — so `allow_unauthenticated`, `require_totp`, `trust_proxy`, the bind addresses, both privileged program paths, `state_dir`, both revoke switches and the alert destination stay SSH-only. The overlay wins over the file, says so per key, and is DROPPED rather than fatal when it is unreadable or out of range. §6G.3: alerting is the panel's only outbound connection, off by default, and sends a condition type and a count — no user name, no administrator name, no address. Three layers against a storm: a transition rather than a state, N confirming readings in BOTH directions, and a per-condition cooldown under an hourly ceiling. Two operational traps recorded: the webhook URL is restricted to http/https at send time as well as at start-up, and an `IPAddressDeny=any` added as generic unit hardening silently kills delivery, because a blocked connect looks exactly like a webhook that did not answer. |
+| 2026-08-30 | 8 | **Review of the privileged path as one system.** §5 corrected: a compromised panel gains all EIGHT verbs, and `cred-config` returns the client private key of ANY user whose credential is still inside its hand-off window — the ownership check is (user, credential) consistency and a compromised panel supplies both halves. The response now says to reissue every credential named in a `cred-config` record, because those are legitimate users' keys, read without a trace anywhere but the helper's log. §3.1 rewritten from one deployment trap to THREE, all sharing one shape — the unit hardens the panel but binds the root process sudo starts, and none of them fails at start-up: `no_new_privs` set implicitly (unchanged), an emptied `CapabilityBoundingSet=` that leaves the helper at euid 0 with zero capabilities (the unit's comment claimed the opposite of how execve works), and `ProtectSystem=strict` with no `ReadWritePaths=`, which makes every write verb fail and silently prevents the root audit log from ever being created. §6E.2: the writability backstop now covers the shell libraries each program SOURCES as root — `lib/` is a sibling of `helper/`, not an ancestor, so walking the target's parents never reached it and a group-writable install tree passed. Seven/eight verb drift fixed in §5, §6E.1 and §6E.2. |
 | 2026-08-30 | 8 | §6F added — the self-serve portal. It is a SECOND EXPRESS APPLICATION on a second socket rather than the admin app with a role check, so an admin route is not registered on the portal's listener at all and no token, session or header can reach one (§6F.1); the cost of the two sharing one process is stated rather than buried, along with what buys it and what would be needed to split them (§6F.2). §3's one-line summary now reads eight verbs, seven of which write: `cred-config` was added deliberately, takes the USER as an argument and lets the register decide ownership — the only verb here that does not trust the panel about who may ask — and it needed no sudoers change because that rule pins the program rather than the arguments (§6F.3). Access codes are 256-bit, shown once, stored only as SHA-256, and carried in a URL fragment so they never reach a server log; withdrawing one ends its sessions at the next request (§6F.4). Rotation issues before it revokes, so a half-failure leaves two working credentials rather than none, and says so (§6F.5). `portal_trust_proxy` is refused unless the bind is loopback (§6F.7). CI runs both acceptance criteria on every push. |
 | 2026-08-30 | 5 | §3.1 added — the READ is privileged too, and is a deliberately separate route from the write helper: two programs, two sudo rules, two modules, so a read-only deployment can install one grant and not the other. The sudoers rule pins the **argument**, because `vpn55.sh` with no argument is the interactive installer and a path-only rule grants that too — the single most consequential line in the deployment. The panel refuses to start if it can write the program it is about to ask root to run, or any directory above it. "Read-only" is qualified honestly: `_status` sweeps each adapter's expired key spool, which is how §6.1's hand-off window is enforced. One deployment trap recorded: a dozen common systemd hardening options force `NoNewPrivileges=yes`, which breaks setuid sudo and reports itself as a filesystem problem. §3 and §4 corrected — the privileged surface was described as one program, and the bind claim now matches what `deploy/` installs (nginx on the tunnel address, panel on loopback). |
 | 2026-08-27 | 0 | Written before any implementation. Privileged-helper model DECIDED (§3). WireGuard key custody and DNS resolver left OPEN (§6). |

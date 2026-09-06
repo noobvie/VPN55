@@ -120,6 +120,19 @@ VPN55_WG_SLOT=0
 : "${VPN55_WG_PORT:=51820}"
 : "${VPN55_WG_KEEPALIVE:=25}"
 
+# How recent a handshake has to be for `_status` to call the credential
+# CONNECTED, in seconds. This protocol has no connections to count, so liveness
+# has to be inferred from the one thing the kernel does timestamp.
+#
+# 180 is the protocol's own number, not a guess: a session is rejected once it is
+# REJECT_AFTER_TIME (180s) old, and a peer with traffic re-handshakes at
+# REKEY_AFTER_TIME (120s). Every config this adapter issues sets
+# PersistentKeepalive, and a keepalive is a data packet, so a peer that is
+# genuinely up keeps its handshake inside that window. Older than 180s means no
+# live session — the tunnel will come back on the next packet, but it is not
+# carrying one now, which is exactly what the field claims.
+: "${VPN55_WG_LIVE_WINDOW:=180}"
+
 # How long a server-generated private key stays retrievable after issue, in
 # hours. Long enough for a real hand-off — issue in the panel now, scan on the
 # user's phone this evening — and short enough that the box is not a permanent
@@ -418,6 +431,12 @@ _wg_install_packages() {
 
     local -a want=() missing=()
     mapfile -t want < <(_wg_packages) || return 1
+    # mapfile succeeds even when the process substitution inside it failed, so
+    # the emptiness is what has to be tested. Without this the loop below is
+    # skipped, nothing is installed, and the failure surfaces two calls later as
+    # "'wg' is still missing after installing packages" — which points at the
+    # wrong thing entirely. Same guard, same reason, as _ovpn_install_packages.
+    [[ ${#want[@]} -gt 0 ]] || { error "no package set for this host"; return 1; }
 
     local pkg
     for pkg in "${want[@]}"; do
@@ -432,7 +451,19 @@ _wg_install_packages() {
     else
         info "Installing: ${missing[*]}"
         distro_pkg_refresh || warn "package index refresh failed — continuing with the cached one"
-        distro_pkg_install "${missing[@]}" || return 1
+        if ! distro_pkg_install "${missing[@]}"; then
+            # The same hint the other two adapters give, and it was missing here
+            # for the packages that need it MOST: on Rocky, AlmaLinux and Oracle
+            # 9 both wireguard-tools and qrencode live in EPEL, not in the base
+            # repositories. Two of the eight rows in the README's matrix are
+            # Rocky and Alma, so this is the failure a first tester meets.
+            if [[ "$VPN55_OS_FAMILY" == "rhel" ]]; then
+                error "wireguard-tools and qrencode are not in the base repositories on"
+                error "this distribution. They live in EPEL. Enable it and re-run:"
+                error "  dnf install -y epel-release"
+            fi
+            return 1
+        fi
     fi
 
     # On EL 8 the module ships out of tree. Best effort only: EL 9 and every
@@ -538,10 +569,17 @@ _awg_validate() {
     # H1..H4 replace the type bytes. 1-4 are WireGuard's own values, so anything
     # in that range is "no obfuscation" for that message type, and duplicates
     # make two message types indistinguishable to the peer.
+    #
+    # The ceiling is 2^32-1 because that is what the field IS upstream: a
+    # uint32. An earlier 2^31-1 came from a worry about bash arithmetic that
+    # does not apply here (bash integers are 64-bit signed), and it rejected
+    # values AmneziaWG accepts. It could only ever bite a HAND-EDITED conf --
+    # which this function re-checks on every install run -- and it told the
+    # operator the value was out of range, which was not true.
     local h
     for h in "$h1" "$h2" "$h3" "$h4"; do
-        (( h >= 5 && h <= 2147483647 )) \
-            || { error "H1-H4 must be 5-2147483647; 1-4 are WireGuard's own type bytes. Got ${h}."; return 1; }
+        (( h >= 5 && h <= 4294967295 )) \
+            || { error "H1-H4 must be 5-4294967295; 1-4 are WireGuard's own type bytes. Got ${h}."; return 1; }
     done
     if [[ "$h1" == "$h2" || "$h1" == "$h3" || "$h1" == "$h4" \
        || "$h2" == "$h3" || "$h2" == "$h4" || "$h3" == "$h4" ]]; then
@@ -580,10 +618,24 @@ _awg_generate() {
     # Four distinct type bytes. The space is 2^31 wide, so a collision is a
     # formality — but an un-checked formality is how two message types end up
     # sharing a byte and the peer silently drops half the handshake.
+    #
+    # The try counter is not decoration. This loop exits when _awg_rand
+    # FAILS, but not when it succeeds and returns the same value every time
+    # -- and that is a real state, not a hypothetical: a randomness source
+    # that has gone constant passes every check here and spins this loop
+    # forever, silently, in the middle of an install, with no output and
+    # nothing to time out. The S2 redraw above is bounded for exactly this
+    # reason; this one was not.
     local -a htypes=()
-    local cand dup existing
+    local cand dup existing tries=0
     while (( ${#htypes[@]} < 4 )); do
-        cand="$(_awg_rand 5 2147483647)" || return 1
+        (( tries += 1 ))
+        if (( tries > 64 )); then
+            error "could not draw four distinct H values in 64 attempts --"
+            error "the randomness source is returning repeats, which it must never do."
+            return 1
+        fi
+        cand="$(_awg_rand 5 4294967295)" || return 1
         dup=0
         for existing in ${htypes[@]+"${htypes[@]}"}; do
             [[ "$cand" == "$existing" ]] && dup=1
@@ -1435,11 +1487,12 @@ vpn_wireguard_cred_add() {
     # the server-custody path. On the client path there is no private key to
     # hold and the same file is simply written without one.
     #
-    # The comment header is NOT spooled. It is prose addressed to the person who
-    # will read this file, so it is rendered in their language at the moment it
-    # is handed over — which is the only moment anyone knows what that language
-    # is. Spooling it would freeze one translation into a file that lives for
-    # hours and is then fetched by somebody else.
+    # Only the tunnel is spooled. The prose that explains it is a separate
+    # artifact, rendered in the reader's language at the moment of handover —
+    # the only moment anyone knows what that language is. Spooling it would
+    # freeze one translation into a file that lives for hours and is then
+    # fetched by somebody else, and would put text of an unmeasurable length
+    # inside the one artifact this adapter offers as a QR code.
     local spool
     spool="$(_wg_spool_path "$cred")"
     _wg_build_client_body "$ip" "$psk" "$spub" "$custody" "$cpriv" \
@@ -1524,42 +1577,61 @@ vpn_wireguard_cred_list() {
     return 0
 }
 
-# ─── Client config ────────────────────────────────────────────────────────────
+# ─── Client artifacts ─────────────────────────────────────────────────────────
 #
-# The file is built in two halves, and the split is an i18n decision rather than
-# a tidiness one.
+# Two artifacts, and the split is the same one the other adapters make:
 #
-#   _wg_build_client_header  prose, addressed to the person who will read it.
-#                            Translated. Rendered at the moment of handover,
-#                            because that is the only moment anyone knows which
-#                            language to render it in.
-#   _wg_build_client_body    the tunnel itself. Not prose, not translated, and
-#                            byte-for-byte what the client parser consumes.
+#   conf          the tunnel. Bytes for a parser, not prose, not translated, and
+#                 byte-for-byte what a client imports.
+#   instructions  prose, addressed to the person who will read it. Translated,
+#                 and rendered at the moment of handover — the only moment
+#                 anyone knows which language to render it in.
 #
-# Only the body is spooled. Freezing one language into a file that lives for
-# hours and is then fetched by somebody else would make the credential's
-# language a property of who ISSUED it.
+# The prose used to be a comment header inside `conf`, which was wrong twice.
+#
+# It made the SCANNABLE artifact carry text whose length is a property of the
+# locale, so the adapter was promising `qr 1` about a payload it could not
+# measure: the tunnel is 454 bytes, and the same file with a Vietnamese header
+# and this protocol's obfuscation parameters is 1495 — a version-32 code, 153
+# terminal columns wide, that no camera resolves and that looks like it should
+# have worked. Now the code carries the tunnel alone and nothing else.
+#
+# And it put a translated paragraph inside a file a parser reads. The comment
+# syntax made that safe here; it would not be in another format, and it is not
+# where a reader looks for it.
+#
+# `instructions` needs no spool of its own. Every fact it renders — the address,
+# the endpoint, who it was issued to — is in the server config and is not
+# secret, so unlike the other two adapters this one can still produce the page
+# long after the key is gone. That is worth having: it is the page that explains
+# what to do about a key that is gone.
 
-# _wg_build_client_header <cred> <user> <custody> [locale]
-_wg_build_client_header() {
-    local cred="${1:-}" user="${2:-}" custody="${3:-server}" locale="${4:-}"
+# _wg_build_instructions <cred> [locale]
+_wg_build_instructions() {
+    local cred="${1:-}" locale="${2:-}"
     local tag="$VPN55_WG_TAG"
+    local user ip custody endpoint port dns
 
-    i18n_render_comments '# ' "$tag" "$locale" header \
-        "cred=${cred}" "user=${user}" || return 1
-    printf '#\n'
+    user="$(_wg_peer_field "$cred" 2)"
+    ip="$(_wg_peer_field "$cred" 4)"
+    custody="$(_wg_peer_field "$cred" 6)"
+    endpoint="$(_wg_endpoint)"; port="$(_wg_port)"
+    dns="$(_wg_dns)"
+    [[ -n "$dns" ]] || dns="—"
 
-    if [[ "$custody" == "client" ]]; then
-        i18n_render_comments '# ' "$tag" "$locale" custody.client || return 1
+    i18n_render "$tag" "$locale" main \
+        "cred=${cred}" "user=${user}" "ip=${ip%%/*}" \
+        "endpoint=${endpoint}" "port=${port}" "dns=${dns//,/, }" || return 1
+
+    if [[ "${custody:-server}" == "client" ]]; then
+        i18n_render "$tag" "$locale" custody.client || return 1
     else
-        i18n_render_comments '# ' "$tag" "$locale" custody.server \
+        i18n_render "$tag" "$locale" custody.server \
             "ttl_hours=${VPN55_WG_KEY_TTL_HOURS}" || return 1
     fi
 
-    i18n_render_comments '# ' "$tag" "$locale" routing || return 1
-
     if _wg_is_awg; then
-        i18n_render_comments '# ' "$tag" "$locale" transport.awg || return 1
+        i18n_render "$tag" "$locale" transport.awg || return 1
     fi
     return 0
 }
@@ -1570,9 +1642,12 @@ _wg_build_client_header() {
 # of them. They belonged to the header, and the header is now elsewhere.
 _wg_build_client_body() {
     local ip="${1:-}" psk="${2:-}" spub="${3:-}"
-    local custody="${4:-server}" cpriv="${5:-}"
+    local custody="${4:-server}" cpriv="${5:-}" want_endpoint="${6:-}"
     local endpoint port dns keepalive mtu
-    endpoint="$(_wg_endpoint)"; port="$(_wg_port)"; dns="$(_wg_dns)"
+    # The endpoint is overridable because this protocol cannot put more than one
+    # in a file — see the note on the artifact list. Blank means this server's
+    # own, which is every call but the alternate-endpoint one.
+    endpoint="${want_endpoint:-$(_wg_endpoint)}"; port="$(_wg_port)"; dns="$(_wg_dns)"
     keepalive="$(_wg_keepalive)"; mtu="$(_wg_mtu)"
 
     printf '[Interface]\n'
@@ -1611,16 +1686,12 @@ _wg_build_client_body() {
 
 # vpn_wireguard_artifacts <cred_id> — one record per line:
 #
-#   artifact  <id>  <label>  <filename>  <encoding>  <qr>  <note>
-#
-# This adapter has exactly one artifact, which is why the contract got away with
-# assuming a single unnamed config until a protocol with four turned up. It is
-# text and it is small enough to scan, so it is the only artifact in the project
-# that sets qr to 1.
+#   artifact  <id>  <label>  <filename>  <encoding>  <qr 0|1>  <note>
 #
 # The qr flag is not "is this a string" — it is "will a camera actually resolve
-# this". Getting that wrong is worse than omitting the code, because a QR that
-# imports a broken tunnel looks like it worked.
+# this". It is set on the tunnel and never on the prose, and the tunnel is the
+# one artifact in this project small enough to earn it: ~450 bytes, a version-16
+# code, which a phone reads off a terminal without complaint.
 vpn_wireguard_artifacts() {
     local cred="${1:-}"
     [[ -n "$cred" ]] || { error "vpn_wireguard_artifacts <cred_id>"; return 1; }
@@ -1630,7 +1701,7 @@ vpn_wireguard_artifacts() {
     local note qr
     if _wg_spool_held "$cred"; then
         qr=1
-        note="Complete and ready to import. Scan it with the WireGuard app or save it as a .conf file."
+        note="Complete and ready to import. Scan it with the client app or save it as a .conf file."
     else
         # Past the TTL the private key is gone, so the config still describes the
         # tunnel but cannot connect until the holder fills their key in. A QR of
@@ -1640,57 +1711,139 @@ vpn_wireguard_artifacts() {
         note="The private key has been erased, so this needs the holder's own key filled in before it will connect."
     fi
 
-    printf 'artifact\tconf\tWireGuard tunnel configuration\tvpn55-%s.conf\ttext\t%s\t%s\n' \
+    printf 'artifact\tconf\tTunnel configuration\tvpn55-%s.conf\ttext\t%s\t%s\n' \
         "$cred" "$qr" "$note"
+
+    # ── One file per additional endpoint ────────────────────────────────────
+    #
+    # This is the protocol where docs/circumvention.md §4 has no clean answer,
+    # and it is worth being exact about why rather than shipping something that
+    # looks like failover.
+    #
+    # A WireGuard peer has ONE Endpoint. There is no list, no ordering and no
+    # rotation in the format or in any mainstream client — so a blocked address
+    # cannot be stepped past the way OpenVPN steps past one. The two ways out:
+    #
+    #   a) point Endpoint at a name with several A records. Rejected. §1 names
+    #      resolver-level DNS poisoning as the most common filtering method on
+    #      the network this project is for, so putting endpoint resolution
+    #      behind DNS re-opens the exact hole §3 closes. It would look like the
+    #      tidier answer and be the worse one.
+    #   b) hand over one file per endpoint and let the person switch tunnels in
+    #      their app. Manual, and honest about being manual.
+    #
+    # (b), then. Each alternate is this credential's own config with a different
+    # Endpoint — same keys, same address, same obfuscation parameters — so the
+    # user picks a tunnel in the app rather than editing anything.
+    #
+    # No QR on the alternates even when the key is still held. A person scanning
+    # several near-identical codes cannot tell afterwards which one they
+    # imported, and two tunnels differing only in a field neither the app nor
+    # the code shows is a support problem, not a convenience.
+    local extra n=1
+    while IFS= read -r extra; do
+        [[ -n "$extra" ]] || continue
+        n=$(( n + 1 ))
+        printf 'artifact\tconf%s\tTunnel configuration — %s\tvpn55-%s-%s.conf\ttext\t0\t%s\n' \
+            "$n" "$extra" "$cred" "$n" \
+            "The same tunnel reached at ${extra}. Import it alongside the first and switch to it if the first stops connecting — this protocol cannot change over on its own."
+    done < <(net_endpoints_extra)
+
+    printf 'artifact\tinstructions\tSetup instructions\tvpn55-%s.txt\ttext\t0\t%s\n' \
+        "$cred" "Which app to install on each platform, what to do with the configuration, and who holds the key."
     return 0
 }
 
-# vpn_wireguard_client_config <cred_id> [artifact] [locale] — config on stdout.
+# vpn_wireguard_client_config <cred_id> [artifact] [locale] — one artifact on stdout.
 #
-# While the spool entry lives, this is the complete file. After the TTL it is the
-# same file with the private key replaced by a placeholder and a
-# `# vpn55: private-key-not-held` marker, so the panel can tell the two apart
+# `conf` while the spool entry lives is the complete file. After the TTL it is
+# the same file with the private key replaced by a placeholder and a
+# `# vpn55: private-key-not-held` marker, so a reader can tell the two apart
 # without parsing prose. It stays exit 0 in both cases: a config the user can
 # complete themselves is a useful answer, not an error.
 #
 # The locale is the third positional argument on every adapter, and it reaches
 # here from a caller that does not know which protocol it is talking to — a
 # language tag is not protocol vocabulary. An unknown or absent tag renders in
-# the default locale rather than failing; somebody still needs the file.
+# the default locale rather than failing; somebody still needs the file. It is
+# ignored by `conf`, which is bytes for a parser.
 vpn_wireguard_client_config() {
-    local cred="${1:-}" want="${2:-conf}" locale="${3:-}"
+    local cred="${1:-}" want="${2:-}" locale="${3:-}"
     [[ -n "$cred" ]] || { error "vpn_wireguard_client_config <cred_id> [artifact] [locale]"; return 1; }
     _wg_installed || { error "$(_wg_label) is not installed on this host."; return 1; }
-
-    # There is only one, but naming a different one has to fail loudly rather
-    # than quietly return this one — a caller that asked for something else has
-    # a bug, and handing it a WireGuard config would hide that.
-    if [[ -n "$want" && "$want" != "conf" ]]; then
-        error "'${want}' is not an artifact this protocol produces."
-        error "Ask it what it has with the 'artifacts' verb."
-        return 1
-    fi
 
     _wg_spool_sweep || true
     _wg_peer_exists "$cred" || { error "No credential '${cred}' on this server."; return 1; }
 
-    local user ip custody psk spub
-    user="$(_wg_peer_field "$cred" 2)"
-    custody="$(_wg_peer_field "$cred" 6)"
+    [[ -n "$want" ]] || want="conf"
 
-    # The header goes out in front of BOTH paths below, and is built here rather
-    # than inside either of them so that the spooled and the rebuilt config
-    # cannot end up carrying different prose.
-    _wg_build_client_header "$cred" "$user" "${custody:-server}" "$locale" || return 1
+    # `conf` is this server's own endpoint. `conf2`, `conf3`, … are the same
+    # tunnel at each additional endpoint, in the order they were registered —
+    # index 1 IS `conf`, which is why the numbering starts at 2 and why an
+    # explicit `conf1` is not accepted: two spellings of one artifact is how a
+    # caller ends up handing out two files it believes are different.
+    local want_endpoint="" idx=0
+    case "$want" in
+        conf|instructions) ;;
+        conf[0-9]|conf[0-9][0-9])
+            idx="${want#conf}"
+            (( idx >= 2 )) || {
+                error "'${want}' is not an artifact this protocol produces — the first endpoint is 'conf'."
+                return 1
+            }
+            want_endpoint="$(net_endpoints_extra | sed -n "$(( idx - 1 ))p")"
+            [[ -n "$want_endpoint" ]] || {
+                error "There is no endpoint ${idx} on this server."
+                error "Ask it what it has with the 'artifacts' verb."
+                return 1
+            } ;;
+        *)
+            error "'${want}' is not an artifact this protocol produces."
+            error "Ask it what it has with the 'artifacts' verb."
+            return 1 ;;
+    esac
+
+    if [[ "$want" == "instructions" ]]; then
+        _wg_build_instructions "$cred" "$locale" \
+            || { error "cannot build the setup instructions for '${cred}'"; return 1; }
+        return 0
+    fi
 
     local spool
     spool="$(_wg_spool_path "$cred")"
     if [[ -s "$spool" ]]; then
-        printf '\n'
-        cat "$spool" || { error "cannot read the spooled config for '${cred}'"; return 1; }
+        if [[ -z "$want_endpoint" ]]; then
+            cat "$spool" || { error "cannot read the spooled config for '${cred}'"; return 1; }
+            return 0
+        fi
+        # The alternate is the spooled file with one field changed. It is
+        # rewritten rather than re-rendered because the spool is the ONLY place
+        # this credential's private key still exists — re-rendering would
+        # produce a correct-looking config that cannot connect, which is the
+        # failure this protocol gives no error for.
+        #
+        # The Endpoint line is anchored and the replacement is written with awk
+        # rather than sed: an endpoint is an operator-supplied string and `&`,
+        # `\1` and the delimiter all mean something to sed's replacement.
+        awk -v ep="$want_endpoint" '
+            /^[[:space:]]*Endpoint[[:space:]]*=/ {
+                # The port is whatever the file already carries, taken from
+                # after the LAST colon. An endpoint host is IPv4 or a name
+                # (net_endpoint_valid refuses a literal with a colon in it), so
+                # the last colon is always the port separator.
+                p = $0; sub(/^.*:/, "", p)
+                printf "Endpoint     = %s:%s\n", ep, p
+                found = 1
+                next
+            }
+            { print }
+            END { if (!found) exit 3 }
+        ' "$spool" || { error "the spooled config for '${cred}' has no endpoint to replace"; return 1; }
         return 0
     fi
 
+    local ip custody psk spub
+    custody="$(_wg_peer_field "$cred" 6)"
     ip="$(_wg_peer_field "$cred" 4)"
     spub="$(_wg_server_pubkey)" || return 1
 
@@ -1705,8 +1858,7 @@ vpn_wireguard_client_config() {
         warn "If the user no longer has it, revoke this credential and issue a new one."
     fi
 
-    printf '\n'
-    _wg_build_client_body "$ip" "$psk" "$spub" "${custody:-server}" ""
+    _wg_build_client_body "$ip" "$psk" "$spub" "${custody:-server}" "" "$want_endpoint"
     return 0
 }
 
@@ -1716,7 +1868,7 @@ vpn_wireguard_client_config() {
 # panel can concatenate every adapter's output into one stream.
 #
 #   service  <tag>  <state>  <enabled>  <listen>  <since>  <cred_count>
-#   cred     <tag>  <cred_id>  <user>  <state>  <address>  <rx>  <tx>  <handshake>  <endpoint>
+#   cred     <tag>  <cred_id>  <user>  <state>  <address>  <rx>  <tx>  <handshake>  <endpoint>  <connected>
 #   note     <tag>  <severity>  <message>
 #
 #   state      absent | stopped | running   (closed vocabulary, all protocols)
@@ -1728,18 +1880,26 @@ vpn_wireguard_client_config() {
 #              Every protocol resets these; the collector accumulates. `-` means
 #              "no reading", which is not the same as 0 and must not be treated
 #              as a counter reset.
-#   handshake  unix epoch of the last proof this credential was live.
+#   handshake  unix epoch of the last moment this credential was OBSERVED live.
 #              0 = never, as a FACT.  - = no reading.
-#              This adapter can tell those apart — the kernel answers 0 for a
-#              peer that has never completed a handshake — so it never emits -.
-#              An adapter whose daemon keeps no history must emit - rather than
-#              claiming a 0 it cannot support.
+#              The kernel answers 0 for a peer with no handshake since the
+#              INTERFACE came up, which is not the same claim: after every
+#              restart that is every peer on the box. So a 0 from the kernel is
+#              only passed on as 0 when the peer was added after the interface
+#              started and there is therefore nothing it could have forgotten.
+#              Otherwise it becomes -, and a stopped interface is all -.
 #              Always an absolute time, never a formatted age: only the panel
 #              knows the viewer's locale.
-#   endpoint   the peer's current remote address, or -. LIVE state only. It is
-#              not retained anywhere and the collector must not persist it —
-#              docs/security-model.md §2 says VPN55 keeps no per-user connection
-#              IP history.
+#   endpoint   the remote address of the CURRENT session, or -. `wg show dump`
+#              keeps the last known address for the life of the interface, so it
+#              is emitted only alongside connected=1; otherwise it would report
+#              a device that last connected in March. LIVE state only, never
+#              retained — docs/security-model.md §2 says VPN55 keeps no per-user
+#              connection IP history.
+#   connected  1 | 0 | -. This protocol has no connections to count, so it is
+#              answered from the handshake being inside the session window the
+#              protocol itself defines (VPN55_WG_LIVE_WINDOW). - while the
+#              interface is down, because then nothing here knows.
 #   note       severity is info | warn | crit. This record exists so an adapter
 #              can surface something specific — a degraded mode, an expiring
 #              credential store — without the panel learning what it means.
@@ -1795,18 +1955,67 @@ vpn_wireguard_status() {
 
     [[ -n "$peers" ]] || return 0
 
+    local now
+    now="$(fs_now_epoch)"
+
     local cred user pub ip created _custody cstate row
+    local raw_hs shake conn endpoint born
     while IFS=$'\t' read -r cred user pub ip created _custody; do
         [[ -n "$cred" ]] || continue
         cstate="unregistered"
         if row="$(users_cred_find "$cred" 2>/dev/null)"; then
             cstate="${row##*$'\t'}"
         fi
-        printf 'cred\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+
+        # ── handshake ─────────────────────────────────────────────────────────
+        # The kernel's `latest-handshake` is 0 for a peer that has not handshaked
+        # SINCE THIS INTERFACE CAME UP — which is every peer after a reboot or a
+        # restart. Passing that straight through as the contract's `0` would
+        # assert "never used" about a fleet that connected an hour ago, and a
+        # reader that persists "last seen" would overwrite the real date with it.
+        #
+        # So 0 is reported as 0 only where this adapter can PROVE it: the peer was
+        # added AFTER the interface came up, so there has been no moment at which
+        # it could have handshaked and been forgotten. Otherwise the honest answer
+        # is "no reading" — which is also all a stopped interface can say.
+        raw_hs="${hs[$pub]:-}"
+        shake='-'
+        if [[ "$state" == "running" && "$raw_hs" =~ ^[0-9]+$ ]]; then
+            if [[ "$raw_hs" -gt 0 ]]; then
+                shake="$raw_hs"
+            elif [[ "$since" =~ ^[0-9]+$ ]]; then
+                born="$(date -d "$created" +%s 2>/dev/null || true)"
+                if [[ "$born" =~ ^[0-9]+$ ]] && [[ "$born" -gt "$since" ]]; then
+                    shake=0
+                fi
+            fi
+        fi
+
+        # ── connected, and the endpoint that goes with it ─────────────────────
+        # This protocol has no connections to count, so liveness is the handshake
+        # being inside the protocol's own session window.
+        #
+        # The endpoint is gated on that answer rather than reported raw. `wg show
+        # dump` keeps the LAST KNOWN source address for the life of the interface,
+        # so a device that connected once in March still carries one — and the
+        # contract says this field is the address of the CURRENT session.
+        conn='-'
+        endpoint='-'
+        if [[ "$state" == "running" ]]; then
+            conn=0
+            if [[ "$shake" =~ ^[0-9]+$ ]] && [[ "$shake" -gt 0 ]] \
+               && [[ $(( now - shake )) -le "$VPN55_WG_LIVE_WINDOW" ]]; then
+                conn=1
+                if [[ -n "${ep[$pub]:-}" && "${ep[$pub]}" != "(none)" ]]; then
+                    endpoint="${ep[$pub]}"
+                fi
+            fi
+        fi
+
+        printf 'cred\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
             "$tag" "$cred" "$user" "$cstate" "${ip%%/*}" \
             "${rx[$pub]:--}" "${tx[$pub]:--}" \
-            "${hs[$pub]:-0}" \
-            "$( [[ -n "${ep[$pub]:-}" && "${ep[$pub]}" != "(none)" ]] && printf '%s' "${ep[$pub]}" || printf -- '-' )"
+            "$shake" "$endpoint" "$conn"
     done <<< "$peers"
     return 0
 }
@@ -1815,6 +2024,17 @@ vpn_wireguard_status() {
 # The panel prints these without knowing what any of them mean.
 _wg_notes() {
     local tag="$VPN55_WG_TAG" impl held
+
+    # The endpoint list, said once per service so the panel is coherent about
+    # it. This protocol cannot fail over on its own, so what an operator has
+    # to know is not that alternates exist but that handing them over is a
+    # manual step they have to take.
+    local _extra
+    _extra="$(net_endpoints_count)"
+    if [[ "$_extra" != "0" ]]; then
+        printf 'note	%s	info	%s
+' "$tag" \n            "Credentials issued from now on come with ${_extra} extra configuration file(s), one per additional address. This protocol has no way to change address on its own, so hand them over together and tell the user to switch tunnels in the app if the first stops connecting."
+    fi
 
     # Which transport mode is running, and what it costs. The stock mode is the
     # one that needs saying: it works perfectly and it is the single easiest
@@ -1842,6 +2062,36 @@ _wg_notes() {
     if [[ "${held:-0}" -gt 0 ]]; then
         printf 'note\t%s\tinfo\t%s\n' "$tag" \
             "${held} client configuration(s) are still retrievable, which means this server is still holding those private keys. Each is erased ${VPN55_WG_KEY_TTL_HOURS}h after it was issued."
+    fi
+    return 0
+}
+
+# ─── What must survive this host ──────────────────────────────────────────────
+# The backup contract: one absolute path per line, on stdout. core_backup.sh
+# names no protocol, so this is the only place that knows WireGuard keeps
+# anything outside /etc/vpn55.
+#
+# ⚠ /etc/wireguard/*.conf IS THE AUTHORITY for this protocol. WireGuard has no
+# CA — the server's private key sits in that file beside every peer's public
+# key, so those two facts together ARE the identity of this tunnel. A new key
+# means every configuration ever handed out stops working, with no way to
+# reissue against the old one. It is the WireGuard equivalent of losing the CA,
+# and unlike the CA there is not even a revocation story to fall back on.
+#
+# ⚠ The spool is NOT here and must never be. It holds client configurations
+# waiting to be collected, private key and all, and they are erased on purpose
+# some hours after issue. An archive that preserved them would outlive that
+# erasure by years — and core_backup refuses any path under a spool anyway,
+# which is a guard against this function, not a reason to relax it.
+vpn_wireguard_backup_paths() {
+    local p
+
+    [[ -f "$VPN55_WG_CONF" ]] && printf '%s\n' "$VPN55_WG_CONF"
+
+    if [[ -d "$VPN55_WG_ETC" ]]; then
+        for p in "$VPN55_WG_ETC"/*.conf; do
+            [[ -f "$p" ]] && printf '%s\n' "$p"
+        done
     fi
     return 0
 }

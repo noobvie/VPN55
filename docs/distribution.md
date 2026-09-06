@@ -171,7 +171,7 @@ sha256sum vpn55.sh vpn55-*.tar.gz > SHA256SUMS
 minisign -Sm SHA256SUMS -s vpn55.key
 
 # Sign the git tag too — this is what proves the commit, not just the tarball.
-git tag -s v1.0.0 -m 'VPN55 v1.0.0'
+git tag -s v2026.09.09 -m 'VPN55 v2026.09.09'
 ```
 
 ### What the user runs — document this in Vietnamese

@@ -20,6 +20,8 @@ screen_doctor() {
     ui_rule
     pki_report || true
     ui_rule
+    bak_report || true
+    ui_rule
     ui_kv "Registered users" "$(users_count)"
     ui_kv "Protocol adapters" "${#VPN55_ADAPTER_TAGS[@]} loaded"
     ui_kv "VPN55 state" "$VPN55_ETC"
@@ -187,6 +189,22 @@ screen_uninstall() {
     net_forwarding_disable || warn "could not remove the forwarding sysctl file"
     success "VPN55 network state removed."
 
+    # The program itself is not removed here, and saying so is the point. This
+    # screen is named "network state" and means it — but an operator who has
+    # just run the most destructive option on the menu reasonably assumes VPN55
+    # is gone, and nothing anywhere else tells them the tree is still on disk.
+    # There is deliberately no verb for it: a script deleting the directory it
+    # is executing from has to survive its own libraries vanishing mid-run, and
+    # two `rm` lines an operator can read are a better trade than that.
+    if [[ "$VPN55_ROOT" != "$PWD" ]] && [[ -f "$VPN55_ROOT/vpn55.sh" ]]; then
+        info ""
+        info "VPN55 itself is still installed at ${VPN55_ROOT}, and it stays there —"
+        info "this screen removes network state, not the program. To remove that too,"
+        info "after you are finished with this menu:"
+        info "    rm -rf ${VPN55_ROOT}"
+        info "    rm -f  /etc/sudoers.d/vpn55-panel"
+    fi
+
     # The certificate authority outlives any single service on purpose: more
     # than one protocol can be built on it, so removing one must not invalidate
     # the other's credentials. That means nothing else ever deletes it, and this
@@ -202,7 +220,18 @@ screen_uninstall() {
         fi
         warn "Nothing is using it any more. Destroying it is PERMANENT: every"
         warn "certificate it ever signed becomes worthless, including any already"
-        warn "handed out, and there is no backup and no way to reissue them."
+        warn "handed out, and nothing on this host can reissue them."
+        # The claim here used to be "there is no backup", which was true and is
+        # no longer. It is replaced rather than deleted: an operator standing in
+        # front of this prompt is one keystroke from the irreversible thing, and
+        # "you can take one first" is the most useful sentence available.
+        if [[ -n "$(bak_list 2>/dev/null)" ]]; then
+            info "Backups exist on this host — 'vpn55.sh --backup-list' shows them."
+            info "A restore from one brings this authority back."
+        else
+            warn "There is NO backup of it on this host. 'vpn55.sh --backup' takes"
+            warn "one now, and takes about a second."
+        fi
         if ask_proceed "Destroy the certificate authority as well"; then
             pki_destroy || warn "the certificate authority could not be removed"
         else
@@ -238,7 +267,21 @@ screen_update() {
     src_update "$VPN55_ROOT" || rc=$?
     case "$rc" in
         0)  return 0 ;;
-        10) src_relaunch "$VPN55_ROOT" ;;   # never returns
+        10)
+            # src_relaunch execs and never returns — unless it refuses, which it
+            # does when the new vpn55.sh is not executable. Returning there would
+            # drop the operator back into a menu whose in-memory code is the OLD
+            # tree while the NEW one is on disk: precisely the state return code
+            # 10 exists to prevent, arriving by the back door. The menu's arm is
+            # `screen_update || true`, so a `return 1` here is swallowed and the
+            # next thing they pick writes firewall rules with the old code.
+            #
+            # So this exits the process instead. The message src_relaunch printed
+            # says how to start the new copy by hand.
+            src_relaunch "$VPN55_ROOT"
+            error "VPN55 has been updated but this process is still the old code."
+            error "It will not continue. Start the new copy with the command above."
+            exit 1 ;;
         *)  return 1 ;;
     esac
 }

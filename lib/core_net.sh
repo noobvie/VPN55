@@ -22,6 +22,18 @@
 # duplicate row and the nftables backend is asked before it is told; ufw and
 # firewalld already skip a rule they hold.
 #
+# That last sentence is also the trap. A backend that silently skips a rule it
+# already has cannot tell VPN55 whether the rule was VPN55's — so every verb
+# asks BEFORE it applies and records the answer as the ledger's fifth field,
+# and an uninstall removes only what the ledger says this install added. See
+# "Was it already there?" below.
+#
+# And a rule that has been applied is not yet a rule that is live: firewalld's
+# --permanent writes touch nothing running, ufw's NAT block is a file read at
+# reload, and an nftables ruleset is gone at the next boot unless it is written
+# out. Every verb therefore ends in net_fw_commit, which is free when the verb
+# changed nothing.
+#
 # ── The pool rule ─────────────────────────────────────────────────────────────
 # One parent /16, partitioned into /24 slots, so NAT and routing stay a single
 # rule set. Three independent allocators over one range is a routing bug that
@@ -51,6 +63,13 @@ VPN55_NET_LOADED=1
 
 VPN55_FW_BACKEND="${VPN55_FW_BACKEND:-}"   # ufw | firewalld | nftables
 
+# Set by any rule verb that actually executed an add, cleared by net_fw_commit.
+# ufw applies a rule as it takes it, but its NAT block is a file that only
+# reaches the kernel on reload; firewalld's --permanent writes touch nothing
+# running at all; nftables needs its tables written out or they are gone at the
+# next boot. So "did anything change" is tracked here rather than assumed.
+VPN55_FW_DIRTY=0
+
 # ─── State plumbing ───────────────────────────────────────────────────────────
 _net_ensure_state_dir() {
     if [[ ! -d "$VPN55_ETC" ]]; then
@@ -62,6 +81,40 @@ _net_ensure_state_dir() {
         chmod 0700 "$VPN55_LEASE_DIR" || { error "cannot set mode on $VPN55_LEASE_DIR"; return 1; }
     fi
     return 0
+}
+
+# Serialise the writers that hand out addresses.
+#
+# ⚠ The panel reaches the allocator through vpnctl and an operator reaches it
+# through vpn55.sh; the two land at the same moment as soon as there is more
+# than one person. Without this, two concurrent cred-adds both read the lease
+# file, both pick the same free address and both append it — which is precisely
+# the duplicate-address failure the allocator's own comments say it exists to
+# prevent. core_users.sh solved the identical problem first; this is the same
+# shape, kept local rather than shared for the load-order reason set out there.
+#
+# flock absent (a very small image) degrades to running unserialised rather than
+# refusing to run at all — the same call this project makes for the registry.
+_net_locked() {
+    local lock="$VPN55_ETC/.pool.lock" rc=0
+    _net_ensure_state_dir || return 1
+
+    if ! command -v flock >/dev/null 2>&1; then
+        "$@"
+        return $?
+    fi
+
+    local fd
+    exec {fd}>"$lock" || { error "cannot open the pool lock"; return 1; }
+    if ! flock -w 10 "$fd"; then
+        error "timed out waiting for the address pool lock"
+        exec {fd}>&-
+        return 1
+    fi
+    "$@"
+    rc=$?
+    exec {fd}>&-
+    return $rc
 }
 
 # Replace a file atomically. Content arrives on stdin. A half-written pool table
@@ -133,7 +186,12 @@ _net_drop_rows() {
     [[ -n "$file" && -n "$idx" ]] || { error "_net_drop_rows <file> <field> <value>"; return 1; }
     [[ -f "$file" ]] || return 0
 
-    remaining="$(awk -F'\t' -v i="$idx" -v v="$value" '$i != v' "$file" 2>/dev/null || true)"
+    # The value reaches awk through the ENVIRONMENT rather than `awk -v`. An -v
+    # assignment processes escape sequences, so a value containing a backslash
+    # arrives inside awk as something else, matches no row, and the function
+    # silently reports success while dropping nothing — a leaked lease that
+    # looks exactly like a released one.
+    remaining="$(_ndr_v="$value" awk -F'\t' -v i="$idx" '$i != ENVIRON["_ndr_v"]' "$file" 2>/dev/null || true)"
 
     if [[ -n "$remaining" ]]; then
         printf '%s\n' "$remaining" | _net_write_atomic "$file" || return 1
@@ -224,6 +282,214 @@ net_public_endpoint() {
     return 0
 }
 
+# ─── Additional endpoints ─────────────────────────────────────────────────────
+#
+# docs/circumvention.md §4: one blocked IP must degrade the service, never end
+# it. A config listing a single address is a single point of failure by design.
+#
+# ── Why this is here and not in an adapter ──────────────────────────────────
+#
+# All three protocols run on the same host and therefore reach it at the same
+# addresses. The PORT differs per protocol, so this list holds HOSTS and each
+# adapter pairs each host with its own port. That is also why an entry may not
+# carry a port: one host:port cannot serve three protocols, and accepting the
+# syntax would invite an operator to write something only one of them honours.
+#
+# ── The primary is still the adapter's ──────────────────────────────────────
+#
+# Each adapter keeps its own `endpoint` setting, resolved at install, and that
+# stays the FIRST entry. This list is what comes after it. Two reasons, and the
+# second is the one that decided it:
+#
+#   1. An install that predates this file behaves exactly as it did. Nothing
+#      migrates, nothing is rewritten, and an empty list is today's behaviour.
+#   2. The adapters do not agree on their primary and should not have to. An
+#      operator may have typed a domain into one and let another resolve an IP.
+#
+# So callers ask for net_endpoints_all "<their own primary>" and get a list
+# whose first element is that primary. The single-endpoint case is the
+# one-element case, and there is no second code path to drift.
+#
+# ── What this CANNOT check ──────────────────────────────────────────────────
+#
+# §4 asks for endpoints across different ASNs and providers. Nothing here can
+# verify that. net_public_endpoint refuses to ask a third party what this host's
+# own address is, because that is the telemetry this project does not have — and
+# an ASN lookup is the same outbound call wearing a different hat. So the ASN
+# requirement is an operator warning at add time and a line on the launch
+# checklist. It is deliberately not a validator: a check that cannot check is
+# worse than no check, because it is believed.
+#
+# ── And what a second endpoint actually requires ────────────────────────────
+#
+# Adding an address here does NOT make a second host work. The second host has
+# to answer with the same server identity — the same CA and server certificate
+# for the certificate protocols, and for WireGuard the same server private key
+# AND the same nine obfuscation parameters, which _awg_settings_bootstrap draws
+# per server and then refuses to change. Sharing that identity across hosts is a
+# separate piece of work and is NOT built. Until it is, this list is for the
+# addresses of ONE host: a second IP, an IPv6 address alongside the v4, a
+# domain beside the address it resolves to, a front that terminates elsewhere.
+# That is a real and useful case; it is just not the multi-ASN case, and
+# net_endpoints_explain says so out loud rather than letting an operator infer
+# a fleet from a working command.
+
+: "${VPN55_ENDPOINTS_KEY:=endpoints}"
+
+# A host: an IPv4 address or a DNS name. No port, no scheme, no path.
+#
+# ⚠ An IPv6 literal is REFUSED, and the refusal is the considered answer rather
+# than a gap nobody looked at. Each protocol spells a v6 endpoint differently —
+# WireGuard wants `[2001:db8::1]:51820`, OpenVPN wants the address bare with a
+# `udp6`/`tcp6-client` transport on the same line, strongSwan wants something
+# else again — so accepting one string here would emit three files of which at
+# best one connects, with no error on any of them. That is precisely the
+# silent-failure shape this list exists to remove.
+#
+# It also would not be reachable: net_wan_address resolves through `ip -4`, so
+# this project has no v6 endpoint anywhere to pair a v6 alternate with. When v6
+# arrives it arrives as its own piece of work, with the per-protocol syntax and
+# a test for each. Until then a colon is only ever the port mistake below.
+net_endpoint_valid() {
+    local host="${1:-}"
+    [[ -n "$host" ]] || return 1
+    case "$host" in
+        *,*|*' '*|*$'\t'*|*/*|*'['*|*']'*) return 1 ;;
+        *:*) return 1 ;;
+    esac
+    [[ "$host" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$ ]] || return 1
+    return 0
+}
+
+# The extra endpoints, one per line, in the order they were added. Empty output
+# and rc 0 when there are none — "none" is the normal state, not an error.
+net_endpoints_extra() {
+    local raw entry
+    raw="$(fs_conf_default "$VPN55_NET_CONF" "$VPN55_ENDPOINTS_KEY" "")"
+    [[ -n "$raw" ]] || return 0
+    local IFS=','
+    for entry in $raw; do
+        [[ -n "$entry" ]] || continue
+        printf '%s\n' "$entry"
+    done
+    return 0
+}
+
+# net_endpoints_all <primary> — the full ordered list a client config should
+# carry: the caller's own primary first, then every extra that is not already
+# it. Called with an empty primary it degrades to the extras alone rather than
+# emitting a blank first line, because a blank endpoint in a client config is a
+# file that fails at connect time with nothing to read.
+net_endpoints_all() {
+    local primary="${1:-}" entry
+    if [[ -n "$primary" ]]; then
+        printf '%s\n' "$primary"
+    fi
+    while IFS= read -r entry; do
+        [[ -n "$entry" ]] || continue
+        [[ "$entry" == "$primary" ]] && continue
+        printf '%s\n' "$entry"
+    done < <(net_endpoints_extra)
+    return 0
+}
+
+net_endpoints_count() {
+    local n
+    n="$(net_endpoints_extra | grep -c . || true)"
+    printf '%s' "${n:-0}"
+}
+
+net_endpoints_add() {
+    local host="${1:-}" existing
+    [[ -n "$host" ]] || { error "net_endpoints_add <host>"; return 1; }
+    net_endpoint_valid "$host" || {
+        error "'${host}' is not a host this can use."
+        error "Give an IPv4 address or a DNS name, with no port and no scheme —"
+        error "the port belongs to the protocol, and each service adds its own."
+        case "$host" in
+            *:*) error "An IPv6 endpoint is not supported yet: the three protocols"
+                 error "spell one differently and would not all connect." ;;
+        esac
+        return 1
+    }
+
+    while IFS= read -r existing; do
+        if [[ "$existing" == "$host" ]]; then
+            info "${host} is already in the list — nothing was changed."
+            return 0
+        fi
+    done < <(net_endpoints_extra)
+
+    _net_ensure_state_dir || return 1
+    local raw
+    raw="$(fs_conf_default "$VPN55_NET_CONF" "$VPN55_ENDPOINTS_KEY" "")"
+    if [[ -n "$raw" ]]; then
+        raw="${raw},${host}"
+    else
+        raw="$host"
+    fi
+    fs_conf_set "$VPN55_NET_CONF" "$VPN55_ENDPOINTS_KEY" "$raw" \
+        || { error "cannot record the endpoint in ${VPN55_NET_CONF}"; return 1; }
+
+    success "Added ${host}."
+    net_endpoints_explain
+    return 0
+}
+
+net_endpoints_remove() {
+    local host="${1:-}" entry found=0 kept=""
+    [[ -n "$host" ]] || { error "net_endpoints_remove <host>"; return 1; }
+
+    while IFS= read -r entry; do
+        [[ -n "$entry" ]] || continue
+        if [[ "$entry" == "$host" ]]; then
+            found=1
+            continue
+        fi
+        if [[ -n "$kept" ]]; then kept="${kept},${entry}"; else kept="$entry"; fi
+    done < <(net_endpoints_extra)
+
+    if [[ "$found" -eq 0 ]]; then
+        error "'${host}' is not in the list. Nothing was changed."
+        return 1
+    fi
+
+    _net_ensure_state_dir || return 1
+    fs_conf_set "$VPN55_NET_CONF" "$VPN55_ENDPOINTS_KEY" "$kept" \
+        || { error "cannot rewrite ${VPN55_NET_CONF}"; return 1; }
+
+    success "Removed ${host}."
+    # §4 again: a burned IP stays burned, and blocklist entries are effectively
+    # never reviewed. So removing one from the list is not the end of the job —
+    # every config already carrying it still carries it.
+    warn "Client configurations already issued still list ${host}."
+    warn "They cannot be rewritten: the private keys in them were erased after"
+    warn "hand-off. A client will simply fail over past it, which is the point."
+    return 0
+}
+
+# Printed after a change, and by the CLI's list verb. It says the two things an
+# operator cannot work out from the command succeeding.
+net_endpoints_explain() {
+    info ""
+    info "Two things this does not do:"
+    info "  · It does not reach configurations already issued. A client file is"
+    info "    fixed at the moment it is handed over — the key in it is erased"
+    info "    afterwards, so it cannot be rebuilt. Endpoints added now appear in"
+    info "    credentials issued from now on."
+    info "  · It does not check that the addresses are independent. Endpoints in"
+    info "    one provider's range go together when that range is blocked, so"
+    info "    they should sit in different networks at different providers — and"
+    info "    nothing on this host can verify that without asking somebody"
+    info "    outside, which this project does not do."
+    info ""
+    info "A second host must also answer with this server's identity — the same"
+    info "certificate authority, and for WireGuard the same server key and the"
+    info "same obfuscation parameters. Sharing that between hosts is not built"
+    info "yet, so today this is for the several addresses of ONE host."
+    return 0
+}
+
 # ─── DNS resolvers handed to clients ──────────────────────────────────────────
 # Every tunnel protocol pushes a resolver at its clients, and the choice is
 # identical for all of them — so it lives here rather than once per adapter.
@@ -306,15 +572,33 @@ net_forwarding_active() {
     [[ "$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null || echo 0)" == "1" ]]
 }
 
+# ⚠ There is deliberately NO IPv6 branch here, and the parameter that used to
+# offer one is refused rather than ignored.
+#
+# Turning on net.ipv6.conf.all.forwarding is the only part of a v6 tunnel this
+# file could do, and doing only that part is worse than doing none of it: there
+# is no v6 pool, net_fw_allow_subnet matches `ip saddr` (v4 only) inside the
+# inet table, vpn55nat is family `ip`, and net_wan_iface reads `ip -4 route`.
+# A caller that passed 1 got forwarding enabled with no forward accepts and no
+# NAT behind it — a half-built path that reads as a working one.
+#
+# The client-side v6 leak is a different question and is already answered, in
+# the adapters where it belongs: WireGuard claims ::/0 so a dual-stack client
+# fails v6 closed, OpenVPN pushes block-ipv6 where the daemon supports it and
+# discloses where it does not, and IKEv2 states plainly that it cannot. Real v6
+# transport is a pool, a NAT family and a set of forward rules — a feature, not
+# a flag.
 net_forwarding_enable() {
-    local want_v6="${1:-0}"
+    if [[ -n "${1:-}" && "${1:-}" != "0" ]]; then
+        error "net_forwarding_enable takes no IPv6 argument — IPv6 transport is not implemented."
+        error "Enabling v6 forwarding without a v6 pool, NAT family and forward rules"
+        error "builds half a path and presents it as a whole one. See the note above."
+        return 1
+    fi
 
     {
         printf '# Written by VPN55. Removing this file disables tunnel routing.\n'
         printf 'net.ipv4.ip_forward = 1\n'
-        if [[ "$want_v6" == "1" ]]; then
-            printf 'net.ipv6.conf.all.forwarding = 1\n'
-        fi
     } | _net_write_atomic "$VPN55_SYSCTL_CONF" || return 1
 
     chmod 0644 "$VPN55_SYSCTL_CONF" || { error "cannot set mode on $VPN55_SYSCTL_CONF"; return 1; }
@@ -463,42 +747,226 @@ _net_nft_rule_present() {
 # ufw owns no NAT verb, so masquerade goes into a marked block at the top of
 # /etc/ufw/before.rules — still inside ufw, which is the point. The markers are
 # what makes removal exact.
+# The exact block this tag should own, rendered so it can be COMPARED with what
+# is on disk rather than merely detected as present.
+_net_ufw_nat_block_render() {
+    local tag="${1:-}" cidr="${2:-}" wan="${3:-}"
+    printf '# BEGIN VPN55 %s\n' "$tag"
+    printf '*nat\n'
+    printf ':POSTROUTING ACCEPT [0:0]\n'
+    printf -- '-A POSTROUTING -s %s -o %s -j MASQUERADE\n' "$cidr" "$wan"
+    printf 'COMMIT\n'
+    printf '# END VPN55 %s' "$tag"
+}
+
+# Whatever currently sits between this tag's markers, or nothing.
+#
+# awk comparing whole lines as strings, not sed: the tag would land in a sed
+# ADDRESS as a regular expression, where a slash or a metacharacter either
+# breaks the expression or matches more than the one block it was aimed at.
+_net_ufw_nat_block_current() {
+    local tag="${1:-}" rules="/etc/ufw/before.rules"
+    [[ -f "$rules" ]] || return 0
+    _unb_t="$tag" awk '
+        $0 == "# BEGIN VPN55 " ENVIRON["_unb_t"] { inb = 1 }
+        inb                                      { print }
+        $0 == "# END VPN55 " ENVIRON["_unb_t"]   { inb = 0 }
+    ' "$rules" 2>/dev/null || true
+}
+
 _net_ufw_nat_block_add() {
     local tag="${1:-}" cidr="${2:-}" wan="${3:-}"
-    local rules="/etc/ufw/before.rules"
+    local rules="/etc/ufw/before.rules" want have
 
     [[ -f "$rules" ]] || { error "$rules not found — is ufw installed?"; return 1; }
 
-    if grep -q "^# BEGIN VPN55 ${tag}$" "$rules" 2>/dev/null; then
+    want="$(_net_ufw_nat_block_render "$tag" "$cidr" "$wan")" \
+        || { error "cannot render the ufw NAT block"; return 1; }
+    have="$(_net_ufw_nat_block_current "$tag")"
+
+    # ⚠ Present is not the same as correct. The guard here used to return as
+    # soon as it saw the BEGIN marker, so changing the outbound interface or the
+    # pool slot and re-installing left the ORIGINAL masquerade line in place for
+    # good: idempotent in the sense that nothing grew, wrong in the sense that
+    # NAT went on pointing at an interface that was no longer the way out, and
+    # silent in both. Compare the content, not the marker.
+    if [[ "$have" == "$want" ]]; then
         return 0
+    fi
+    if [[ -n "$have" ]]; then
+        _net_ufw_nat_block_remove "$tag" || return 1
     fi
 
     {
-        printf '# BEGIN VPN55 %s\n' "$tag"
-        printf '*nat\n'
-        printf ':POSTROUTING ACCEPT [0:0]\n'
-        printf -- '-A POSTROUTING -s %s -o %s -j MASQUERADE\n' "$cidr" "$wan"
-        printf 'COMMIT\n'
-        printf '# END VPN55 %s\n' "$tag"
+        printf '%s\n' "$want"
         cat "$rules"
     } | _net_write_atomic "${rules}.vpn55" || return 1
 
     chmod 0640 "${rules}.vpn55" || { error "cannot set mode on ${rules}.vpn55"; return 1; }
     mv -f "${rules}.vpn55" "$rules" || { error "cannot update $rules"; return 1; }
+    # before.rules is read by iptables-restore at `ufw reload`, not continuously.
+    # Without this the block is on disk and not in the kernel, and NAT does not
+    # start working until something else reloads ufw.
+    VPN55_FW_DIRTY=1
     return 0
 }
 
 _net_ufw_nat_block_remove() {
     local tag="${1:-}"
-    local rules="/etc/ufw/before.rules"
+    local rules="/etc/ufw/before.rules" have
 
     [[ -f "$rules" ]] || return 0
-    grep -q "^# BEGIN VPN55 ${tag}$" "$rules" 2>/dev/null || return 0
+    have="$(_net_ufw_nat_block_current "$tag")"
+    [[ -n "$have" ]] || return 0
 
-    sed "/^# BEGIN VPN55 ${tag}$/,/^# END VPN55 ${tag}$/d" "$rules" \
-        | _net_write_atomic "${rules}.vpn55" || return 1
+    _unb_t="$tag" awk '
+        $0 == "# BEGIN VPN55 " ENVIRON["_unb_t"] { skip = 1 }
+        !skip                                    { print }
+        $0 == "# END VPN55 " ENVIRON["_unb_t"]   { skip = 0 }
+    ' "$rules" | _net_write_atomic "${rules}.vpn55" || return 1
     chmod 0640 "${rules}.vpn55" || { error "cannot set mode on ${rules}.vpn55"; return 1; }
     mv -f "${rules}.vpn55" "$rules" || { error "cannot update $rules"; return 1; }
+    VPN55_FW_DIRTY=1
+    return 0
+}
+
+# ── Was it already there? ──
+# ⚠ The single most destructive thing this file can do is remove a rule the
+# operator had BEFORE VPN55 was installed. It is easy to do by accident, because
+# the backends hide it: `ufw allow 1194/udp` on a port ufw already allows prints
+# "Skipping adding existing rule" and adds nothing, and firewalld answers
+# ALREADY_ENABLED — so the install looks the same either way, and the uninstall
+# then deletes a rule that was never ours. On firewalld the worst case is
+# --add-masquerade, which is zone-level: an uninstall would turn off NAT the
+# host was already doing for something else.
+#
+# So every verb asks the backend whether the rule is there BEFORE it applies,
+# and stores the answer in the ledger as a fifth field:
+#
+#   new       we added it, so a revoke removes it
+#   pre       it was already there, so a revoke leaves it alone
+#   unknown   the probe could not answer; a revoke leaves it and says so
+#
+# `unknown` is deliberately biased toward leaving a rule behind. A stray accept
+# rule is untidy; deleting the operator's own is an outage they did not ask for.
+#
+# A row with only four fields is a ledger written before this existed — it is
+# read as `new`, which is exactly what that code did.
+#
+# nftables never needs any of this: VPN55 owns `inet vpn55` and `ip vpn55nat`
+# outright, so nothing in them can pre-date the install.
+
+# Run a boolean query and keep "no" and "could not ask" apart: 0 yes · 1 no ·
+# 2 anything else. The distinction is the whole point of the probe.
+_net_fw_query() {
+    local rc=0
+    "$@" >/dev/null 2>&1 || rc=$?
+    case "$rc" in
+        0) return 0 ;;
+        1) return 1 ;;
+        *) return 2 ;;
+    esac
+}
+
+# _net_fw_preexists <backend> <kind> <a> <b> — 0 present · 1 absent · 2 unknown
+_net_fw_preexists() {
+    local backend="${1:-}" kind="${2:-}" a="${3:-}" b="${4:-}"
+
+    case "$backend:$kind" in
+        nftables:*) return 1 ;;
+
+        ufw:port)
+            # `ufw status` is captured and then tested, never piped into grep -q:
+            # grep exits on the match, SIGPIPEs ufw, and under pipefail the
+            # pipeline reads as "not found". Field-exact matching via awk, so
+            # 1194/udp cannot be matched by a rule for 11194/udp, and so the
+            # "(v6)" suffix ufw appends is not mistaken for part of the port.
+            local out
+            out="$(ufw status 2>/dev/null || true)"
+            [[ -n "$out" ]] || return 2
+            _fwp_r="${b}/${a}" awk '$1 == ENVIRON["_fwp_r"] { hit = 1 } END { exit !hit }' \
+                <<< "$out" && return 0
+            return 1 ;;
+        ufw:subnet)
+            local out
+            out="$(ufw status 2>/dev/null || true)"
+            [[ -n "$out" ]] || return 2
+            _fwp_c="$a" awk '/ALLOW FWD/ && index($0, ENVIRON["_fwp_c"]) { hit = 1 } END { exit !hit }' \
+                <<< "$out" && return 0
+            return 1 ;;
+        ufw:masquerade)
+            # Always "absent", and that is not laziness.
+            #
+            # ufw's NAT is a per-CIDR rule inside a block VPN55 delimits with its
+            # own markers, so nothing already in before.rules can BE that block —
+            # and removal is marker-exact, so there is nothing to protect. An
+            # earlier draft of this probe answered "pre" whenever before.rules
+            # held any POSTROUTING rule at all, which is wrong in the direction
+            # that costs the most: the operator masquerading their OWN subnet
+            # says nothing about the tunnel's, so VPN55 would have skipped adding
+            # its NAT and the tunnel would connect and then carry no traffic.
+            #
+            # firewalld is the opposite case and is handled as one below:
+            # --add-masquerade there is zone-level, genuinely global, and really
+            # can already be on for something else.
+            return 1 ;;
+
+        # firewall-cmd's --query-* verbs answer 0 for yes and 1 for no. ANY OTHER
+        # code is an error — the binary is gone, the daemon is down, the zone
+        # does not exist — and must not be read as "no". Reading an error as "no"
+        # would record the rule as ours to delete, which is how an uninstall
+        # comes to remove a rule it never added.
+        firewalld:port)
+            _net_fw_query firewall-cmd --permanent --query-port="${b}/${a}" ;;
+        firewalld:subnet)
+            _net_fw_query firewall-cmd --permanent --zone=trusted --query-source="$a" ;;
+        firewalld:masquerade)
+            _net_fw_query firewall-cmd --permanent --query-masquerade ;;
+    esac
+    return 2
+}
+
+# The verdict already stored for this exact rule, or rc 1 when it has no row.
+# Consulted BEFORE probing, because on the second install run the probe would
+# find VPN55's own rule from the first run and record it as pre-existing —
+# which would make every later uninstall leave everything behind.
+_net_fw_verdict() {
+    local tag="${1:-}" kind="${2:-}" a="${3:-}" b="${4:-}" row
+    [[ -f "$VPN55_FW_STATE" ]] || return 1
+    row="$(_fwv_t="$tag" _fwv_k="$kind" _fwv_a="$a" _fwv_b="$b" awk -F'\t' '
+        $1 == ENVIRON["_fwv_t"] && $2 == ENVIRON["_fwv_k"] \
+          && $3 == ENVIRON["_fwv_a"] && $4 == ENVIRON["_fwv_b"] {
+            print ($5 == "" ? "new" : $5); exit
+        }' "$VPN55_FW_STATE" 2>/dev/null)" || return 1
+    [[ -n "$row" ]] || return 1
+    printf '%s' "$row"
+}
+
+# Resolve the verdict for a rule and make sure the ledger holds it, so each verb
+# below is four lines of backend and not twenty of bookkeeping. Prints the
+# verdict on stdout.
+_net_fw_claim() {
+    local backend="${1:-}" tag="${2:-}" kind="${3:-}" a="${4:-}" b="${5:-}"
+    local verdict rc=0
+
+    if verdict="$(_net_fw_verdict "$tag" "$kind" "$a" "$b")"; then
+        printf '%s' "$verdict"
+        return 0
+    fi
+
+    _net_fw_preexists "$backend" "$kind" "$a" "$b" || rc=$?
+    case "$rc" in
+        0) verdict="pre" ;;
+        1) verdict="new" ;;
+        *) verdict="unknown" ;;
+    esac
+
+    if [[ "$verdict" == "pre" ]]; then
+        info "This host already allows ${kind} ${a} ${b} — VPN55 will use it and will NOT remove it."
+    fi
+
+    _net_append_record "$VPN55_FW_STATE" "$tag" "$kind" "$a" "$b" "$verdict" || return 1
+    printf '%s' "$verdict"
     return 0
 }
 
@@ -513,6 +981,13 @@ _net_ufw_nat_block_remove() {
 # inverts the failure: what is left behind is a row describing a rule that was
 # never applied, and every revoke branch tolerates a missing rule, so removing it
 # is a no-op. A phantom row is recoverable; an orphan rule is not.
+#
+# ⚠ Every verb ends in net_fw_commit, and that is not decoration. Before it
+# existed, net_fw_reload had exactly one caller in the whole tree — inside
+# net_fw_revoke_tag — so an install on firewalld wrote only --permanent rules
+# that never reached the running firewall, and an install on nftables never
+# wrote its tables out at all and lost every rule at the next reboot. Both
+# printed success. A verb that applies a rule owns making it real.
 
 net_fw_open_port() {
     local tag="${1:-}" transport="${2:-}" port="${3:-}"
@@ -520,27 +995,35 @@ net_fw_open_port() {
         || { error "net_fw_open_port <tag> <tcp|udp> <port>"; return 1; }
     case "$transport" in tcp|udp) ;; *) error "transport must be tcp or udp"; return 1 ;; esac
 
-    local backend
+    local backend verdict
     backend="$(net_fw_backend)" || return 1
+    verdict="$(_net_fw_claim "$backend" "$tag" "port" "$transport" "$port")" || return 1
 
-    _net_append_record "$VPN55_FW_STATE" "$tag" "port" "$transport" "$port" || return 1
+    if [[ "$verdict" == "pre" ]]; then
+        debug "fw: ${port}/${transport} was already open before VPN55 — left as found"
+        return 0
+    fi
 
     case "$backend" in
         ufw)
             ufw allow "${port}/${transport}" comment "vpn55:${tag}" >/dev/null \
-                || { error "ufw could not open ${port}/${transport}"; return 1; } ;;
+                || { error "ufw could not open ${port}/${transport}"; return 1; }
+            VPN55_FW_DIRTY=1 ;;
         firewalld)
             firewall-cmd --permanent --add-port="${port}/${transport}" >/dev/null \
-                || { error "firewalld could not open ${port}/${transport}"; return 1; } ;;
+                || { error "firewalld could not open ${port}/${transport}"; return 1; }
+            VPN55_FW_DIRTY=1 ;;
         nftables)
             _net_nft_tables || return 1
             local c_in="vpn55:${tag}:port:${transport}:${port}"
             if ! _net_nft_rule_present inet vpn55 input "$c_in"; then
                 nft add rule inet vpn55 input "$transport" dport "$port" accept comment "\"${c_in}\"" \
                     || { error "nft could not open ${port}/${transport}"; return 1; }
+                VPN55_FW_DIRTY=1
             fi ;;
     esac
 
+    net_fw_commit || return 1
     debug "fw: opened ${port}/${transport} for tag ${tag} via ${backend}"
     return 0
 }
@@ -551,20 +1034,26 @@ net_fw_allow_subnet() {
     local tag="${1:-}" cidr="${2:-}"
     [[ -n "$tag" && -n "$cidr" ]] || { error "net_fw_allow_subnet <tag> <cidr>"; return 1; }
 
-    local backend
+    local backend verdict
     backend="$(net_fw_backend)" || return 1
+    verdict="$(_net_fw_claim "$backend" "$tag" "subnet" "$cidr" "-")" || return 1
 
-    _net_append_record "$VPN55_FW_STATE" "$tag" "subnet" "$cidr" "-" || return 1
+    if [[ "$verdict" == "pre" ]]; then
+        debug "fw: ${cidr} was already routed before VPN55 — left as found"
+        return 0
+    fi
 
     case "$backend" in
         ufw)
             ufw route allow from "$cidr" comment "vpn55:${tag}" >/dev/null \
                 || { error "ufw could not allow routing from ${cidr}"; return 1; }
             ufw route allow to "$cidr" comment "vpn55:${tag}" >/dev/null \
-                || { error "ufw could not allow routing to ${cidr}"; return 1; } ;;
+                || { error "ufw could not allow routing to ${cidr}"; return 1; }
+            VPN55_FW_DIRTY=1 ;;
         firewalld)
             firewall-cmd --permanent --zone=trusted --add-source="$cidr" >/dev/null \
-                || { error "firewalld could not trust ${cidr}"; return 1; } ;;
+                || { error "firewalld could not trust ${cidr}"; return 1; }
+            VPN55_FW_DIRTY=1 ;;
         nftables)
             _net_nft_tables || return 1
             # Two rules, two comments: one identity per rule, or the presence
@@ -574,13 +1063,16 @@ net_fw_allow_subnet() {
             if ! _net_nft_rule_present inet vpn55 forward "$c_out"; then
                 nft add rule inet vpn55 forward ip saddr "$cidr" accept comment "\"${c_out}\"" \
                     || { error "nft could not allow forwarding from ${cidr}"; return 1; }
+                VPN55_FW_DIRTY=1
             fi
             if ! _net_nft_rule_present inet vpn55 forward "$c_ret"; then
                 nft add rule inet vpn55 forward ip daddr "$cidr" ct state established,related accept comment "\"${c_ret}\"" \
                     || { error "nft could not allow return traffic to ${cidr}"; return 1; }
+                VPN55_FW_DIRTY=1
             fi ;;
     esac
 
+    net_fw_commit || return 1
     debug "fw: allowed subnet ${cidr} for tag ${tag} via ${backend}"
     return 0
 }
@@ -592,28 +1084,36 @@ net_fw_masquerade() {
         wan="$(net_wan_iface)" || return 1
     fi
 
-    local backend
+    local backend verdict
     backend="$(net_fw_backend)" || return 1
+    verdict="$(_net_fw_claim "$backend" "$tag" "masquerade" "$cidr" "$wan")" || return 1
 
-    _net_append_record "$VPN55_FW_STATE" "$tag" "masquerade" "$cidr" "$wan" || return 1
+    if [[ "$verdict" == "pre" ]]; then
+        debug "fw: this host already masquerades — left as found"
+        return 0
+    fi
 
     case "$backend" in
         ufw)
             _net_ufw_nat_block_add "$tag" "$cidr" "$wan" || return 1 ;;
         firewalld)
             # Zone-level and not per-source, so it is reference-counted through the
-            # ledger: the last tag to be revoked is the one that turns it off.
+            # ledger: the last tag to be revoked is the one that turns it off —
+            # and only when no row says the host was masquerading before us.
             firewall-cmd --permanent --add-masquerade >/dev/null \
-                || { error "firewalld could not enable masquerade"; return 1; } ;;
+                || { error "firewalld could not enable masquerade"; return 1; }
+            VPN55_FW_DIRTY=1 ;;
         nftables)
             _net_nft_tables || return 1
             local c_nat="vpn55:${tag}:masquerade:${cidr}:${wan}"
             if ! _net_nft_rule_present ip vpn55nat postrouting "$c_nat"; then
                 nft add rule ip vpn55nat postrouting ip saddr "$cidr" oifname "$wan" masquerade comment "\"${c_nat}\"" \
                     || { error "nft could not add masquerade for ${cidr}"; return 1; }
+                VPN55_FW_DIRTY=1
             fi ;;
     esac
 
+    net_fw_commit || return 1
     debug "fw: masquerade ${cidr} out ${wan} for tag ${tag} via ${backend}"
     return 0
 }
@@ -629,9 +1129,23 @@ net_fw_revoke_tag() {
     local backend
     backend="$(net_fw_backend)" || return 1
 
-    local rec_tag kind a b
-    while IFS=$'\t' read -r rec_tag kind a b; do
+    local rec_tag kind a b verdict
+    while IFS=$'\t' read -r rec_tag kind a b verdict; do
         [[ "$rec_tag" == "$tag" ]] || continue
+
+        # A row this install did not create is a row this uninstall does not
+        # get to delete. An empty fifth field is a ledger written before the
+        # verdict column existed, and "new" is exactly what that code assumed.
+        case "${verdict:-new}" in
+            pre)
+                debug "fw: leaving ${kind} ${a} ${b} — it pre-dates VPN55"
+                continue ;;
+            unknown)
+                warn "Leaving ${kind} ${a} ${b} in place — VPN55 could not establish whether"
+                warn "this host already had it before the install. Remove it by hand if it is ours."
+                continue ;;
+        esac
+
         case "$backend:$kind" in
             ufw:port)
                 ufw delete allow "${b}/${a}" >/dev/null 2>&1 || true ;;
@@ -665,7 +1179,19 @@ net_fw_revoke_tag() {
         || { error "cannot rewrite the firewall ledger"; return 1; }
 
     net_fw_reload || return 1
+    VPN55_FW_DIRTY=0
     success "Firewall rules for '${tag}' removed."
+    return 0
+}
+
+# Make what the verbs applied actually real, and be free when they applied
+# nothing. The flag is what keeps a second and third install run genuinely inert
+# — no reload, no daemon-reload, no log line — rather than merely
+# same-in-the-end.
+net_fw_commit() {
+    [[ "$VPN55_FW_DIRTY" == "1" ]] || return 0
+    net_fw_reload || return 1
+    VPN55_FW_DIRTY=0
     return 0
 }
 
@@ -705,24 +1231,51 @@ net_fw_persist() {
     local nft_bin
     nft_bin="$(command -v nft)" || { error "nft disappeared from PATH"; return 1; }
 
-    if [[ ! -f /etc/systemd/system/vpn55-firewall.service ]]; then
-        {
-            printf '[Unit]\n'
-            printf 'Description=VPN55 firewall rules\n'
-            printf 'DefaultDependencies=no\n'
-            printf 'Before=network-pre.target\n'
-            printf 'Wants=network-pre.target\n'
-            printf '\n[Service]\n'
-            printf 'Type=oneshot\n'
-            printf 'RemainAfterExit=yes\n'
-            printf 'ExecStart=%s -f %s\n' "$nft_bin" "$VPN55_NFT_CONF"
-            printf '\n[Install]\n'
-            printf 'WantedBy=multi-user.target\n'
-        } | _net_write_atomic /etc/systemd/system/vpn55-firewall.service || return 1
+    # ⚠ Ordering, and why every line of it is load-bearing.
+    #
+    # `Before=network-pre.target` alone was a race, not an order. The distro's
+    # own nftables.service is ordered against that same target, and the
+    # /etc/nftables.conf it loads conventionally opens with `flush ruleset` —
+    # two units both Before= one target have NO ordering relative to each other,
+    # so whichever landed second won, and when that was the distro's, the vpn55
+    # tables were flushed. Non-deterministically, which is the worst way for a
+    # firewall to behave.
+    #
+    # `DefaultDependencies=no` also drops the implicit After=local-fs.target, so
+    # ExecStart could run before the filesystem holding $VPN55_NFT_CONF was
+    # mounted. Both are named back explicitly.
+    local unit_path="/etc/systemd/system/vpn55-firewall.service" want have=""
+    want="$(printf '%s\n' \
+        "[Unit]" \
+        "Description=VPN55 firewall rules" \
+        "Documentation=https://github.com/noobvie/VPN55" \
+        "DefaultDependencies=no" \
+        "After=local-fs.target" \
+        "RequiresMountsFor=${VPN55_NFT_CONF}" \
+        "After=nftables.service" \
+        "Wants=nftables.service" \
+        "Before=network-pre.target" \
+        "Wants=network-pre.target" \
+        "" \
+        "[Service]" \
+        "Type=oneshot" \
+        "RemainAfterExit=yes" \
+        "ExecStart=${nft_bin} -f ${VPN55_NFT_CONF}" \
+        "" \
+        "[Install]" \
+        "WantedBy=multi-user.target")" || { error "cannot render the firewall unit"; return 1; }
 
-        chmod 0644 /etc/systemd/system/vpn55-firewall.service \
-            || { error "cannot set mode on vpn55-firewall.service"; return 1; }
+    # Compared, not merely tested for existence: the old guard skipped the write
+    # whenever the file was there at all, so an installed host would never have
+    # received the ordering fix above.
+    [[ -f "$unit_path" ]] && have="$(cat "$unit_path" 2>/dev/null || true)"
+
+    if [[ "$have" != "$want" ]]; then
+        printf '%s\n' "$want" | _net_write_atomic "$unit_path" || return 1
+        chmod 0644 "$unit_path" || { error "cannot set mode on vpn55-firewall.service"; return 1; }
         distro_daemon_reload || return 1
+    fi
+    if ! distro_service_is_enabled vpn55-firewall.service; then
         distro_service_enable vpn55-firewall.service || return 1
     fi
     return 0
@@ -807,6 +1360,10 @@ _net_valid_owner() {
 # any conflict — silently handing out an already-claimed /24 is the overlapping
 # subnet bug this whole allocator exists to prevent.
 net_pool_claim() {
+    _net_locked _net_pool_claim_locked "$@"
+}
+
+_net_pool_claim_locked() {
     local owner="${1:-}" slot="${2:-}"
     _net_valid_owner "$owner" || return 1
     _net_valid_slot "$slot" || return 1
@@ -849,6 +1406,10 @@ net_pool_slot() {
 }
 
 net_pool_release() {
+    _net_locked _net_pool_release_locked "$@"
+}
+
+_net_pool_release_locked() {
     local owner="${1:-}"
     _net_valid_owner "$owner" || return 1
 
@@ -865,6 +1426,10 @@ net_pool_release() {
 # asking twice for the same cred_id returns the same address rather than burning
 # a second one.
 net_pool_alloc() {
+    _net_locked _net_pool_alloc_locked "$@"
+}
+
+_net_pool_alloc_locked() {
     local owner="${1:-}" cred_id="${2:-}"
     _net_valid_owner "$owner" || return 1
     [[ -n "$cred_id" ]] || { error "net_pool_alloc <owner> <cred_id>"; return 1; }
@@ -916,6 +1481,10 @@ net_pool_alloc() {
 }
 
 net_pool_free() {
+    _net_locked _net_pool_free_locked "$@"
+}
+
+_net_pool_free_locked() {
     local owner="${1:-}" cred_id="${2:-}"
     _net_valid_owner "$owner" || return 1
     [[ -n "$cred_id" ]] || { error "net_pool_free <owner> <cred_id>"; return 1; }

@@ -61,6 +61,39 @@ jobs:
           # no shebang; -S style keeps informational notes visible without failing.
           shellcheck --color=always --severity=warning --external-sources "${files[@]}"
 
+      # ── The shell unit tests ─────────────────────────────────────────────
+      #
+      # These ran nowhere until 2026-09-02. tests/vpnctl-ownership.sh had
+      # existed for weeks, guarding the assertion that stands between the
+      # portal's rotation and somebody else's credential, and CI had never
+      # executed it once — an unrun test is a comment that takes longer to
+      # write.
+      #
+      # All three need nothing but bash and openssl: no root, no VPS, no
+      # network. tests/vps-acceptance.sh is the one that cannot run here, and
+      # it is deliberately not in this list.
+      #
+      # AWG_TEST_RUNS is lowered from its default because the generator forks
+      # thirteen subprocesses per set and the sample size buys nothing on a
+      # runner — the boundary table is the half that finds bugs, and it runs
+      # in full regardless.
+      - name: Shell unit tests
+        env:
+          AWG_TEST_RUNS: 120
+        run: |
+          set -euo pipefail
+          rc=0
+          for t in tests/vpnctl-ownership.sh tests/awg-params.sh tests/signature-verify.sh; do
+            echo "── $t"
+            if bash "$t"; then
+              echo "  ok      $t"
+            else
+              echo "  FAILED  $t"
+              rc=1
+            fi
+          done
+          exit "$rc"
+
   locales:
     name: Locales — key parity across vi / en / fr
     runs-on: ubuntu-latest
@@ -108,6 +141,22 @@ jobs:
       # it is laying out against the wrong language.
       - name: Expansion budget for the longest locale
         run: node .github/scripts/check-expansion.mjs
+
+      # Both stylesheets open by warning that a rule setting a background must
+      # set its colour too. The warning was there from the start and did not stop
+      # a warning badge shipping at 1.93:1 — because "is this pair readable" is
+      # arithmetic, and a reviewer reading CSS is not doing arithmetic. Four
+      # themes, two of them near-white, and the default is dark: three themes
+      # being fine is exactly how the fourth ships broken.
+      - name: Contrast and the paired-property rule
+        run: node .github/scripts/check-contrast.mjs
+
+      # A mask that lets a value through renders something that LOOKS masked,
+      # gets photographed for the README, and is never noticed — because the
+      # output has the right shape. The cases are mostly the ones where a
+      # lenient parser says yes.
+      - name: Remote addresses are actually masked
+        run: node tests/mask-endpoint.mjs
 
   hygiene:
     name: Hygiene — no protocol leakage, no shebang in lib/
@@ -207,11 +256,45 @@ jobs:
 
       # errexit is disabled inside any ||-guarded function body, so a bare
       # create/copy/move/delete in lib/ is a silent failure that ships.
+      #
+      # ⚠ Continuations are JOINED before the test, and that is not a
+      # refinement. A guard written across a line break —
+      #
+      #     mv -f "$a" "$b" \
+      #         || { error "..."; return 1; }
+      #
+      # — is correctly guarded, and a line-at-a-time grep sees only the `mv`.
+      # The check used to fail exactly that shape, so the only way to satisfy it
+      # was to un-wrap a long line or to leave the job red. A hygiene check that
+      # rejects correct code teaches people to ignore it.
       - name: Unguarded cp/mv/mkdir/rm in lib/
         run: |
           set -uo pipefail
           hits=$(
-            grep -rnE '^[[:space:]]*(cp|mv|mkdir|rm|ln|install)[[:space:]]' lib/ \
+            for f in lib/*.sh; do
+              [ -f "$f" ] || continue
+              # Join every line ending in a backslash with the one after it, and
+              # keep the ORIGINAL line number so a hit is still locatable.
+              #
+              # The continuation is detected by looking at the last CHARACTER,
+              # not with /\\[[:space:]]*$/ — in a gawk regex literal the `\\`
+              # collapses to one backslash which then escapes the `[`, so that
+              # pattern quietly means "a literal [" and matches nothing here.
+              awk -v file="$f" '
+                {
+                  if (buf == "") startline = NR
+                  sub(/[ \t\r]+$/, "")
+                  if (substr($0, length($0), 1) == "\\") {
+                    buf = buf substr($0, 1, length($0) - 1) " "
+                    next
+                  }
+                  print file ":" startline ":" buf $0
+                  buf = ""
+                }
+                END { if (buf != "") print file ":" startline ":" buf }
+              ' "$f"
+            done \
+              | grep -E ':[0-9]+:[[:space:]]*(cp|mv|mkdir|rm|ln|install)[[:space:]]' \
               | grep -vE '(\|\||&&)' \
               || true
           )
@@ -456,3 +539,144 @@ jobs:
               echo "Unexpected output from a directory-less run."
               exit 1 ;;
           esac
+
+      # ── The bootstrap's SECOND half ────────────────────────────────────────
+      #
+      # The step above proves the bootstrap is reached. It stops at the root
+      # check, so everything after it — the fetch to VPN55_HOME, the chmod, and
+      # the exec into the copy just installed — was never exercised anywhere.
+      # That is most of the code path the README's one-line install runs.
+      #
+      # Here it runs for real: no directory beside the script, a mirror served
+      # from this checkout, VPN55_HOME redirected into a temp dir, under sudo so
+      # the root check passes. If the relaunched copy answers, the whole chain
+      # works.
+      - name: The one-line install completes and hands over
+        run: |
+          set -euo pipefail
+          python3 -m http.server 8899 --bind 127.0.0.1 --directory . >/dev/null 2>&1 &
+          server=$!
+          trap 'kill "$server" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 40); do
+            curl -fsS http://127.0.0.1:8899/MANIFEST.sha256 >/dev/null 2>&1 && break
+            sleep 0.25
+          done
+
+          home="$(mktemp -d)/vpn55"
+          out="$(sudo VPN55_MIRROR=http://127.0.0.1:8899 VPN55_HOME="$home" \
+                   bash <(cat vpn55.sh) --version 2>&1)"
+          printf '%s\n' "$out" | sed 's/^/      /'
+
+          printf '%s\n' "$out" | grep -q 'source base:' \
+            || { echo "the relaunched copy did not run"; exit 1; }
+          sudo test -x "$home/vpn55.sh" || { echo "no executable entry point at VPN55_HOME"; exit 1; }
+          sudo test -r "$home/lib/ui.sh" || { echo "the installed tree has no lib/"; exit 1; }
+          echo "  ok  fetched to VPN55_HOME, made executable, and handed over"
+
+      # ── The loop that used to have no floor ────────────────────────────────
+      #
+      # src_manifest_verify checks the files a manifest NAMES. A manifest that
+      # simply omits lib/ui.sh therefore downloads and verifies perfectly, and
+      # installs a tree vpn55.sh cannot start from — so the bootstrap fetched it
+      # again, and again, forever, as root. A half-synced mirror was enough.
+      #
+      # src_fetch now refuses such a tree before installing it, and the
+      # bootstrap refuses to fetch twice in one run. This asserts the first
+      # refusal happens and that the run TERMINATES, which is the property that
+      # actually matters — a passing check here that hangs is the bug.
+      - name: An incomplete file list is refused, not fetched forever
+        run: |
+          set -uo pipefail
+          root="$(mktemp -d)"
+          cp -a . "$root/mirror"
+          rm -rf "$root/mirror/.git"
+          grep -v '  lib/ui\.sh$' MANIFEST.sha256 > "$root/mirror/MANIFEST.sha256"
+
+          python3 -m http.server 8898 --bind 127.0.0.1 --directory "$root/mirror" >/dev/null 2>&1 &
+          server=$!
+          trap 'kill "$server" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 40); do
+            curl -fsS http://127.0.0.1:8898/MANIFEST.sha256 >/dev/null 2>&1 && break
+            sleep 0.25
+          done
+
+          set +e
+          out="$(timeout 120 sudo VPN55_MIRROR=http://127.0.0.1:8898 \
+                   VPN55_HOME="$root/home" bash <(cat vpn55.sh) --version 2>&1)"
+          rc=$?
+          set -e
+          printf '%s\n' "$out" | sed 's/^/      /'
+
+          if [ "$rc" = "124" ]; then
+            echo "TIMED OUT — the bootstrap is looping on an incomplete file list."
+            exit 1
+          fi
+          [ "$rc" != "0" ] || { echo "an incomplete file list was accepted"; exit 1; }
+          printf '%s\n' "$out" | grep -q 'lib/ui.sh' \
+            || { echo "refused, but not for the right reason"; exit 1; }
+          test ! -d "$root/home" || { echo "a tree with no entry point was installed"; exit 1; }
+          echo "  ok  refused before installing, and the run ended"
+
+      # ── The return code the whole update design rests on ───────────────────
+      #
+      # src_update returns 10 for "new code is on disk and this process is still
+      # the old one", and both callers stop on it. Nothing automated exercised
+      # it: the distribution job tested src_fetch, and the acceptance harness
+      # runs from a git checkout, where src_update refuses by design. So the one
+      # decision that separates "applied the fix" from "reported applying the
+      # fix while running the old code" had no cover at all.
+      - name: A changed tree makes src_update return 10
+        run: |
+          set -euo pipefail
+          root="$(mktemp -d)"
+          cp -a . "$root/mirror"
+          rm -rf "$root/mirror/.git"
+
+          python3 -m http.server 8897 --bind 127.0.0.1 --directory "$root/mirror" >/dev/null 2>&1 &
+          server=$!
+          trap 'kill "$server" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 40); do
+            curl -fsS http://127.0.0.1:8897/MANIFEST.sha256 >/dev/null 2>&1 && break
+            sleep 0.25
+          done
+
+          export VPN55_MIRROR=http://127.0.0.1:8897
+          dest="$root/tree"
+
+          # First fetch, then an update against an UNCHANGED mirror: 0.
+          bash -c '. lib/core_source.sh; src_fetch "'"$dest"'"' >/dev/null 2>&1
+          set +e
+          bash -c '. lib/core_source.sh; src_update "'"$dest"'"' >/dev/null 2>&1
+          rc=$?
+          set -e
+          [ "$rc" = "0" ] || { echo "an unchanged mirror should return 0, got $rc"; exit 1; }
+          echo "  ok  unchanged mirror → 0"
+
+          # Now change one shipped file and regenerate the mirror's manifest: 10.
+          printf '\n# ci probe\n' >> "$root/mirror/lib/ui.sh"
+          ( cd "$root/mirror" && ./tools/manifest.sh >/dev/null )
+          set +e
+          bash -c '. lib/core_source.sh; src_update "'"$dest"'"' >/dev/null 2>&1
+          rc=$?
+          set -e
+          [ "$rc" = "10" ] || { echo "a changed tree must return 10, got $rc"; exit 1; }
+          echo "  ok  changed tree → 10 (relaunch, do nothing else first)"
+
+      # ── One default, in two files ─────────────────────────────────────────
+      #
+      # vpn55.sh sets VPN55_MIRROR before it sources anything, so its copy wins
+      # whenever it is the entry point. lib/core_source.sh's copy is what
+      # applies when the lib is sourced on its own — which the steps above do,
+      # and so does the acceptance harness. They are the same string today and
+      # nothing enforced it, so a mirror change could land in one and not the
+      # other and the two paths would fetch from different hosts.
+      - name: The two copies of the mirror default agree
+        run: |
+          set -euo pipefail
+          a="$(grep -m1 '^: "${VPN55_MIRROR:=' vpn55.sh)"
+          b="$(grep -m1 '^: "${VPN55_MIRROR:=' lib/core_source.sh)"
+          printf '      vpn55.sh        %s\n' "$a"
+          printf '      core_source.sh  %s\n' "$b"
+          [ -n "$a" ] && [ "$a" = "$b" ] \
+            || { echo "the two default mirror URLs disagree"; exit 1; }
+          echo "  ok  one base URL, spelled the same in both files"

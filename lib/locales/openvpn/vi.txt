@@ -43,9 +43,9 @@ Lưu ý
   - Mỗi lúc chỉ một thiết bị được dùng chứng danh này. Kết nối thiết bị thứ hai
     sẽ ngắt thiết bị thứ nhất. Hãy xin thêm một chứng danh riêng cho mỗi thiết bị.
   - IPv6 không đi qua đường hầm này. Nếu máy chủ đủ mới, nó sẽ báo thiết bị của
-    bạn ngừng dùng IPv6 trong lúc kết nối; nếu không, một thiết bị hai ngăn xếp
-    vẫn giữ đường IPv6 riêng và lưu lượng đó không đi qua đường hầm.
-  - DNS của đường hầm do máy chủ đặt. Máy chủ phân giải đó nhìn thấy mọi tên
+    bạn ngừng dùng IPv6 trong lúc kết nối; nếu không, thiết bị dùng cả IPv4 lẫn
+    IPv6 vẫn giữ đường IPv6 riêng và lưu lượng đó không đi qua đường hầm.
+  - DNS của đường hầm do máy chủ đặt. Trình phân giải đó nhìn thấy mọi tên
     miền bạn tra cứu trong lúc kết nối.
 
 @@ transport.tcp

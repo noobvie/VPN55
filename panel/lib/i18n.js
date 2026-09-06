@@ -75,6 +75,22 @@ class Catalogs {
     return this.maps.has(locale);
   }
 
+  /**
+   * Change the default locale at runtime — the settings screen writes this.
+   *
+   * Only a locale whose catalog is already LOADED is accepted. `locales` is not
+   * changeable from the settings screen precisely because the catalogs are read
+   * once at startup, so this can never be asked for a file that is not in
+   * memory; the guard is here anyway, because "cannot happen" is how a page of
+   * raw key names ships.
+   */
+  setDefault(locale) {
+    const wanted = String(locale || '').toLowerCase();
+    if (!this.has(wanted)) return false;
+    this.defaultLocale = wanted;
+    return true;
+  }
+
   /** The whole catalog for a locale, English-filled, for the browser. */
   catalog(locale) {
     const target = this.maps.get(locale) || new Map();

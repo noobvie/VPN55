@@ -165,12 +165,77 @@ _adapter_show_status() {
     return 0
 }
 
+# ─── The filtering disclosure, in the terminal ───────────────────────────────
+#
+# The panel has shown this since Phase 5. The terminal did not, and the terminal
+# is where services are actually installed — so the one interface that acts on
+# the answer was the one interface that never printed it.
+#
+# docs/circumvention.md §5 asks for it "wherever a user picks a protocol", which
+# is this file twice: once in the list, so the three can be compared before one
+# is chosen, and once before an install, where the choice is made.
+#
+# The LEVEL is our word and gets a short label; the SENTENCE is the adapter's
+# own and is printed verbatim, the same rule the panel follows and the same one
+# `custody` already follows below. Nothing here learns which protocol it holds.
+
+# A short label for the list. An unknown level prints itself rather than
+# collapsing to "unknown" — a new answer should look like a new answer.
+_filtering_label() {
+    case "${1:-}" in
+        resistant) printf 'hard to block' ;;
+        partial)   printf 'partly exposed' ;;
+        exposed)   printf 'EASY TO BLOCK' ;;
+        "")        printf '' ;;
+        *)         printf '%s' "$1" ;;
+    esac
+}
+
+# Field 2 of the adapter's own filtering record, or empty if it declares none.
+_adapter_filtering_level() {
+    vpn_adapter_call "${1:-}" capabilities 2>/dev/null \
+        | awk -F'\t' '$1 == "filtering" { print $2; exit }'
+}
+
+# Level + sentence, printed. Used before an install, where there is room for the
+# whole thing and the operator is one keypress from committing to it.
+_adapter_filtering_notice() {
+    local tag="${1:-}" caps level sentence
+    caps="$(vpn_adapter_call "$tag" capabilities 2>/dev/null || true)"
+    level="$(printf '%s\n' "$caps"    | awk -F'\t' '$1 == "filtering" { print $2; exit }')"
+    sentence="$(printf '%s\n' "$caps" | awk -F'\t' '$1 == "filtering" { print $3; exit }')"
+    [[ -n "$level" ]] || return 0
+
+    # `exposed` is the one an operator can act on by choosing differently, so it
+    # is the one that gets a colour. The others are stated, not flagged.
+    if [[ "$level" == "exposed" ]]; then
+        warn "On a filtered network: $(_filtering_label "$level")"
+    else
+        info "On a filtered network: $(_filtering_label "$level")"
+    fi
+    if [[ -n "$sentence" ]]; then
+        info "  ${sentence}"
+    fi
+    return 0
+}
+
 _adapter_install() {
     local tag="${1:-}" label="${2:-}"
     if ! vpn_adapter_call "$tag" available; then
         error "${label} cannot run on this host — nothing was changed."
         return 1
     fi
+
+    # Before the install, not after. An operator who learns here that this is the
+    # protocol a censor blocks first can still pick another one; the same
+    # sentence printed at the end is an obituary.
+    #
+    # It is deliberately not a confirmation prompt. Two of the three adapters
+    # settle their own transport choice inside `install` — which is where that
+    # question belongs — and a gate here would ask about a level that the very
+    # next prompt can change.
+    _adapter_filtering_notice "$tag" || true
+
     vpn_adapter_call "$tag" install
 }
 
@@ -205,6 +270,24 @@ _adapter_uninstall() {
 #   size      a terminal is a bad place for a large file. Everything is written
 #             to disk; only something small enough to read is also printed.
 VPN55_ARTIFACT_PRINT_MAX=4096
+
+# The ceiling on what is worth drawing as a QR code, in bytes of payload.
+#
+# The adapter declares `qr 1`, and that declaration is a promise about a payload
+# it does not always control — an artifact carrying translated prose is as long
+# as the locale makes it, and the locale is chosen here, at handover, not there.
+# So the promise is checked rather than trusted.
+#
+# 600 bytes is where a terminal stops being able to show one. qrencode defaults
+# to error-correction level L, so 600 bytes is a version-19 symbol: 93 modules
+# plus the 4-module quiet zone each side is 101 columns, and -t ANSIUTF8 halves
+# the ROWS but not the columns. Past that the code wraps, and a wrapped QR is not
+# a smaller QR, it is a picture of nothing — which is worse than no code at all,
+# because it looks as though it should have worked.
+#
+# Refusing loudly is the point. A silent skip would leave an operator waiting for
+# a code the adapter said was coming.
+VPN55_ARTIFACT_QR_MAX=600
 
 # ─── Which language the ARTIFACTS are written in ──────────────────────────────
 #
@@ -301,7 +384,13 @@ _adapter_deliver() {
         fi
 
         if [[ "$qr" == "1" ]]; then
-            ui_qr "$body" || true
+            if [[ "${#body}" -le "$VPN55_ARTIFACT_QR_MAX" ]]; then
+                ui_qr "$body" || true
+            else
+                warn "Not drawing a QR code for '${label}': ${#body} bytes is past the"
+                warn "${VPN55_ARTIFACT_QR_MAX}-byte ceiling a terminal can render legibly, and a code no"
+                warn "camera reads is worse than none. Hand over ${dest} instead."
+            fi
         fi
     done <<< "$rows"
 
@@ -389,7 +478,7 @@ _adapter_cred_list() {
         return 0
     fi
 
-    local cred user state address created custody held config_state
+    local cred user state address created custody held config_state addr_part
     ui_rule
     while IFS=$'\t' read -r cred user state address created custody held; do
         [[ -n "$cred" ]] || continue
@@ -398,7 +487,15 @@ _adapter_cred_list() {
         else
             config_state="no longer downloadable"
         fi
-        ui_kv "$cred" "${user} · ${state} · ${address} · ${custody}-generated · config ${config_state} · issued ${created}"
+        # `-` in the address column means this protocol has no per-credential
+        # address to pin — its daemon hands one out at connect time. Printing the
+        # dash would read as a missing value in a row of real ones, so the field
+        # is left out instead. It is an absence, not a blank.
+        addr_part=""
+        if [[ -n "$address" && "$address" != "-" ]]; then
+            addr_part="${address} · "
+        fi
+        ui_kv "$cred" "${user} · ${state} · ${addr_part}${custody}-generated · config ${config_state} · issued ${created}"
     done <<< "$rows"
     ui_rule
     return 0
@@ -482,6 +579,7 @@ _screen_adapter() {
     while true; do
         section "$label"
         ui_kv "State" "$(_adapter_state "$tag")"
+        _adapter_filtering_notice "$tag" || true
         cat >&2 <<'MENU'
 
   1) Status and live connections
@@ -523,15 +621,32 @@ screen_protocols() {
             return 0
         fi
 
-        local i tag
+        # Each row carries its filtering level beside its state, because this is
+        # the screen where the three are compared. Listing a protocol that a
+        # censor blocks first alongside two that survive, with nothing to tell
+        # them apart, is the interface failure docs/circumvention.md §5 names.
+        #
+        # The level is the adapter's own and is read live, so a WireGuard
+        # service reads differently here depending on how it was installed.
+        # Adapters that declare none show their state alone.
+        local i tag level
         for i in "${!VPN55_ADAPTER_TAGS[@]}"; do
             tag="${VPN55_ADAPTER_TAGS[$i]}"
             if vpn_adapter_call "$tag" available >/dev/null 2>&1; then
-                ui_kv "$(( i + 1 ))) ${VPN55_ADAPTER_LABELS[$i]}" "$(_adapter_state "$tag")"
+                level="$(_filtering_label "$(_adapter_filtering_level "$tag")")"
+                if [[ -n "$level" ]]; then
+                    ui_kv "$(( i + 1 ))) ${VPN55_ADAPTER_LABELS[$i]}" \
+                          "$(_adapter_state "$tag")  ·  ${level}"
+                else
+                    ui_kv "$(( i + 1 ))) ${VPN55_ADAPTER_LABELS[$i]}" "$(_adapter_state "$tag")"
+                fi
             else
                 ui_kv "$(( i + 1 ))) ${VPN55_ADAPTER_LABELS[$i]}" "cannot run on this host"
             fi
         done
+        info ""
+        info "The second column after the state is how each protocol fares on a"
+        info "network that filters. Open one to read the service's own explanation."
 
         local key=""
         ask_key key "Select a service [1-${#VPN55_ADAPTER_TAGS[@]} / 0 to go back]" || return 0

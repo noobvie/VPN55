@@ -319,9 +319,35 @@
       var fillClass = 'meter__fill';
       if (pct >= 1) fillClass += ' meter__fill--crit';
       else if (pct >= 0.8) fillClass += ' meter__fill--warn';
-      card.appendChild(el('div', { class: 'meter' }, [
-        el('div', { class: fillClass, style: 'width:' + (pct * 100).toFixed(1) + '%' })
-      ]));
+      /* The width is set through the CSSOM, NOT as a `style` attribute.
+       *
+       * This page is served under `style-src 'self'` with no 'unsafe-inline'
+       * (panel/server.js), which blocks the style CONTENT ATTRIBUTE — so
+       * `el('div', { style: 'width:...' })` produced a bar of width zero, in
+       * every browser, with the failure reported only to the console. The
+       * person looking at it saw an empty track and read it as "no quota used".
+       * Assigning through element.style is a CSSOM write and is not what
+       * style-src governs, so it applies. Do not turn this back into an
+       * attribute, and do not reach for 'unsafe-inline' to make one work.
+       *
+       * A percentage is the one inline style worth having: the alternative is a
+       * ladder of quantised classes, and a quota bar that can only say 75% or
+       * 80% is a quota bar that rounds somebody past their limit. */
+      var fill = el('div', { class: fillClass });
+      fill.style.width = (pct * 100).toFixed(1) + '%';
+
+      /* The bar is a meter, so it says so. Colour is not the only signal —
+       * the figure is printed underneath — but a screen reader gets nothing at
+       * all from a div whose only content is its width. */
+      var meter = el('div', {
+        class: 'meter',
+        role: 'progressbar',
+        'aria-valuemin': '0',
+        'aria-valuemax': '100',
+        'aria-valuenow': (pct * 100).toFixed(0),
+        'aria-label': t('portal.col.quota'),
+      }, [fill]);
+      card.appendChild(meter);
       card.appendChild(el('p', {
         class: 'small muted',
         text: t('portal.quota.used', { percent: F.percent(u.quotaUsedFraction) })
@@ -498,6 +524,12 @@
     var note = fromService(current.note);
     if (note) wrap.appendChild(note);
 
+    /* The account banner said this at length; this is the same fact in one
+       line at the moment it is about to matter, because this is the file the
+       person is installing right now. Not `muted`: it is the one sentence in
+       this panel that is about their safety rather than about the file. */
+    wrap.appendChild(el('p', { class: 'small', text: t('portal.nokillswitch.short') }));
+
     var isText = current.encoding === 'text';
 
     if (isText) {
@@ -596,12 +628,32 @@
             else flash('error', t('portal.rotate.partial'));
             Object.keys(state.configs).forEach(function (k) { delete state.configs[k]; });
             state.open = Object.create(null);
-            return load();
+            /* The file they had is dead and the replacement is not on screen:
+               this is the one moment in the whole flow where the person holds
+               nothing that works. Opening it costs a click they would have had
+               to make anyway, and leaving it closed is how somebody ends up
+               with no working configuration and a page that looks finished. */
+            return load().then(function () {
+              if (data.cred) openConfig(data.cred, null);
+            });
           }, function (err) {
+            /* `cred_unknown` after a rotate is usually not what it says. The
+               likeliest cause is that the rotation SUCCEEDED and the reply was
+               lost — a dropped connection, the proxy's timeout — and the retry
+               then sends an id that was revoked a moment ago. Reporting "that
+               configuration is not one of yours" directly after pressing
+               Replace reads as the credential having been taken away. Refresh
+               the account instead and say what is actually true; the same
+               sentence is honest if an operator revoked it. */
+            if (err.error === 'portal.cred_unknown') {
+              flash('ok', t('portal.rotate.already'));
+              return load();
+            }
             flash('error', tOr(err.error, 'portal.failed', {
               minutes: err.retryAfterSeconds
                 ? Math.max(1, Math.ceil(err.retryAfterSeconds / 60)) : 0
             }));
+            return null;
           });
       });
   }
@@ -651,6 +703,27 @@
     return bar;
   }
 
+  /* The signature, on every state this page can be in — signed out, loading,
+     empty and full alike. It is a catalog key rather than a line of English in
+     the script, for the same reason nothing else here is: Vietnamese is the
+     default and this is the surface most users actually see.
+
+     The flag is drawn in CSS (brand.css, shared with the admin panel) and is
+     `aria-hidden`: it is decorative, and the place is already named in the
+     sentence beside it. */
+  function footer() {
+    return el('footer', { class: 'pfooter' }, [
+      el('p', { class: 'muted small made' }, [
+        el('span', { text: t('app.madewith') }),
+        el('span', { class: 'made__flag', 'aria-hidden': 'true' })
+      ])
+    ]);
+  }
+
+  /* The frame is drawn once and the footer is appended once, whichever state
+     `renderMain` returned from. That is why the early returns live in their own
+     function: a footer appended after each of them is a footer that goes
+     missing the day a sixth state is added. */
   function render() {
     if (!root) {
       root = el('div', { class: 'portal' });
@@ -661,7 +734,11 @@
     VPN55_I18N.apply(document);
 
     root.appendChild(topBar());
+    renderMain();
+    root.appendChild(footer());
+  }
 
+  function renderMain() {
     if (!state.known) {
       root.appendChild(el('p', { class: 'muted', text: t('app.loading') }));
       return;
@@ -696,6 +773,25 @@
       ]));
       return;
     }
+
+    /* What happens when the tunnel is NOT up. The client configuration carries
+       no PostUp/PreDown firewall rules, deliberately — a rule set the ledger
+       never sees is one nobody can withdraw — but the consequence of that
+       decision lands on the device, not on the server: when the tunnel drops,
+       the phone returns to the ordinary network and keeps sending. Nothing else
+       on this page says so, and for this audience it is a safety fact rather
+       than a technical detail.
+
+       Once, on the account, and not on each credential card: it is a property
+       of the service, and the same sentence under three cards is the part
+       people learn to scroll past. `--info` rather than `--warn` because the
+       warn banner a few lines above means something has gone wrong just now; a
+       permanent warn beside a transient one teaches the reader that the colour
+       carries no information. */
+    root.appendChild(el('div', { class: 'banner banner--info' }, [
+      el('strong', { text: t('portal.nokillswitch.title') }),
+      document.createTextNode(t('portal.nokillswitch.body'))
+    ]));
     creds.forEach(function (c) { root.appendChild(credentialCard(c)); });
   }
 
