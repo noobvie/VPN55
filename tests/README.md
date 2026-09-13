@@ -8,17 +8,24 @@ Two kinds of thing live here, and they answer different questions.
 | `vpnctl-ownership.sh` | nothing — any machine | can one user revoke another's credential |
 | `awg-params.sh` | nothing — any machine | are the obfuscation parameters within every bound, and drawn rather than nudged |
 | `signature-verify.sh` | nothing — openssl | does signature verification actually verify, and does it fail closed |
+| `front443.sh` | nothing — any machine | does the shared-443 front recognise every `listen 443` spelling, restore byte-exact, leave the panel's tunnel bind alone, verify binds by address rather than by `nginx -t`, does `--front443-check` exit 1 on drift and 2 on no front, does `--front443-remove` restore the host from the marked files alone when the ledger is gone, and is drift repairable while the fronted service is stopped |
+| `front443-adapter.sh` | nothing — any machine | with the front on, is the client file **byte-identical** to the one issued without it; does only the server's bind move to loopback; does the filtering level stay put; does the offer accept exactly `nginx`; does `VPN55_OVPN_FRONT=no` take a service off the record only where the front is not on the host; do the status notes carry the loopback fact and one record per broken invariant |
+| `panel-deploy.sh` | nothing — any machine | is a vhost written where this host's nginx actually reads it; is the panel's port opened on INPUT rather than only routed; and does the portal's vhost land **behind the shared front** when one is installed, tagged so its removal restores it |
 
 ```bash
 ./tests/vpnctl-ownership.sh          # anywhere, changes nothing, ~1 second
 ./tests/awg-params.sh                # ~2s on Linux; AWG_TEST_RUNS=n to change the sample
 ./tests/signature-verify.sh          # ~2s, mints its own throwaway keys
+./tests/front443.sh                  # ~2s, a fake nginx host in one mktemp dir
+./tests/front443-adapter.sh          # ~1s, the adapter side of the front against stubs
+./tests/panel-deploy.sh              # ~2s, the panel's and the portal's vhosts against stubs
 ```
 
-The three unit tests share a shape worth keeping: each **lifts the real function
-out of the shipped file and evaluates it**, rather than re-typing the logic. A
-test that re-states what it checks keeps passing on the day the real thing is
-deleted.
+The unit tests share a shape worth keeping: each **lifts the real function out
+of the shipped file and evaluates it**, rather than re-typing the logic — and
+the three that render a file render the template that actually ships, so a
+template edit that breaks a caller fails here rather than on a host. A test that
+re-states what it checks keeps passing on the day the real thing is deleted.
 
 They also share a reason for existing, which is not "coverage". Each covers
 something whose failure is **silent**:

@@ -219,6 +219,50 @@ _adapter_filtering_notice() {
     return 0
 }
 
+# ─── The service's own notes, wherever the service is shown ──────────────────
+#
+# The status screen has printed `note` records since the contract had them. The
+# service screen's header and the pre-install notice did not — so the one place
+# an operator stands before re-running an install was the one place that did
+# not tell them the install they were about to re-run had a broken front, and
+# the panel showed it while the terminal, where the repair is actually typed,
+# did not. That is the Phase 5 lesson again: both front ends, or it is
+# half-shipped.
+#
+# Attributed, verbatim, by severity — the same rule as the filtering sentence
+# above and as the panel's rendering. This file does not know what any note is
+# about and prints every one the adapter emits; the adapter decides what is
+# worth saying and how loudly. An unknown severity is shown at the LOUDEST
+# level, never the quietest.
+#
+# Takes the status rows as an optional third argument so a caller that already
+# read the status does not read it twice — a read is a subprocess tree per
+# adapter, and the fronted one inspects nginx and the kernel's sockets on the
+# way.
+_adapter_notes_notice() {
+    local tag="${1:-}" label="${2:-}" rows="${3-}"
+    local kind severity text shown=0
+    if [[ $# -lt 3 ]]; then
+        rows="$(vpn_adapter_call "$tag" status 2>/dev/null || true)"
+    fi
+    [[ -n "$rows" ]] || return 0
+    while IFS=$'\t' read -r kind _ severity text; do
+        [[ "$kind" == "note" ]] || continue
+        [[ -n "$text" ]] || continue
+        if [[ "$shown" -eq 0 ]]; then
+            info "${label} says, in its own words:"
+            shown=1
+        fi
+        case "$severity" in
+            info) info  "  ${text}" ;;
+            warn) warn  "  ${text}" ;;
+            crit) error "  ${text}" ;;
+            *)    error "  [${severity}] ${text}" ;;
+        esac
+    done <<< "$rows"
+    return 0
+}
+
 _adapter_install() {
     local tag="${1:-}" label="${2:-}"
     if ! vpn_adapter_call "$tag" available; then
@@ -235,6 +279,11 @@ _adapter_install() {
     # question belongs — and a gate here would ask about a level that the very
     # next prompt can change.
     _adapter_filtering_notice "$tag" || true
+
+    # And what the service, if it is already here, has to say about itself
+    # BEFORE it is re-applied: a note naming a broken shared front and its
+    # repair is worth more here than after the re-run has tried to use it.
+    _adapter_notes_notice "$tag" "$label" || true
 
     vpn_adapter_call "$tag" install
 }
@@ -575,11 +624,15 @@ _adapter_cred_remove() {
 }
 
 _screen_adapter() {
-    local tag="${1:-}" label="${2:-}"
+    local tag="${1:-}" label="${2:-}" rows state
     while true; do
         section "$label"
-        ui_kv "State" "$(_adapter_state "$tag")"
+        # One status read for both the state row and the notes under it.
+        rows="$(vpn_adapter_call "$tag" status 2>/dev/null || true)"
+        state="$(printf '%s\n' "$rows" | awk -F'\t' '$1 == "service" { print $3; exit }')"
+        ui_kv "State" "${state:-unknown}"
         _adapter_filtering_notice "$tag" || true
+        _adapter_notes_notice "$tag" "$label" "$rows" || true
         cat >&2 <<'MENU'
 
   1) Status and live connections

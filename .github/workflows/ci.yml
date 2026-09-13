@@ -83,7 +83,7 @@ jobs:
         run: |
           set -euo pipefail
           rc=0
-          for t in tests/vpnctl-ownership.sh tests/awg-params.sh tests/signature-verify.sh; do
+          for t in tests/vpnctl-ownership.sh tests/awg-params.sh tests/signature-verify.sh tests/panel-deploy.sh tests/front443.sh tests/front443-adapter.sh; do
             echo "── $t"
             if bash "$t"; then
               echo "  ok      $t"
@@ -238,6 +238,50 @@ jobs:
             exit 1
           fi
           echo "  ok  no NUL bytes"
+
+      # ⚠ A shell script saved with CRLF gives its shebang a trailing carriage
+      # return, so the kernel goes looking for an interpreter named "…/env bash^M"
+      # and the installer dies on its very first line — on the SERVER, never here.
+      # The same carriage return then rides into everything the scripts WRITE: a
+      # systemd unit, an nginx vhost, a sudoers rule, a client configuration.
+      #
+      # Nothing else in this workflow catches it. `bash -n` parses a CRLF script
+      # perfectly well, shellcheck passes it, and tools/manifest.sh simply records
+      # the digest of the broken file. VPN55 is developed on Windows, so this is
+      # one editor setting away at all times: .gitattributes pins the endings and
+      # this step is what proves the pin is holding.
+      #
+      # ⚠ The pattern is built with printf and then PROVED against a file that is
+      # known to have CRLF, because the failure mode of the obvious spelling is
+      # silent and inverted: a pattern that expands to the empty string matches
+      # every file rather than none, and a `grep -l` that lists the whole
+      # repository reads as a catastrophe rather than as a broken check. An
+      # untested probe is not evidence either way.
+      - name: No CRLF in anything that runs on the server
+        run: |
+          set -uo pipefail
+          CR=$(printf '\r')
+          [ -n "$CR" ] || { echo "the carriage-return pattern is empty; this check cannot work"; exit 1; }
+
+          probe=$(mktemp)
+          printf 'a\r\nb\r\n' > "$probe"
+          grep -qU "$CR" "$probe" || { echo "the probe cannot see a known CRLF file"; exit 1; }
+          printf 'a\nb\n' > "$probe"
+          grep -qU "$CR" "$probe" && { echo "the probe reports CRLF in an LF file"; exit 1; }
+          rm -f "$probe"
+
+          # --binary-files=without-match so a PNG that happens to contain 0x0d
+          # is not a finding.
+          hits=$(git ls-files -z | xargs -0 grep -lU --binary-files=without-match "$CR" || true)
+          if [ -n "$hits" ]; then
+            echo "these tracked files carry CRLF line endings:"
+            echo "$hits" | sed 's/^/    /'
+            echo
+            echo "every one of them is executed or parsed on the server."
+            echo "fix:  sed -i 's/\r$//' <file>    — then check your editor's settings"
+            exit 1
+          fi
+          echo "  ok  every tracked file is LF"
 
       # lib/ files are sourced, not executed.
       - name: No shebang in lib/

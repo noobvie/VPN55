@@ -185,6 +185,7 @@ t "an empty public key refuses"           "$(v "$WORK/msg.txt" "$WORK/msg.txt.mi
 # then be passing for the wrong reason and would keep passing if the signature
 # check were deleted. A negative test that cannot tell you why it passed is not
 # a test.
+# shellcheck disable=SC2034  # read by lib/cli.sh (cli_rendezvous)
 VPN55_PUBKEY="$PUB"
 
 printf '\nThe rendezvous file\n'

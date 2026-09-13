@@ -103,6 +103,22 @@
 #    client drop its own IPv6 rather than route it around the tunnel. Where the
 #    daemon is older, that is reported as a note rather than papered over.
 #
+# 7. PORT 443 IS SHARED WITH NGINX, NOT SURRENDERED TO IT — docs/security-model.md
+#    §6C.8. When tcp443 is chosen and the port is held, and the holder is nginx,
+#    the install OFFERS the shared front instead of refusing: nginx's stream
+#    module takes the public address, hands TLS to the operator's sites on a
+#    loopback port and everything else to this daemon on ITS loopback port.
+#    Any other holder gets the refusal as before. The engine is
+#    lib/core_front443.sh and is protocol-neutral — this file calls
+#    front443_install with a port and reads front443_check back, and nothing
+#    in that file learns what listens there. What the front costs is printed
+#    before the question is asked (_ovpn_front_offer), and the answer is
+#    recorded as `front=nginx` beside the transport because the client file is
+#    unchanged by it: `remote <host> 443 tcp` is what a client dials either way.
+#    With the front on VPN55 opens NOTHING in the firewall for this protocol —
+#    443 is the web server's rule already — and labels no SELinux port for it:
+#    443 carries the web label and the daemon never binds it.
+#
 # ── Revocation: measured, not assumed ────────────────────────────────────────
 # A revocation here is a list entry, exactly as it is for the other certificate
 # protocol, and a list entry does nothing to a session that has already
@@ -206,6 +222,20 @@ VPN55_OVPN_SERVER_CN="vpn55-openvpn-server"
 : "${VPN55_OVPN_TCP_PORT:=443}"
 : "${VPN55_OVPN_UDP_PORT:=1194}"
 
+# The loopback port the daemon binds when port 443 is SHARED with the web
+# server through nginx's stream front (docs/security-model.md §6C.8, built in
+# lib/core_front443.sh). Design note 7. It is written into nothing a client
+# receives — the client still dials <endpoint> 443 — so it is the server's
+# record alone and may be chosen freely. 1194 is the daemon's own default port,
+# which already carries the daemon's SELinux port type on every distribution in
+# the matrix, so no label is added for it; an operator who overrides it gets the
+# usual label check on the port they chose. VPN55_OVPN_LOCAL_PORT overrides.
+VPN55_OVPN_LOCAL_PORT_DEFAULT=1194
+
+# How long _install waits for the daemon to show up on its loopback port before
+# handing that port to the front. The front never points at a dead port.
+: "${VPN55_OVPN_BIND_WAIT:=10}"
+
 # Opt-in package purge on uninstall. Off by default, for the same reason as the
 # other adapters: removing a package is not what "reverse the install" means to
 # an operator who wants the tunnel gone.
@@ -232,6 +262,16 @@ _ovpn_svc_group() { fs_conf_default "$VPN55_OVPN_CONF" svc_group ""; }
 _ovpn_tls_mode()  { fs_conf_default "$VPN55_OVPN_CONF" tls_mode  ""; }
 _ovpn_reneg()     { fs_conf_default "$VPN55_OVPN_CONF" reneg_seconds "$VPN55_OVPN_RENEG_SECONDS"; }
 _ovpn_selinux()   { fs_conf_default "$VPN55_OVPN_CONF" selinux_port "0"; }
+
+# The shared-443 front (design note 7). `front` is `nginx` or empty; there is no
+# other value in this version. `port` stays what the CLIENT dials; `local_port`
+# is where the DAEMON listens behind the front, and _ovpn_bind_port is the one
+# every server-side consumer (the config render, the SELinux label, the
+# conflict check) reads, so none of them can pick the wrong one.
+_ovpn_front()      { fs_conf_default "$VPN55_OVPN_CONF" front      ""; }
+_ovpn_local_port() { fs_conf_default "$VPN55_OVPN_CONF" local_port ""; }
+_ovpn_front_on()   { [[ "$(_ovpn_front)" == "nginx" ]]; }
+_ovpn_bind_port()  { if _ovpn_front_on; then _ovpn_local_port; else _ovpn_port; fi; }
 
 _ovpn_subnet()  { net_pool_subnet  "$VPN55_OVPN_SLOT"; }
 _ovpn_gateway() { net_pool_gateway "$VPN55_OVPN_SLOT"; }
@@ -392,6 +432,17 @@ vpn_openvpn_available() {
 # There are no options: this adapter takes nothing but a user name. Declaring
 # that emptiness is the point — it is what stops the installer prompting every
 # protocol for a field only one of them has a use for.
+#
+# The shared-443 front (design note 7) is NOT declared here, and that is a
+# recorded gap rather than an oversight. `option` records describe what
+# _cred_add ACCEPTS — a prompt, a required flag, help text — and "this install
+# shares its port through the web server" is neither an input nor a
+# per-credential fact; it is install-time STATE, exactly the class of thing §6D
+# already found the contract cannot carry. Widening `option` to mean "state"
+# would make every reader guess which of the two it is looking at, so the fact
+# is emitted where install-time state already goes: as a `note` in _status,
+# every read, while the front is on. The gap is listed in
+# docs/security-model.md §6D beside the Phase 4 one.
 vpn_openvpn_capabilities() {
     printf 'revoke\tcrl\t%s\n' "$(_ovpn_revoke_bound)"
     printf 'custody\tserver\t%s\n' \
@@ -683,6 +734,324 @@ _ovpn_selinux_port_remove() {
     return 0
 }
 
+# ─── The shared-443 front ─────────────────────────────────────────────────────
+# Design note 7. Everything here goes through the public verbs of
+# lib/core_front443.sh — front443_holder_is_nginx, front443_available,
+# front443_scan, front443_install, front443_check, front443_remove — and never
+# through its internals, so the engine stays replaceable and the adapter stays
+# what the contract says it is. The library is sourced by vpn55.sh, not by the
+# helper, which never runs _install, _uninstall or _status; the guard below is
+# what turns "sourced on its own" into a sentence rather than a command-not-found.
+_ovpn_front_lib_loaded() {
+    declare -F front443_install >/dev/null 2>&1 \
+        && declare -F front443_check >/dev/null 2>&1 \
+        && declare -F front443_remove >/dev/null 2>&1
+}
+
+# _ovpn_loopback_held <port> — 127.0.0.1:<port> is in LISTEN, read from `ss`
+# by ADDRESS. The same rule the front lives by: a check that grepped for ":1194"
+# would go green on a wildcard bind, which is the daemon on the public
+# interface with no front in front of it.
+_ovpn_loopback_held() {
+    local port="${1:-}" l
+    [[ "$port" =~ ^[0-9]+$ ]] || return 1
+    command -v ss >/dev/null 2>&1 || return 1
+    while IFS= read -r l; do
+        [[ "$l" == "127.0.0.1:${port}" ]] && return 0
+    done < <(ss -Hlnt "sport = :${port}" 2>/dev/null | awk '{print $4}')
+    return 1
+}
+
+_ovpn_wait_loopback() {
+    local port="${1:-}" tries=0 limit
+    limit=$(( ${VPN55_OVPN_BIND_WAIT:-10} * 2 ))
+    while ! _ovpn_loopback_held "$port"; do
+        tries=$(( tries + 1 ))
+        [[ "$tries" -lt "$limit" ]] || return 1
+        sleep 0.5
+    done
+    return 0
+}
+
+# The loopback port, settled on every run: the stored value, then the
+# environment, then the default — the same precedence as every other setting.
+# It is in no client file, so unlike `port` it may change while credentials
+# exist; it may NOT change once the front is installed against it, because the
+# engine refuses to re-install with different ports than its ledger holds and
+# the honest answer is to say so here rather than fail three steps later.
+_ovpn_local_port_settle() {
+    local lp stored public
+    stored="$(_ovpn_local_port)"
+    public="$(_ovpn_port)"
+    lp="$stored"
+    [[ -n "${VPN55_OVPN_LOCAL_PORT:-}" ]] && lp="$VPN55_OVPN_LOCAL_PORT"
+    [[ -n "$lp" ]] || lp="$VPN55_OVPN_LOCAL_PORT_DEFAULT"
+
+    if [[ ! "$lp" =~ ^[0-9]+$ ]] || (( lp < 1 || lp > 65535 )); then
+        error "VPN55_OVPN_LOCAL_PORT '${lp}' is not a valid port number."
+        return 1
+    fi
+    if [[ "$lp" == "$public" ]]; then
+        error "The loopback port behind the front cannot be ${public} — that is the port the"
+        error "front itself takes. Set VPN55_OVPN_LOCAL_PORT to another one."
+        return 1
+    fi
+    if [[ -n "$stored" && "$lp" != "$stored" ]] \
+        && _ovpn_front_lib_loaded && front443_installed; then
+        error "This service is fronted on 127.0.0.1:${stored} and VPN55_OVPN_LOCAL_PORT asks"
+        error "for ${lp}. The front is installed against the recorded port; remove the"
+        error "service and install it again to move it."
+        return 1
+    fi
+    _ovpn_set local_port "$lp" || return 1
+    return 0
+}
+
+# _ovpn_front_offer <holder> <transport> <port> — the offer §6C.8 makes in place
+# of §6C.6's refusal. Returns 0 when the operator accepted and the choice is
+# recorded; 1 in every other case, and the caller then refuses exactly as it
+# always did. Nothing here installs anything: the front goes on AFTER the
+# daemon is up on its loopback port (_ovpn_front_apply), so it never points at
+# a dead one.
+#
+# Precedence is the adapter's usual: VPN55_OVPN_FRONT is the prompt's default
+# and, with no terminal, its answer — so `VPN55_OVPN_FRONT=nginx` accepts
+# unattended and anything else refuses unattended. The interactive default is
+# `no`: what is being accepted is an edit to configuration VPN55 does not own,
+# and that takes a typed answer rather than a bare Enter.
+_ovpn_front_offer() {
+    local holder="${1:-}" transport="${2:-}" port="${3:-}"
+
+    [[ "$transport" == "tcp" && "$port" == "443" ]] || return 1
+    _ovpn_front_lib_loaded || {
+        debug "front: lib/core_front443.sh is not loaded, so the shared front cannot be offered"
+        return 1
+    }
+    front443_holder_is_nginx tcp "$port" || return 1
+
+    info "Port ${port} is held by nginx (${holder}). VPN55 can SHARE it rather than refuse:"
+    info "nginx's stream module takes this host's public address on ${port}, hands TLS"
+    info "connections to your sites on a loopback port, and everything else to this"
+    info "service on 127.0.0.1:$(_ovpn_local_port_preview). Your sites keep the real client"
+    info "address; a client still dials ${port}, and the client file does not change."
+    if ! front443_available; then
+        warn "The shared front cannot be set up on this host — see above. Port ${port}"
+        warn "therefore stays refused."
+        return 1
+    fi
+
+    # What it costs, from docs/security-model.md §6C.8, in the order the design
+    # states them. The vhosts are listed BY NAME because they are files VPN55
+    # does not own and the operator is about to let it edit them.
+    local records rtype rfile rline rspec rflag files="" realip_srv="" realip_http="" refused="" f
+    records="$(front443_scan)" || records=""
+    while IFS=$'\t' read -r rtype rfile rline rspec _ rflag; do
+        case "$rtype" in
+            listen)
+                str_has_line "$files" "$rfile" || files="${files}${files:+$'\n'}${rfile}"
+                if [[ "$rflag" == "1" ]]; then
+                    str_has_line "$realip_srv" "$rfile" || realip_srv="${realip_srv}${realip_srv:+$'\n'}${rfile}"
+                fi ;;
+            realip)
+                [[ "$rspec" == "http" ]] && realip_http="${realip_http}${realip_http:+$'\n'}${rfile}:${rline}" ;;
+            refuse)
+                refused="${refused}${refused:+$'\n'}${rfile}:${rline}: ${rspec}" ;;
+        esac
+    done <<< "$records"
+
+    info ""
+    info "What sharing ${port} costs:"
+    info "  1. Every peer of this service arrives from 127.0.0.1. Status output shows"
+    info "     loopback where it would show a client address, and no per-address"
+    info "     control (a ban list, handshake throttling) is possible on this service."
+    info "  2. nginx is now part of the tunnel's availability. A reload is graceful;"
+    info "     a restart, or a configuration it refuses, drops every session at once."
+    info "  3. These nginx files carry VPN55's edits — each rewritten 'listen' line is"
+    info "     tagged with a marker holding the original, and uninstall reverses the"
+    info "     tagged lines, never the files:"
+    if [[ -n "$files" ]]; then
+        while IFS= read -r f; do
+            [[ -n "$f" ]] || continue
+            if str_has_line "$realip_srv" "$f"; then
+                info "       ${f}   ⚠ sets its own real_ip_header — behind the front it will log"
+                info "                every visitor as 127.0.0.1 unless that directive trusts loopback"
+            else
+                info "       ${f}"
+            fi
+        done <<< "$files"
+    else
+        info "       (no file currently listens on the public ${port} — the front would still"
+        info "        take the port, and a site added later is routed with no edit)"
+    fi
+    if [[ -n "$realip_http" ]]; then
+        warn "nginx sets real_ip_header at the http level, and the front's snippet would be a"
+        warn "duplicate nginx refuses. The front will not install until it is moved into the"
+        warn "server blocks that need it:"
+        printf '%s\n' "$realip_http" | sed 's/^/           /' >&2
+    fi
+    if [[ -n "$refused" ]]; then
+        warn "These listen lines share their line with other text, or do not end on it; the"
+        warn "front rewrites one directive per line and will not install until each public-443"
+        warn "listen is on a line of its own, ending in ';':"
+        printf '%s\n' "$refused" | sed 's/^/           /' >&2
+    fi
+    info ""
+    info "Answer 'nginx' to share the port; anything else keeps today's refusal."
+    info "Unattended: VPN55_OVPN_FRONT=nginx."
+
+    local choice
+    choice="${VPN55_OVPN_FRONT:-no}"
+    ask_value choice "Share port ${port} through nginx? (nginx/no)" "$choice" || return 1
+    if [[ "$choice" != "nginx" ]]; then
+        info "Declined ('${choice}')."
+        return 1
+    fi
+
+    _ovpn_set front nginx || return 1
+    _ovpn_local_port_settle || return 1
+    success "Port ${port} will be shared through nginx; this service binds 127.0.0.1:$(_ovpn_local_port)."
+    return 0
+}
+
+# The loopback port the offer would record, before it is recorded.
+_ovpn_local_port_preview() {
+    local lp
+    lp="$(_ovpn_local_port)"
+    [[ -n "${VPN55_OVPN_LOCAL_PORT:-}" ]] && lp="$VPN55_OVPN_LOCAL_PORT"
+    printf '%s' "${lp:-$VPN55_OVPN_LOCAL_PORT_DEFAULT}"
+}
+
+# The refusal §6C.6 makes, unchanged from before the front existed. It is the
+# answer for every holder that is not nginx, and for an nginx holder when the
+# offer is declined or the host cannot carry the front.
+_ovpn_port_refuse() {
+    local holder="${1:-}" transport="${2:-}" port="${3:-}"
+    error "${transport}/${port} is already in use on this host, by ${holder}."
+    if [[ "$port" == "443" ]]; then
+        error "Port 443 is the one every web server holds, and that is the cost of"
+        error "the transport that gets through filtered networks — the two cannot"
+        error "share it unless the holder is nginx and the shared front is accepted."
+        error "Either move the web server, or set VPN55_OVPN_PORT to a free port and"
+        error "re-run. Note that VPN55's own admin panel does NOT need this port:"
+        error "it binds to a tunnel address and takes its certificate over DNS."
+    else
+        error "Set VPN55_OVPN_PORT to a free port and re-run."
+    fi
+    error "Nothing was installed or changed."
+    return 0
+}
+
+# _ovpn_front_apply — the front goes on, AFTER the daemon is up. Both sides are
+# verified with `ss` by address: the daemon on 127.0.0.1:<local_port> before the
+# engine is called (it refuses a dead backend anyway, but the message here names
+# the unit to look at), and the front on the public address after, through
+# front443_check. Idempotent: on a re-run with the front intact the engine
+# changes nothing and reloads nothing.
+_ovpn_front_apply() {
+    local local_port unit
+    local_port="$(_ovpn_local_port)"
+    unit="$(_ovpn_unit)"
+    [[ -n "$local_port" ]] || { error "the front is recorded but no loopback port is"; return 1; }
+    _ovpn_front_lib_loaded || { error "lib/core_front443.sh is not loaded; the shared front cannot be applied"; return 1; }
+
+    if ! _ovpn_wait_loopback "$local_port"; then
+        error "The daemon did not bind 127.0.0.1:${local_port} within ${VPN55_OVPN_BIND_WAIT}s, so the"
+        error "front was not pointed at it. See: journalctl -u ${unit}"
+        return 1
+    fi
+
+    front443_install "$local_port" || return 1
+
+    local check
+    if ! check="$(front443_check)"; then
+        error "The front was installed but its invariants do not hold:"
+        printf '%s\n' "$check" | sed 's/^/    /' >&2
+        return 1
+    fi
+    return 0
+}
+
+# What happens to the adapter when the front cannot be put on. The engine has
+# already rolled ITS state back to before the call. With no credentials the
+# service goes back to "not installed" — the same state as a refused install.
+# With credentials it does not: an uninstall revokes every one of them, and a
+# host where nginx took 443 out from under a running service is not a reason
+# to do that. The service stays, on its loopback port, unreachable from
+# outside until the front is put back, and _status says exactly that.
+_ovpn_front_failed() {
+    if [[ -z "$(_ovpn_cred_ids)" ]]; then
+        warn "The shared front could not be set up. Rolling this service back to not installed…"
+        vpn_openvpn_uninstall || warn "the rollback did not complete cleanly — read the messages above"
+        return 0
+    fi
+    error "The shared front could not be set up, and this service has credentials, so it is"
+    error "NOT removed. It is running on 127.0.0.1:$(_ovpn_local_port) and unreachable from"
+    error "outside until the front is in place. Fix what is reported above and re-run the"
+    error "install; or remove the service. If this host is not to share port $(_ovpn_port) at all"
+    error "(no nginx here — a restore onto a new host), re-run with VPN55_OVPN_FRONT=no to take"
+    error "the front off this service's record; it then binds $(_ovpn_port) itself."
+    return 0
+}
+
+# ─── Taking the service OFF the front's record ───────────────────────────────
+# `front=nginx` is settled once and never re-asked (the offer's contract), and
+# settings.conf rides in the backup — so a restore carries the record onto a
+# host that may have no nginx at all. There the re-run starts the daemon on
+# loopback, cannot put a front on, and with credentials leaves the service
+# unreachable (_ovpn_front_failed) with no way off the record short of an
+# uninstall that revokes every credential (R1, hypothesis 9c).
+#
+# VPN55_OVPN_FRONT=no on a re-run is that way off. It is the same answer to
+# the same question, so it needs no new verb — and it is honoured only when
+# the front is NOT on this host: with the engine's ledger present the front
+# is carrying the web server's vhosts on the loopback port, and forgetting
+# that is not a way to take it down (vpn55.sh --front443-remove is); with the
+# front's traces present and no ledger, the same verb comes first. The record
+# is dropped only once the port check has passed: 443 held by nginx makes the
+# offer again, and declined it refuses with the record intact; held by
+# anything else it refuses as it always did. A refusal un-records nothing.
+_ovpn_front_drop_wanted() {
+    _ovpn_front_on || return 1
+    [[ "${VPN55_OVPN_FRONT:-}" == "no" ]] || return 1
+    return 0
+}
+
+# Whether the drop may go ahead on this host. Prints why not.
+_ovpn_front_drop_allowed() {
+    local port
+    port="$(_ovpn_port)"
+    _ovpn_front_lib_loaded || {
+        error "VPN55_OVPN_FRONT=no asks to take this service off the shared front, but"
+        error "lib/core_front443.sh is not loaded, so whether the front is on this host cannot"
+        error "be told. Nothing was changed."
+        return 1
+    }
+    if front443_installed; then
+        error "VPN55_OVPN_FRONT=no asks to take this service off the shared front, but the front"
+        error "is installed on this host: nginx's sites are on the loopback web port with the"
+        error "front in front of them. Forgetting that here would not take it down. To stop"
+        error "sharing port ${port}: ${VPN55_FRONT443_REMOVE_CMD:-vpn55.sh --front443-remove} puts"
+        error "the sites back on ${port}, after which this service can bind it only if nginx no"
+        error "longer wants it — re-run then with VPN55_OVPN_FRONT=no. Nothing was changed."
+        return 1
+    fi
+    if declare -F front443_traces_present >/dev/null 2>&1 && front443_traces_present; then
+        error "VPN55_OVPN_FRONT=no asks to take this service off the shared front, but this host"
+        error "still carries the front's files with no ledger for them. Take those down first:"
+        error "    ${VPN55_FRONT443_REMOVE_CMD:-vpn55.sh --front443-remove}"
+        error "then re-run. Nothing was changed."
+        return 1
+    fi
+    return 0
+}
+
+_ovpn_front_drop() {
+    _ovpn_set front "" || return 1
+    info "The shared front is no longer recorded for this service (VPN55_OVPN_FRONT=no):"
+    info "it binds $(_ovpn_transport)/$(_ovpn_port) itself from here on, and the firewall rule for it is VPN55's."
+    return 0
+}
+
 # ─── Settings bootstrap ───────────────────────────────────────────────────────
 # Settled once, then never asked again. Precedence is: an existing stored value,
 # then an environment override, then the interactive prompt, then the default.
@@ -781,7 +1150,7 @@ _ovpn_settings_bootstrap() {
     local endpoint
     endpoint="$(fs_conf_default "$VPN55_OVPN_CONF" endpoint "")"
     if [[ -z "$endpoint" ]]; then
-        endpoint="${VPN55_OVPN_ENDPOINT:-}"
+        endpoint="${VPN55_OVPN_ENDPOINT:-${VPN55_ENDPOINT:-}}"
     fi
     if [[ -z "$endpoint" ]]; then
         local detected="" rc=0
@@ -821,7 +1190,7 @@ _ovpn_settings_bootstrap() {
     local dns_choice dns_custom dns
     dns_choice="$(fs_conf_default "$VPN55_OVPN_CONF" dns_choice "")"
     if [[ -z "$dns_choice" ]]; then
-        dns_choice="${VPN55_OVPN_DNS_CHOICE:-system}"
+        dns_choice="${VPN55_OVPN_DNS_CHOICE:-${VPN55_DNS_CHOICE:-system}}"
         net_resolvers_explain
         ask_value dns_choice "DNS (system/cloudflare/quad9/custom)" "$dns_choice" || return 1
         if [[ "$dns_choice" == "custom" ]]; then
@@ -1020,6 +1389,18 @@ _ovpn_render_conf() {
     [[ -n "$transport" && -n "$port" ]] || { error "no transport recorded"; return 1; }
     [[ -n "$tls_mode" ]] || { error "no control-channel key recorded"; return 1; }
 
+    # Design note 7. Behind the front the daemon binds loopback on its own port
+    # and nginx carries the public 443 to it. `port` (what the client dials) is
+    # untouched — the client file is rendered from it and must not change.
+    local front="" local_port=""
+    if _ovpn_front_on; then
+        front="nginx"
+        local_port="$(_ovpn_local_port)"
+        [[ "$transport" == "tcp" ]] || { error "the shared front is recorded on a ${transport} transport; it carries tcp only"; return 1; }
+        [[ "$local_port" =~ ^[0-9]+$ ]] \
+            || { error "the shared front is recorded but no loopback port is"; return 1; }
+    fi
+
     local ccd
     ccd="$(_ovpn_ccd_dir)"
 
@@ -1034,9 +1415,28 @@ _ovpn_render_conf() {
 # There are no firewall rules in this file either. The open port, the forward
 # path and the NAT rule are applied through VPN55's firewall ledger under the
 # tag '${VPN55_OVPN_TAG}', so an uninstall reverses exactly what was added.
+CONF
+
+    if [[ "$front" == "nginx" ]]; then
+        cat <<CONF
+
+# Port ${port} is SHARED with nginx: its stream front holds the public address
+# and forwards every non-TLS connection here. So this daemon binds loopback
+# only, every peer arrives from 127.0.0.1, and the firewall opens nothing for
+# it — ${port} is the web server's rule. Clients still dial ${port}.
+local 127.0.0.1
+port ${local_port}
+proto tcp
+CONF
+    else
+        cat <<CONF
 
 port ${port}
 proto ${transport}
+CONF
+    fi
+
+    cat <<'CONF'
 dev tun
 topology subnet
 CONF
@@ -1242,21 +1642,62 @@ vpn_openvpn_install() {
 
     # Before anything is written. A port conflict discovered after the config is
     # in place is a config in place for a daemon that cannot start.
-    local holder
+    #
+    # Design note 7: when the holder is nginx and the port is 443, the conflict
+    # becomes an OFFER (once — a recorded `front=nginx` is never re-asked), and
+    # with the front recorded the port being held by nginx is the arrangement
+    # rather than a conflict. Any other holder gets the refusal as before.
+    local holder drop_front=0 accepted=0
+    if _ovpn_front_drop_wanted; then
+        _ovpn_front_drop_allowed || return 1
+        drop_front=1
+    fi
     if holder="$(_ovpn_port_conflict "$transport" "$port")"; then
-        error "${transport}/${port} is already in use on this host, by ${holder}."
-        if [[ "$port" == "443" ]]; then
-            error "Port 443 is the one every web server holds, and that is the cost of"
-            error "the transport that gets through filtered networks — the two cannot"
-            error "share it."
-            error "Either move the web server, or set VPN55_OVPN_PORT to a free port and"
-            error "re-run. Note that VPN55's own admin panel does NOT need this port:"
-            error "it binds to a tunnel address and takes its certificate over DNS."
+        if _ovpn_front_on && [[ "$drop_front" -eq 0 ]]; then
+            if _ovpn_front_lib_loaded && front443_holder_is_nginx tcp "$port"; then
+                debug "${transport}/${port} is held by nginx, which fronts this service"
+            else
+                error "${transport}/${port} is held by ${holder}, and this service is recorded as"
+                error "sharing it through nginx's front. The front cannot be re-applied while"
+                error "something else holds the port. Put nginx back on ${port} and re-run, or"
+                error "remove the service. Nothing was installed or changed."
+                return 1
+            fi
+        elif _ovpn_front_offer "$holder" "$transport" "$port"; then
+            accepted=1
         else
-            error "Set VPN55_OVPN_PORT to a free port and re-run."
+            _ovpn_port_refuse "$holder" "$transport" "$port"
+            if [[ "$drop_front" -eq 1 ]]; then
+                error "VPN55_OVPN_FRONT=no asked to take this service off the shared front, but off it"
+                error "the service could not bind ${transport}/${port}. The record is unchanged."
+            fi
+            return 1
         fi
-        error "Nothing was installed or changed."
-        return 1
+    fi
+    # The offer just made may have been accepted at the prompt, in which case
+    # the record is `nginx` again and stays. Otherwise the port is free, or
+    # ours, and the record goes.
+    if [[ "$drop_front" -eq 1 ]]; then
+        if [[ "$accepted" -eq 1 ]]; then
+            info "The front stays recorded: it was accepted again at the prompt."
+        else
+            _ovpn_front_drop || return 1
+        fi
+    fi
+
+    # Behind the front the daemon binds a loopback port of its own, and that one
+    # has to be free too — read on every run so an operator can move it with
+    # VPN55_OVPN_LOCAL_PORT before the front is installed against it.
+    local local_port=""
+    if _ovpn_front_on; then
+        _ovpn_local_port_settle || return 1
+        local_port="$(_ovpn_local_port)"
+        if holder="$(_ovpn_port_conflict tcp "$local_port")"; then
+            error "tcp/${local_port} is already in use on this host, by ${holder}, and that is the"
+            error "loopback port this service binds behind the shared front."
+            error "Set VPN55_OVPN_LOCAL_PORT to a free port and re-run. Nothing was installed or changed."
+            return 1
+        fi
     fi
 
     # Claim before anything is written. Idempotent for the same owner and slot,
@@ -1281,7 +1722,20 @@ vpn_openvpn_install() {
     fi
     fs_ensure_dir "$(_ovpn_ccd_dir)" 0755 || return 1
 
-    _ovpn_selinux_port_ensure "$transport" "$port" || return 1
+    # SELinux labels the port the DAEMON binds, never 443 when it is fronted:
+    # 443 carries the web label and the daemon does not bind it, so labelling it
+    # would be the §6C.6 trap in reverse. The daemon's own default loopback port
+    # already carries its type on every distribution in the matrix and is left
+    # alone; a port the operator chose instead gets the usual check.
+    if _ovpn_front_on; then
+        if [[ "$local_port" != "$VPN55_OVPN_LOCAL_PORT_DEFAULT" ]]; then
+            _ovpn_selinux_port_ensure tcp "$local_port" || return 1
+        else
+            debug "selinux: tcp/${local_port} is the daemon's own default and carries its label already"
+        fi
+    else
+        _ovpn_selinux_port_ensure "$transport" "$port" || return 1
+    fi
 
     # Rendered into a variable first, for two reasons. fs_write_if_changed must
     # not sit on the right of a pipe or the "did it change" answer is lost in a
@@ -1304,7 +1758,17 @@ vpn_openvpn_install() {
     local subnet
     subnet="$(_ovpn_subnet)" || return 1
 
-    net_fw_open_port    "$VPN55_OVPN_TAG" "$transport" "$port" || return 1
+    # With the front on VPN55 opens NOTHING for this protocol. Port 443 is
+    # reached through the web server's own rule, which existed before VPN55 and
+    # must outlive it; recording it in the ledger would make _uninstall close
+    # the operator's website (core_net.sh, the srcport probe, says why a
+    # pre-existing world-open rule is never recorded as ours). The daemon's
+    # loopback port needs no rule: nothing but nginx on this host reaches it.
+    if _ovpn_front_on; then
+        debug "fw: ${transport}/${port} is the web server's rule; nothing opened for the front"
+    else
+        net_fw_open_port "$VPN55_OVPN_TAG" "$transport" "$port" || return 1
+    fi
     net_fw_allow_subnet "$VPN55_OVPN_TAG" "$subnet" || return 1
     net_fw_masquerade   "$VPN55_OVPN_TAG" "$subnet" || return 1
 
@@ -1325,9 +1789,25 @@ vpn_openvpn_install() {
         distro_service_restart "$unit" || return 1
     fi
 
+    # The front goes on LAST, once the daemon holds its loopback port, so it
+    # never points at a dead one. Its failure takes the adapter back with it —
+    # see _ovpn_front_failed for the one case where it deliberately does not.
+    if _ovpn_front_on; then
+        if ! _ovpn_front_apply; then
+            _ovpn_front_failed
+            return 1
+        fi
+    fi
+
     _ovpn_spool_sweep || true
 
-    success "OpenVPN is up on ${subnet} — ${transport}/${port}, endpoint $(_ovpn_endpoint)."
+    if _ovpn_front_on; then
+        success "OpenVPN is up on ${subnet} — ${transport}/${port} shared through nginx (daemon on 127.0.0.1:${local_port}), endpoint $(_ovpn_endpoint)."
+        info "Every peer of this service is seen as 127.0.0.1; nginx is now in the tunnel's"
+        info "availability path. The client file is unchanged: clients dial ${port}."
+    else
+        success "OpenVPN is up on ${subnet} — ${transport}/${port}, endpoint $(_ovpn_endpoint)."
+    fi
     info "Control channel: tls-$(_ovpn_tls_mode) (always on). Client key custody: server-generated."
     info "DNS: $(_ovpn_dns)."
     if [[ "$transport" == "tcp" ]]; then
@@ -1358,6 +1838,31 @@ vpn_openvpn_uninstall() {
     port="$(_ovpn_port)"
 
     section "Removing OpenVPN"
+
+    # The front first, and verified gone before anything else moves. It is the
+    # one piece of this install that lives in files VPN55 does not own, and its
+    # removal is the two-reload dance the engine documents; if that does not
+    # complete, the engine keeps its ledger for a re-run — so this uninstall
+    # stops here too, with settings.conf (and the `front` record that says the
+    # front is ours) still in place for that re-run. Going on would delete the
+    # only record that this service is what the front was carrying.
+    if _ovpn_front_on; then
+        _ovpn_front_lib_loaded || {
+            error "This service shares port ${port} through nginx's front, and lib/core_front443.sh"
+            error "is not loaded, so the front cannot be taken down. Nothing was removed."
+            return 1
+        }
+        front443_remove || {
+            error "The shared front could not be removed cleanly; the service is left in place."
+            error "Deal with the messages above and run the removal again."
+            return 1
+        }
+        if front443_installed; then
+            error "The front's ledger is still present after removal; the service is left in"
+            error "place. Run the removal again once the messages above are dealt with."
+            return 1
+        fi
+    fi
 
     # Registry first, while the credential index is still readable. A credential
     # left marked active for a protocol that no longer exists is the "user exists
@@ -1397,11 +1902,18 @@ vpn_openvpn_uninstall() {
         distro_daemon_reload || true
     fi
 
+    # The ledger never held tcp/443 for a fronted install (nothing was opened for
+    # it), so revoking the tag leaves the web server's rule exactly as found.
     net_fw_revoke_tag "$VPN55_OVPN_TAG" || warn "some firewall rules could not be removed — check ${VPN55_FW_STATE}"
     net_pool_release  "$VPN55_OVPN_TAG" || warn "could not release the pool claim"
 
-    if [[ -n "$transport" && -n "$port" ]]; then
-        _ovpn_selinux_port_remove "$transport" "$port" || true
+    # The label, if VPN55 added one, is on the port the daemon BOUND — the
+    # loopback port behind the front, the public one otherwise. 443 was never
+    # labelled and is never unlabelled.
+    local bind_port
+    bind_port="$(_ovpn_bind_port)"
+    if [[ -n "$transport" && -n "$bind_port" ]]; then
+        _ovpn_selinux_port_remove "$transport" "$bind_port" || true
     fi
 
     pki_hook_remove "$VPN55_OVPN_HOOK" || true
@@ -2467,8 +2979,8 @@ _ovpn_notes() {
     local _extra
     _extra="$(net_endpoints_count)"
     if [[ "$_extra" != "0" ]]; then
-        printf 'note	%s	info	%s
-' "$tag" \n            "Client profiles issued from now on list ${_extra} address(es) beyond this host's own, in random order. A client moves to the next one by itself when the first stops answering — no second file and nothing for the user to do. Profiles issued earlier are unchanged and cannot be rebuilt."
+        printf 'note\t%s\tinfo\t%s\n' "$tag" \
+            "Client profiles issued from now on list ${_extra} address(es) beyond this host's own, in random order. A client moves to the next one by itself when the first stops answering — no second file and nothing for the user to do. Profiles issued earlier are unchanged and cannot be rebuilt."
     fi
 
     transport="$(_ovpn_transport)"
@@ -2479,6 +2991,7 @@ _ovpn_notes() {
         printf 'note\t%s\twarn\t%s\n' "$tag" \
             "This service runs on UDP. The control channel is encrypted, so there is no handshake signature to match — but a network that drops UDP outright blocks it anyway. If your users are on a filtered network, the TCP mode is the one that gets through."
     fi
+    _ovpn_front_notes || true
 
     if ! _ovpn_version_ge 2 5; then
         printf 'note\t%s\twarn\t%s\n' "$tag" \
@@ -2526,6 +3039,58 @@ _ovpn_notes() {
         printf 'note\t%s\tinfo\t%s\n' "$tag" \
             "${held} client profile(s) are still retrievable, which means this server is still holding those private keys. Each is erased ${VPN55_OVPN_KEY_TTL_HOURS}h after it was issued."
     fi
+    return 0
+}
+
+# The shared front's facts (design note 7), as note records — nothing here is
+# per-credential and none of it is the service being up. Two kinds:
+#
+#   · one `info`, always while the front is on: peers are reported as
+#     127.0.0.1. A reader that sees loopback in the endpoint column has to be
+#     told it is not a bug, and told by the adapter, because nothing else knows.
+#   · one per broken invariant from front443_check, each naming its repair.
+#     §6C.8: drift is the live risk — certbot writes a fresh `listen 443` into
+#     a new vhost, a package upgrade replaces nginx.conf, a pasted vhost — and
+#     none of it fails loudly, because the reload keeps the old workers serving.
+#     A front that has silently stopped being one is an outage on the website
+#     AND the tunnel at once, so every invariant except the daemon's own port
+#     is `crit`. The daemon's port is `warn` while the service is stopped
+#     (the service record already says so) and `crit` while it claims to run.
+#
+# The filtering LEVEL is deliberately not touched by any of this. The front is
+# a way of sharing a port, not probe resistance, and _capabilities keys the
+# level on transport and port alone.
+_ovpn_front_notes() {
+    local tag="$VPN55_OVPN_TAG"
+    _ovpn_front_on || return 0
+
+    printf 'note\t%s\tinfo\t%s\n' "$tag" \
+        "Port $(_ovpn_port) is shared with the web server through nginx's front, so every peer of this service arrives from 127.0.0.1 — the endpoint column shows loopback, not the client's address. Clients still dial $(_ovpn_port); the daemon itself listens on 127.0.0.1:$(_ovpn_local_port)."
+
+    if ! _ovpn_front_lib_loaded; then
+        printf 'note\t%s\twarn\t%s\n' "$tag" \
+            "The shared front's state could not be checked from here: the library that manages it is not loaded in this process."
+        return 0
+    fi
+
+    local out rc=0 rtype rwhich rdetail rrepair sev running=0
+    out="$(front443_check)" || rc=$?
+    case "$rc" in
+        0) return 0 ;;
+        2)
+            printf 'note\t%s\tcrit\t%s\n' "$tag" \
+                "This service is recorded as sharing port $(_ovpn_port) through nginx's front, but no front is installed — nothing reaches the daemon on its loopback port, so every client is refused. Re-run the install to put the front back, or re-run it with VPN55_OVPN_FRONT=no if this host is not to share the port."
+            return 0 ;;
+    esac
+
+    _ovpn_active && running=1
+    while IFS=$'\t' read -r rtype rwhich rdetail rrepair; do
+        [[ "$rtype" == "broken" ]] || continue
+        sev="crit"
+        if [[ "$rwhich" == "backend" && "$running" -eq 0 ]]; then sev="warn"; fi
+        printf 'note\t%s\t%s\t%s\n' "$tag" "$sev" \
+            "The shared front on port $(_ovpn_port) is broken (${rwhich}): ${rdetail}. Until it is repaired the website and this tunnel are both affected. Repair: ${rrepair}."
+    done <<< "$out"
     return 0
 }
 

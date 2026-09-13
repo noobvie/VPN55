@@ -44,6 +44,9 @@
 # keeps handing out fresh bytes inside the subshell. This is not a footnote:
 # writing it the other way is what proved that loop needed the bound it now has.
 
+# The boundary table passes swap's output UNQUOTED on purpose: it is nine
+# space-separated parameters and the validator takes nine arguments.
+# shellcheck disable=SC2046
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -74,7 +77,7 @@ _pool_drop() {
 trap _pool_drop EXIT
 
 _pool_make() {
-    POOL="$(mktemp "${TMPDIR:-/tmp}/awg-pool.XXXXXX")" || return 1
+    POOL="$(mktemp "${TMPDIR:-/tmp}/params-pool.XXXXXX")" || return 1
     # 13 draws x 4 bytes per set, plus slack for the two redraw loops.
     head -c $(( RUNS * 160 + 65536 )) /dev/urandom \
         | od -An -tx1 -v | tr -d ' \n' > "$POOL" || return 1
@@ -144,7 +147,7 @@ chk reject "S1 + 56 == S2      equal packet lengths" 6 12 200 100 156 11 12 13 1
 chk accept "S1 + 56 == S2 - 1"                       6 12 200 100 157 11 12 13 14
 chk accept "S1 + 56 == S2 + 1"                       6 12 200 100 155 11 12 13 14
 
-chk reject "H1 = 4             1-4 are WireGuard's"  $(swap 5 4)
+chk reject "H1 = 4             1-4 are the base protocol's"  $(swap 5 4)
 chk accept "H1 = 5"                                  $(swap 5 5)
 chk accept "H1 = 4294967295    the field is uint32"  $(swap 5 4294967295)
 chk reject "H1 = 4294967296"                         $(swap 5 4294967296)

@@ -559,6 +559,27 @@ net_pool_free    wireguard "$cred_id"
 net_pool_release wireguard            # _uninstall: drops the claim and every lease
 ```
 
+**Port 443 is bound by address on this host, never bare.** The panel binds the tunnel
+address; the shared front (Phase 10, `docs/security-model.md` §6C.8 — built 2026-09-11,
+reviewed, **not VPS-run**; `lib/core_front443.sh`, protocol-neutral) binds the public
+address and moves the operator's vhosts to `127.0.0.1:8443` with PROXY protocol (not
+the design draft's 4443: 8443 already carries `http_port_t`, 4443 carries nothing, so
+nginx on 4443 fails to bind under SELinux enforcing with a message only in the audit
+log). Non-TLS bytes go through a strip hop on `127.0.0.1:8008` to the service's own
+loopback port. A wildcard `listen 443` anywhere in nginx collides with one of them
+inside the same process — and `nginx -t` will not say so: it parses, it never binds,
+and `systemctl reload` returns before the master has bound anything, so every bind is
+verified afterwards from `ss` **by address**. It routes on *is this TLS*, never on SNI,
+and is offered only when the port's holder is nginx. On an SELinux host it sets
+`httpd_can_network_connect` (recorded first, reversed on remove — nginx's connect to a
+non-http-labelled loopback port is denied otherwise); the cost is that nginx workers
+may then connect anywhere, and it is stated to the operator. Every touched `listen`
+line carries a `# vpn55-front443: was …` marker; remove restores by marker, never from
+a copy. `vpn55.sh --front443-check` / `--front443-repair` are the drift guard, and
+`--front443-remove` takes the front down (from the marked files alone when the ledger
+is gone), all root at the console only — the panel shows the adapter's `note` and gains
+no repair path.
+
 **Adopt one firewall abstraction** (ufw / firewalld / raw nft) and route every rule
 through it. Mixing two is how a rule survives an uninstall.
 

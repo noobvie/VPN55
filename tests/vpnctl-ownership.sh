@@ -35,6 +35,7 @@ VPNCTL="${HERE}/../helper/vpnctl"
 
 E_OK=0; E_USAGE=2; E_ARG=3; E_PRIV=4; E_TARGET=5; E_FAILED=6
 export E_OK E_USAGE E_ARG E_PRIV E_TARGET E_FAILED
+# shellcheck disable=SC2034  # read by the helper functions lifted below
 VPNCTL_TARGET=""
 
 ctl_fail()   { printf 'FAIL(%s) %s\n' "$1" "$2"; exit "$1"; }
@@ -111,7 +112,7 @@ expect "an invalid user name is rejected"                "$E_ARG"    nam-1 'user
 # non-empty made a bare `user=` skip the check and revoke.
 expect "an empty user= is not a wildcard"                "$E_ARG"    nam-1 'user='
 expect "two user= are refused"                           "$E_USAGE"  nam-1 user=nam user=linh
-expect "two tags are refused"                            "$E_USAGE"  nam-1 wg ovpn
+expect "two tags are refused"                            "$E_USAGE"  nam-1 wg alpha
 expect "a fourth argument is refused"                    "$E_USAGE"  nam-1 wg user=nam extra
 expect "an invalid credential id is rejected"            "$E_ARG"    'a b' user=nam
 

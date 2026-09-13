@@ -12,9 +12,11 @@ This is the companion to `docs/distribution.md`, and the split between them matt
 Those fail independently. A user can have a perfect copy of `vpn55.sh` and a working
 server, and still have every packet dropped. Solving one does nothing for the other.
 
-Last revised: 2026-09-02 — §4 (endpoints, as built), §5 (the admission now reaches
-the terminal), §8 (the Nostr decision) and the §10 checklists, after a verification
-pass over the adapters against this document. Before that: 2026-08-29 (Phase 2).
+Last revised: 2026-09-11 — Phase 10 (shared 443) added to §5, §6 and §10: designed,
+built and reviewed (S1–S4), not VPS-run; §10's boxes stay unticked for S5. Before
+that: 2026-09-02 — §4 (endpoints, as built), §5 (the admission now reaches the
+terminal), §8 (the Nostr decision) and the §10 checklists, after a
+verification pass over the adapters against this document; 2026-08-29 (Phase 2).
 
 ---
 
@@ -195,6 +197,10 @@ because the table's shorthand hides them:
   badly. Two host collisions are checked before anything is written: the port itself,
   which every web server already holds, and the SELinux port label, which cannot be
   taken from the web server without breaking it. Details in §6C.6 of the security model.
+  ⚠ That refusal hits the *normal* operator — a VPS already serving a website — and
+  VPN55's own portal is such a website. The shared-443 front that replaces the
+  refusal when the holder is nginx is designed in §6C.8, built and reviewed (not yet
+  VPS-run), and is **Phase 10** below.
 
 Rung 0 of the ladder below is therefore complete on this protocol.
 
@@ -241,7 +247,7 @@ one before it.
 
 | Rung | Trigger | Response |
 |---|---|---|
-| **0** | Baseline | DoH, multi-endpoint configs, OpenVPN TCP/443 + `tls-crypt` on by default |
+| **0** | Baseline | DoH, multi-endpoint configs, OpenVPN TCP/443 + `tls-crypt` on by default — and 443 **shared** with the website already on the host, not surrendered to it (security-model §6C.8, built 2026-09-11, not VPS-run) |
 | **1** | WireGuard specifically being blocked | AmneziaWG mode |
 | **2** | TLS-wrapped traffic being blocked by SNI | `wstunnel` / WebSocket wrapping with a plausible SNI |
 | **3** | Active probing appears — a censor connects to the endpoint to test whether it is a proxy | **VLESS + XTLS-Reality**, or **Trojan**. Both answer a probe by serving real traffic from a real site, so the probe learns nothing |
@@ -524,6 +530,31 @@ code.
       only — **decided 2026-09-02: documented, not shipped.** The signed
       statement it was built around ships instead. Reasoning and the work it
       implies are in §8
+
+**Phase 10 — Shared 443** — designed and built 2026-09-11, reviewed as one system (S4),
+**nothing VPS-run** (security-model §6C.8 "As built"). ⚠ Every box below stays
+unticked until the acceptance session (S5) opens a socket: each one is unit-tested
+against a fake host, and a box ticked before a socket was opened is exactly the
+drift this section exists to catch.
+- [ ] When `tcp443` is chosen and the port is held **by nginx**, offer the shared
+      front instead of refusing; refuse exactly as today for any other holder
+- [ ] The front is an nginx `stream` block that routes on `$ssl_preread_protocol`
+      — TLS to the web listener on `127.0.0.1:8443` with PROXY protocol (via a second
+      stream server that strips the header), everything else to OpenVPN on its
+      loopback port. Never an SNI map. (Built with 8443, not the design draft's 4443:
+      8443 already carries `http_port_t`, 4443 carries nothing)
+- [ ] The front binds the **public address**, never the wildcard — the panel's
+      tunnel-address `:443` bind must survive in the same nginx process
+- [ ] Every rewritten `listen` line carries a marker comment; uninstall reverses the
+      tagged lines and never restores a file from a copy
+- [ ] `_status` checks the drift invariants on every read (stream include present,
+      no http listener on the public 443, OpenVPN on its loopback port — and, as
+      built, a fourth read from `ss` by address: no wildcard holds 443) and names the
+      repair in a `note`; `vpn55.sh --front443-check` / `--front443-repair` /
+      `--front443-remove` at the console
+- [ ] Verified on a host: `ssl_preread` declines an OpenVPN first packet at once;
+      the two specific-address binds coexist; certbot on a NEW site is caught by the
+      guard
 
 **Contract review, whenever it next happens**
 - [ ] Confirm a non-peer (inbound/listener-shaped) protocol could implement the adapter

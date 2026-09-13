@@ -166,12 +166,69 @@ screen_panel() {
     info "         trusts the panel, so a panel compromise costs exactly those"
     info "         seven verbs rather than root."
     info ""
-    info "Deploying it is manual for now: panel/README.md and deploy/. Create the"
-    info "first administrator at the console, as root, before starting it:"
+    info "It is reachable OVER THE TUNNEL ONLY. The vhost listens on this host's"
+    info "address on the VPN, never on a bare port, so connect with one of your own"
+    info "client configurations first — a panel with a public port would be a login"
+    info "form on the open internet, which is the one thing this design refuses."
     info ""
-    info "  node /usr/local/lib/vpn55/panel/scripts/admin.js add <name>"
+
+    if pnl_installed; then
+        ui_kv "State" "deployed"
+        ui_kv "URL" "$(panel_url 2>/dev/null || printf 'no tunnel address yet')"
+        ui_kv "Service" "$(distro_service_is_active "$VPN55_PANEL_UNIT" && printf 'running' || printf 'not running')"
+        info ""
+        info "Add or replace an administrator at this console, as root:"
+        info "  node ${VPN55_PANEL_SRC}/scripts/admin.js add    <name>"
+        info "  node ${VPN55_PANEL_SRC}/scripts/admin.js passwd <name>"
+        info "  node ${VPN55_PANEL_SRC}/scripts/admin.js totp   <name>   # second factor"
+        info ""
+
+        # The self-serve portal is the panel's second application, on the
+        # PUBLIC address — the one part of VPN55 meant to be reachable. Its
+        # vhost is the deploy/nginx/vpn55-portal.conf bootstrap, run from
+        # lib/panel_deploy.sh, and it is front-aware: on a host sharing 443
+        # through nginx's front it is written behind the front, not on 443.
+        if pnl_portal_installed; then
+            ui_kv "Portal" "https://$(pnl_portal_host)/"
+            info "Nothing was installed or changed."
+            return 0
+        fi
+        ui_kv "Portal" "not deployed"
+        info ""
+        info "The self-serve portal is where your users fetch their own configurations"
+        info "and rotate their own credentials, with an access code you hand them. It"
+        info "needs a DNS name pointing at this host; the certificate comes from Let's"
+        info "Encrypt over port 80, and the vhost is written for whatever holds 443 here."
+        if ! ask_proceed "Deploy the portal's vhost now"; then
+            info "Nothing was installed or changed."
+            return 0
+        fi
+        local host="${VPN55_PORTAL_HOST:-}"
+        ask_value host "Hostname for the portal (e.g. vpn.example.com)" "$host" || return 1
+        portal_install "$host" || return 1
+        return 0
+    fi
+
+    ui_kv "State" "not deployed"
     info ""
-    info "Nothing was installed or changed."
+    if ! ask_proceed "Deploy the panel now"; then
+        info "Nothing was installed or changed."
+        return 0
+    fi
+
+    local admin="$VPN55_SETUP_ADMIN"
+    ask_value admin "Administrator name" "$admin" || return 1
+    [[ -n "$admin" ]] || { error "The panel needs an administrator name."; return 1; }
+
+    panel_install "$admin" || return 1
+
+    ui_rule
+    ui_kv "URL" "$(panel_url 2>/dev/null || printf 'no tunnel address yet')"
+    ui_kv "Administrator" "$admin"
+    if [[ -n "$VPN55_PANEL_ADMIN_PASS" ]]; then
+        ui_kv "Password" "$VPN55_PANEL_ADMIN_PASS"
+        warn "Shown once and not recoverable — this host keeps only a hash."
+    fi
     return 0
 }
 

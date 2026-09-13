@@ -566,15 +566,42 @@ _ipsec_unlink_creds() {
     return 0
 }
 
+# ⚠ The daemon's own words are CAPTURED and printed, never discarded.
+#
+# This used to be `>/dev/null 2>&1 || { error "the daemon rejected the new
+# configuration"; return 1; }` — nine words that name the symptom and destroy
+# the only evidence of the cause. swanctl says which section it could not parse,
+# which file it could not open and why; an operator who is told only that
+# something was rejected has nothing to act on and no way to get it back, since
+# re-running the installer takes the same branch and prints the same sentence.
+#
+# The first suspect, when this does fire: the credential symlinks above point
+# into the PKI directory, which is 0700 root. They resolve while the daemon runs
+# as root and stop resolving the moment it does not — and a distribution that
+# drops charon's privileges produces exactly this, on a host where every file is
+# present and correct.
 _ipsec_reload() {
+    local out rc=0
     _ipsec_active || return 0
-    swanctl --load-all >/dev/null 2>&1 || { error "the daemon rejected the new configuration"; return 1; }
+    out="$(swanctl --load-all 2>&1)" || rc=$?
+    if [[ "$rc" -ne 0 ]]; then
+        error "The daemon rejected the new configuration. It said:"
+        printf '%s\n' "$out" | sed 's/^/    /' >&2
+        return 1
+    fi
     return 0
 }
 
 _ipsec_reload_creds() {
+    local out rc=0
     _ipsec_active || return 0
-    swanctl --load-creds >/dev/null 2>&1
+    out="$(swanctl --load-creds 2>&1)" || rc=$?
+    if [[ "$rc" -ne 0 ]]; then
+        warn "The daemon would not reload its credentials. It said:"
+        printf '%s\n' "$out" | sed 's/^/    /' >&2
+        return 1
+    fi
+    return 0
 }
 
 # The hook core_pki runs after every revocation-list refresh. It is a standalone
@@ -658,7 +685,7 @@ _ipsec_settings_bootstrap() {
     local endpoint
     endpoint="$(fs_conf_default "$VPN55_IPSEC_CONF" endpoint "")"
     if [[ -z "$endpoint" ]]; then
-        endpoint="${VPN55_IPSEC_ENDPOINT:-}"
+        endpoint="${VPN55_IPSEC_ENDPOINT:-${VPN55_ENDPOINT:-}}"
     fi
     if [[ -z "$endpoint" ]]; then
         local detected="" rc=0
@@ -708,7 +735,7 @@ _ipsec_settings_bootstrap() {
     local dns_choice dns_custom dns
     dns_choice="$(fs_conf_default "$VPN55_IPSEC_CONF" dns_choice "")"
     if [[ -z "$dns_choice" ]]; then
-        dns_choice="${VPN55_IPSEC_DNS_CHOICE:-system}"
+        dns_choice="${VPN55_IPSEC_DNS_CHOICE:-${VPN55_DNS_CHOICE:-system}}"
         net_resolvers_explain
         ask_value dns_choice "DNS (system/cloudflare/quad9/custom)" "$dns_choice" || return 1
         if [[ "$dns_choice" == "custom" ]]; then

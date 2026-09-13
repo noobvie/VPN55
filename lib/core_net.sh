@@ -484,7 +484,7 @@ net_endpoints_explain() {
     info "    outside, which this project does not do."
     info ""
     info "A second host must also answer with this server's identity — the same"
-    info "certificate authority, and for WireGuard the same server key and the"
+    info "certificate authority, and for a keypair protocol the same server key and the"
     info "same obfuscation parameters. Sharing that between hosts is not built"
     info "yet, so today this is for the several addresses of ONE host."
     return 0
@@ -894,6 +894,22 @@ _net_fw_preexists() {
             _fwp_c="$a" awk '/ALLOW FWD/ && index($0, ENVIRON["_fwp_c"]) { hit = 1 } END { exit !hit }' \
                 <<< "$out" && return 0
             return 1 ;;
+        ufw:srcport)
+            # `b` is "<transport>:<port>", so the rule ufw prints as
+            #     443/tcp   ALLOW   10.8.0.0/24
+            # is matched on BOTH halves. Matching the port alone would read a
+            # world-open 443 as this rule and record it as pre-existing, which
+            # would then leave the tunnel unable to reach the panel with no rule
+            # of ours to blame.
+            local out srcp_rule srcp_from
+            out="$(ufw status 2>/dev/null || true)"
+            [[ -n "$out" ]] || return 2
+            srcp_rule="${b#*:}/${b%%:*}"
+            srcp_from="$a"
+            _fwp_r="$srcp_rule" _fwp_c="$srcp_from" awk '
+                $1 == ENVIRON["_fwp_r"] && index($0, ENVIRON["_fwp_c"]) { hit = 1 }
+                END { exit !hit }' <<< "$out" && return 0
+            return 1 ;;
         ufw:masquerade)
             # Always "absent", and that is not laziness.
             #
@@ -920,6 +936,11 @@ _net_fw_preexists() {
             _net_fw_query firewall-cmd --permanent --query-port="${b}/${a}" ;;
         firewalld:subnet)
             _net_fw_query firewall-cmd --permanent --zone=trusted --query-source="$a" ;;
+        firewalld:srcport)
+            # A rich rule, because firewalld's --add-port has no source. Quoted
+            # exactly as it will be added, or the query never matches its own
+            # rule and every run records it afresh.
+            _net_fw_query firewall-cmd --permanent --query-rich-rule="rule family=\"ipv4\" source address=\"${a}\" port port=\"${b#*:}\" protocol=\"${b%%:*}\" accept" ;;
         firewalld:masquerade)
             _net_fw_query firewall-cmd --permanent --query-masquerade ;;
     esac
@@ -1025,6 +1046,62 @@ net_fw_open_port() {
 
     net_fw_commit || return 1
     debug "fw: opened ${port}/${transport} for tag ${tag} via ${backend}"
+    return 0
+}
+
+# net_fw_open_port_from <tag> <cidr> <tcp|udp> <port>
+#
+# Open a port on THIS HOST to one source range only — the INPUT path, not the
+# forward path net_fw_allow_subnet covers.
+#
+# ⚠ The two are not interchangeable and the difference is invisible until
+# something breaks. net_fw_allow_subnet permits traffic ROUTED THROUGH this host
+# (`ufw route allow`, the FORWARD chain); a service listening ON this host is
+# reached through INPUT, which that verb never touches. So a tunnel can carry a
+# client's traffic to the internet perfectly while every connection to a service
+# on the tunnel gateway itself is dropped — and the firewall's own status output
+# looks complete, because the subnet is right there in it.
+#
+# The source scope is the point rather than a refinement. `net_fw_open_port
+# <tag> tcp 443` would open the port on every interface including the public
+# one, which for a service deliberately bound to a tunnel address is a rule that
+# grants nothing today and quietly pre-opens the port for whatever binds it
+# next.
+net_fw_open_port_from() {
+    local tag="${1:-}" cidr="${2:-}" transport="${3:-}" port="${4:-}"
+    [[ -n "$tag" && -n "$cidr" && -n "$transport" && -n "$port" ]] \
+        || { error "net_fw_open_port_from <tag> <cidr> <tcp|udp> <port>"; return 1; }
+    case "$transport" in tcp|udp) ;; *) error "transport must be tcp or udp"; return 1 ;; esac
+
+    local backend verdict
+    backend="$(net_fw_backend)" || return 1
+    verdict="$(_net_fw_claim "$backend" "$tag" "srcport" "$cidr" "${transport}:${port}")" || return 1
+
+    if [[ "$verdict" == "pre" ]]; then
+        debug "fw: ${port}/${transport} from ${cidr} was already open before VPN55 — left as found"
+        return 0
+    fi
+
+    case "$backend" in
+        ufw)
+            ufw allow from "$cidr" to any port "$port" proto "$transport" comment "vpn55:${tag}" >/dev/null \
+                || { error "ufw could not open ${port}/${transport} from ${cidr}"; return 1; }
+            VPN55_FW_DIRTY=1 ;;
+        firewalld)
+            firewall-cmd --permanent --add-rich-rule="rule family=\"ipv4\" source address=\"${cidr}\" port port=\"${port}\" protocol=\"${transport}\" accept" >/dev/null \
+                || { error "firewalld could not open ${port}/${transport} from ${cidr}"; return 1; }
+            VPN55_FW_DIRTY=1 ;;
+        nftables)
+            _net_nft_tables || return 1
+            local c_in="vpn55:${tag}:srcport:${cidr}:${transport}:${port}"
+            if ! _net_nft_rule_present inet vpn55 input "$c_in"; then
+                nft add rule inet vpn55 input ip saddr "$cidr" "$transport" dport "$port" accept comment "\"${c_in}\""                     || { error "nft could not open ${port}/${transport} from ${cidr}"; return 1; }
+                VPN55_FW_DIRTY=1
+            fi ;;
+    esac
+
+    net_fw_commit || return 1
+    debug "fw: opened ${port}/${transport} from ${cidr} for tag ${tag} via ${backend}"
     return 0
 }
 
@@ -1149,6 +1226,8 @@ net_fw_revoke_tag() {
         case "$backend:$kind" in
             ufw:port)
                 ufw delete allow "${b}/${a}" >/dev/null 2>&1 || true ;;
+            ufw:srcport)
+                ufw delete allow from "$a" to any port "${b#*:}" proto "${b%%:*}" >/dev/null 2>&1 || true ;;
             ufw:subnet)
                 ufw route delete allow from "$a" >/dev/null 2>&1 || true
                 ufw route delete allow to "$a" >/dev/null 2>&1 || true ;;
@@ -1156,6 +1235,8 @@ net_fw_revoke_tag() {
                 _net_ufw_nat_block_remove "$tag" || true ;;
             firewalld:port)
                 firewall-cmd --permanent --remove-port="${b}/${a}" >/dev/null 2>&1 || true ;;
+            firewalld:srcport)
+                firewall-cmd --permanent --remove-rich-rule="rule family=\"ipv4\" source address=\"${a}\" port port=\"${b#*:}\" protocol=\"${b%%:*}\" accept" >/dev/null 2>&1 || true ;;
             firewalld:subnet)
                 firewall-cmd --permanent --zone=trusted --remove-source="$a" >/dev/null 2>&1 || true ;;
             firewalld:masquerade)

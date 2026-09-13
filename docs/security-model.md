@@ -5,7 +5,19 @@ this document rather than the document written to excuse the code. Anything belo
 marked **OPEN** is a decision that has not been made yet; anything marked **DECIDED**
 is binding on every later phase.
 
-Last revised: 2026-08-30 (privileged-path review, after Phase 8).
+Last revised: 2026-09-12 (§6C.8 "What S5 must observe" — the 24 facts about Linux,
+nginx, SELinux and certbot that the three fake-host test suites encode, each with the
+command that settles it on a real host; two of them are readings of the nginx source the
+fakes contradict — the wildcard-collapse rule that breaks reload 1 on the section's own
+opening case, and `nginx -t` binding — and go first. Same day, earlier: the "R1 review" —
+a second, independent review of the shared-443 front against the code, ten hypotheses;
+six defects fixed, one cost stated, three refuted and recorded — and, later the same day,
+the "R1 follow-up": the four items that review left owed are built (a ledger-less remove
+and `--front443-remove`; the ledger in the backup's `reference/` area; `VPN55_OVPN_FRONT=no`
+on a re-run takes a service off the front's record; repair no longer needs the fronted
+service up). Still not VPS-run — S5 is
+acceptance). Before that: 2026-09-11 (§6C.8 designed, built through S1–S3, reviewed as one
+system in S4).
 
 ---
 
@@ -795,7 +807,8 @@ Two host-level consequences are checked before anything is written, because both
 as "the service will not start" with the message buried in a journal:
 
 - **Port 443 is the one every web server already holds.** The installer refuses on a
-  conflict and names the process holding it. VPN55's own admin panel does not compete
+  conflict and names the process holding it. (When that process is nginx, §6C.8
+  designs a shared front instead of a refusal — not yet built.) VPN55's own admin panel does not compete
   for it — it binds to a tunnel address and takes its certificate over DNS.
 - **On an SELinux host a port carries one label.** 443 already carries the web one, and
   relabelling it would repair the tunnel by breaking the operator's site. The installer
@@ -810,6 +823,646 @@ daemon that instruction does not exist and the traffic leaks — which is stated
 status note, exactly as §6A.6 states the same limitation for the other protocol. This one
 sits between the two: the keypair protocol captures IPv6, this captures it on a current
 daemon, and the other certificate protocol cannot capture it at all.
+
+### 6C.8 Port 443 is shared, not surrendered — designed and BUILT 2026-09-11, not VPS-run
+
+§6C.6 refuses the install when 443 is held. That was the right answer for a
+"service will not start" bug, and it is the wrong answer for the operator it hits,
+because the operator it hits is the **normal** one: a VPS that already serves a
+website. And it is not even a third-party problem — VPN55's own self-serve portal
+(§6F) listens on the public 443, so a host running the portal and choosing `tcp443`
+collides with *itself*. A shared-443 story therefore has to exist; the only question
+was its shape.
+
+**What nothing avoids.** One process holds `0.0.0.0:443`. Whatever sits in front, the
+web server's `listen 443` lines move to a loopback port. So "a proxy for OpenVPN" is
+two things — a demultiplexer on 443, and a rewrite of every vhost's listen lines — and
+the rewrite is the invasive half, because it touches configuration VPN55 does not own.
+
+**The demultiplexer is nginx's own `stream` module, not OpenVPN's `port-share`.** Both
+were weighed; the deciding question is *who keeps the real client address*, because
+whoever stands behind the front sees `127.0.0.1`:
+
+| | OpenVPN `port-share` | nginx `stream` + `ssl_preread` |
+|---|---|---|
+| Listens on 443 | OpenVPN | nginx — already on the box; that is the premise |
+| Web keeps client addresses | **no** — `port-share` cannot speak PROXY protocol | yes — `proxy_protocol` to the loopback listener |
+| OpenVPN keeps client addresses | yes | no — every peer arrives from `127.0.0.1` |
+| New dependency | none | the stream module (`libnginx-mod-stream` / `nginx-mod-stream`) |
+| Coupling | the website is down whenever the VPN daemon restarts, and every web byte crosses OpenVPN's single-threaded proxy | independent; a `reload` keeps live tunnels on the old workers |
+
+The web-side row decides it. The products this is expected to sit beside rate-limit on
+`$binary_remote_addr`; behind `port-share` every visitor collapses into one `127.0.0.1`
+bucket sharing one budget, and the site starts answering 429 to everyone at once. On
+the other side VPN55 does nothing with an OpenVPN peer's source address today — no
+`client-connect` script, no per-address throttle in the adapter — so losing it costs
+the least. That cost is still stated (below), not hidden.
+
+**Routing is on protocol, not on name.** The front asks one question of the first
+bytes: *is this a TLS ClientHello?* (`$ssl_preread_protocol` non-empty → the web
+listener; empty → OpenVPN). Not an SNI map: a site the operator adds next month must
+work with no VPN55 edit, and an unknown name landing on OpenVPN instead of a
+certificate error would be a bug that looks like an outage. OpenVPN's first TCP bytes
+are a two-byte length prefix, never `0x16`, so the preread declines at once. The
+pleasant side effect: an active prober that opens TLS is handed the operator's real
+website, which is a better answer than a socket that hangs.
+
+**The front binds the public address, never the wildcard.** The panel (§6F.1,
+`deploy/nginx/vpn55-panel.conf`) listens on `<tunnel-address>:443` so that a
+stranger's packet never arrives. A wildcard `0.0.0.0:443` in the stream block would
+collide with that specific bind inside the same nginx process — Linux refuses a
+specific address on a port a wildcard listener already holds — and the only ways out
+would be to drop the panel's property or to route the panel by SNI through the public
+front, which is the same loss. So the rule the panel already lives by becomes the
+rule for the host: **443 is bound by address, never bare.** The front takes the
+public v4 (and the global v6 where the vhosts had `[::]:443`); the panel keeps the
+tunnel address; the operator's sites move to `127.0.0.1:8443` (the build chose 8443 over the first draft's 4443 — see "As built"). That makes the front
+depend on the public address the way the panel depends on the tunnel one, and it
+inherits the panel's `nginx.service` retry drop-in for the same reason.
+
+**It is an install-time answer, offered only when the holder is nginx.** The
+transport prompt gains nothing new; when `tcp443` is chosen and §6C.6's check finds
+the port held, and the holder is nginx, the install offers the shared front with its
+cost, and refuses exactly as today for any other holder (apache, caddy, haproxy — not
+fronted in this version). The choice is recorded beside `transport` and `port`
+(`front=nginx`, and the loopback port OpenVPN actually binds), because it is written
+into nothing the client receives — `remote <host> 443 tcp` is unchanged — and so it
+is the server's record alone.
+
+**What it costs, stated:**
+
+- Every OpenVPN peer is `127.0.0.1` to the daemon. Status output that shows a peer
+  address shows loopback, and any future per-address control on this protocol
+  (handshake throttling, a ban list) needs a transparent-proxy front, which is
+  iptables/tproxy territory and deliberately out of this version.
+- nginx is now part of the tunnel's availability. A `reload` is graceful; a `restart`
+  or a failed config drops every TCP session.
+- The web server's vhosts carry VPN55's edits. Each rewritten `listen` line is tagged
+  with a trailing marker comment, and uninstall reverses **the tagged lines**, never
+  the files — a file restored from a copy would erase whatever the operator changed
+  in between.
+
+**Drift is the live risk, and it needs a guard rather than a one-time fix.** Three
+things put a bare `listen 443` back after the install succeeded, and none of them
+fails loudly — the reload keeps the old workers serving:
+
+1. `certbot --nginx -d newsite` on a new port-80 block writes a fresh
+   `listen 443 ssl` into that vhost.
+2. A package upgrade that replaces `nginx.conf` drops the top-level `stream` include
+   (the same failure the Grin toolkit records for an inline `limit_req_zone`).
+3. The operator pastes a vhost from a tutorial.
+
+So `_status` checks the three invariants on every read — the stream include is
+present in `nginx -T`, no http listener holds the public 443, OpenVPN is bound on its
+loopback port — and reports a `note` naming which one broke and the one command that
+repairs it (the same idempotent rewrite the install ran). A front that has silently
+stopped being a front is an outage on the website *and* the tunnel at once.
+
+**Deliberately not built:** `port-share` (above); an haproxy or sslh front (a new
+daemon, when the web server the operator already has can do the job); an SNI map;
+fronting any web server other than nginx; transparent proxying to give OpenVPN the
+peer address back.
+
+**Verified on a host: nothing.** Every line of Phase 10 is unit-tested against a
+fake host and none of it has opened a socket. Two claims in the design are read from
+the protocol specifications and not yet from a socket, and the acceptance session
+(S5) owes them first: that `ssl_preread` declines an OpenVPN first packet immediately
+rather than at `preread_timeout`, and that the panel's tunnel-address bind and the
+front's public-address bind coexist in one nginx process on the distributions in the
+matrix. The rest of what S5 owes is listed at the end of the section below.
+
+#### As built — 2026-09-11 (S1 engine, S2 adapter, S3 surfaces, S4 review; nothing VPS-run)
+
+The design above is the intent. This is what shipped, and where it departs the
+departure is stated with its reason. Four sessions built it and one reviewed it as a
+whole; the per-session notes that stood here were folded into this one section by the
+review, and the review's own findings are the last heading.
+
+**The pieces.** `lib/core_front443.sh` is the engine — `front443_available` /
+`front443_holder_is_nginx` / `front443_scan` / `front443_install` / `front443_check` /
+`front443_repair` / `front443_remove` / `front443_installed` / `front443_info` /
+`front443_render_vhost` / `front443_adopt_file` — protocol-neutral: it fronts "a
+loopback port", says no protocol's name, and CI's leakage sweep covers it. The one
+adapter that wants it (`lib/proto_openvpn.sh`, design note 7) calls those public verbs
+and nothing `_front443_*`. `lib/cli.sh` adds `vpn55.sh --front443-check`,
+`--front443-repair` and `--front443-remove`; `lib/ui_adapter.sh` prints the adapter's
+notes wherever the service is shown; `lib/panel_deploy.sh` writes the portal's vhost
+front-aware. `tests/front443.sh` (281 assertions after the R1 follow-up),
+`tests/front443-adapter.sh` (91) and `tests/panel-deploy.sh` (69) run in CI against
+a fake host whose `ss` answers from
+what the on-disk configuration would bind *after* a reload.
+
+**The nginx the design left open — PROXY protocol is two stream servers.** nginx sets
+`proxy_protocol` per *server*, not per upstream, and the directive takes no variable,
+so one front server would hand the header to the loopback service too, which cannot
+read it. The front server emits the header to both upstreams; the non-TLS path lands
+on a second stream server (`listen 127.0.0.1:<strip> proxy_protocol;`) whose only job
+is to swallow it and forward plain bytes. One extra loopback hop on the tunnel side
+only; the web side gets the real client address in one hop. The strip hop is a loopback
+TCP port rather than a UNIX socket so SELinux has nothing new to label.
+
+**Ports: web `8443`, strip `8008` — not `4443`.** Both already carry `http_port_t`
+(80, 443, 488, 8008, 8009, 8443 — httpd_selinux(8)); 4443 carries nothing and nginx
+cannot bind it under enforcing. Both are env-overridable (`VPN55_FRONT443_WEB_PORT`,
+`VPN55_FRONT443_STRIP_PORT`). The OpenVPN loopback port defaults to **1194**
+(`VPN55_OVPN_LOCAL_PORT`), the daemon's own port, which carries its type already.
+
+**Trap 5 decided: `httpd_can_network_connect` is set persistently, recorded, and
+reversed.** nginx runs as `httpd_t`; its connect to `127.0.0.1:<backend>` is a connect
+to whatever port type the backend's policy gave that port, and `httpd_can_network_relay`
+reaches http-labelled ports only. The value *before* VPN55 is written to the ledger
+**before** the boolean is flipped (the other order had a window in which the host was
+more permissive with no row to reverse it) and put back on remove only when VPN55
+changed it. **The cost, stated:** with the boolean on, an nginx worker may open a TCP
+connection to any port on any host; before the front, policy confined it to
+http-labelled ports. The narrower alternative — a local policy module allowing
+`httpd_t` exactly the backend's port type, plus `httpd_can_network_relay` for the two
+loopback hops — needs `checkpolicy` on the host and a module carried through upgrades,
+and is deliberately not this version. Relabelling the backend port is never done. A
+permissive host gets the same treatment so a later switch to enforcing does not break
+the front; an enforcing host without `setsebool` is refused. On the adapter side, 443
+is never labelled (it carries the web label and the daemon does not bind it — §6C.6's
+trap in reverse); an operator who overrides the loopback port gets the usual
+`_ovpn_selinux_port_ensure` on the port they chose, and uninstall unlabels what was
+labelled, keyed on the port the daemon *bound*.
+
+**Two reloads, never one.** On SIGHUP nginx opens the new cycle's sockets before closing
+the old ones, and Linux refuses `<address>:443` while a wildcard `:443` is still
+listening — so a single reload that both moves the vhosts and adds the front fails
+with EADDRINUSE and nginx keeps the old configuration, silently. Install reloads once
+to take the vhosts off 443, waits for `ss` to show the wildcard gone, then reloads
+again with the stream block; remove mirrors it. Both are graceful; the gap in which a
+*new* connection to 443 is refused is the time between them.
+
+**`nginx -t` proves parse, not bind — four invariants, not three.** The design's three
+are what the configuration says. `front443_check` adds `bind`: what the kernel says,
+read from `ss` **by address** — the public address holds 443, no wildcard does,
+`127.0.0.1` holds the strip port, and the web port *when the configuration shows a
+vhost on it* (R1: with no public-443 vhost — the panel-only host — nginx never binds
+it, and demanding it failed the install there). A status that could report ok while
+`ss` showed the wildcard on 443 would be the check that goes green whichever process
+won. Install polls the same predicate after each reload and rolls back on a miss. A
+dead backend is reported as `backend` with its own repair ("start the service that
+listens there"), because it is not the front's to fix — and since the R1 follow-up it
+stops only a *fresh* install, never a repair: the front's files do not depend on the
+service being up. Output is `ok` / `off` (exit 2,
+not installed) / one `broken <which> <detail> <repair>` line per failure; the repair
+string is `vpn55.sh --front443-repair` except where that command would refuse — nginx
+stopped (`systemctl start nginx`), a listen line repair cannot rewrite (by hand first;
+R1).
+
+**The rewrite.** A block's first public-443 listener — spelled `443`, `*:443`,
+`0.0.0.0:443`, `[::]:443`, `<pub4>:443` or `[<pub6>]:443`; `quic`/`udp` skipped; any
+other specific address, which is the panel's, left alone — becomes
+`listen 127.0.0.1:<web> <params> proxy_protocol; # vpn55-front443: was <original>`
+with `ipv6only=` dropped (refused on a v4 address). Every further one in the same
+block becomes `# vpn55-front443: off: <original>`, because two identical loopback
+listens in one block are a duplicate nginx refuses. The rewrite is two passes: a block
+that already holds a tagged line keeps it as *the* listener wherever a later bare 443
+lands in the file, above or below. The IPv6 front bind is added only when a vhost had
+`[::]:443` *and* the host has a global v6; otherwise the ledger says `bind6 -` and the
+operator is told. Vhosts are found in `nginx -T`, never by globbing directories, so
+the Debian/RHEL layout difference does not exist here.
+
+**Restore is by marker, and what it deliberately loses is stated.** Tagged lines come
+back as the original text the marker holds; a vhost deleted since is skipped and
+logged; a marker whose original no longer reads as a `listen` directive is left in
+place with a warning naming the file; an operator's other edits to the file survive
+(tested with an edit inserted between rewrite and restore). An edit the operator made
+to the *live* half of a tagged line is discarded on restore — the marker holds the
+original, and the original is what comes back. The include line in `nginx.conf` is
+removed by shape (`stream { … } # vpn55-front443`), never by the bare marker word, so
+an operator's own comment naming it is theirs to keep.
+
+**Trap 6 is warned, and one form of it is refused.** A vhost whose *server* block sets
+`real_ip_header` is named — in the offer, before the question, and again at install —
+because behind the front it will log every visitor as `127.0.0.1`, or make the header
+spoofable if told to trust loopback. Not solved in this version. A `real_ip_header` at
+the *http* level is a duplicate of the snippet the front installs and `nginx -t`
+refuses the pair, so the install stops with the file and line rather than discovering
+it at `-t` time.
+
+**The offer, and its default.** §6C.6's refusal branch asks `front443_holder_is_nginx`
+(by `/proc/<pid>/comm`, not by the name in `ss`'s output) and `front443_available`
+before refusing, exactly when the transport is tcp *and* the port is 443. It prints
+the three costs in the design's order and lists **the vhosts by name**. The answer is
+`ask_value` with `VPN55_OVPN_FRONT` as the default: unattended, `VPN55_OVPN_FRONT=nginx`
+accepts and anything else refuses. **The interactive default is `no`, and exactly
+`nginx` accepts** — what is being accepted is an edit to files VPN55 does not own; that
+takes a typed word naming the thing consenting to it. `front=nginx` is written on
+acceptance and never asked again; on a re-run nginx holding the port is the
+arrangement, and anything *else* holding it with the front recorded refuses by name.
+The one way off the record without an uninstall is `VPN55_OVPN_FRONT=no` on a re-run
+(R1 follow-up): honoured only when the front is not on the host, and dropped only after
+the port check has passed — a refusal un-records nothing.
+
+**`port` is untouched; `local_port` is the new record.** The client file is rendered
+from `port` and the adapter test asserts it is **byte-identical** with and without the
+front — a changed profile would strand every credential issued before the front went
+on. The daemon binds `local 127.0.0.1` / `port <local_port>` / `proto tcp`; the
+no-front render is byte-identical to the previous release. `local_port` may change
+freely until the front is installed against it and not afterwards (the engine refuses
+ports other than its ledger's; the adapter says so up front).
+
+**The firewall opens nothing for a fronted install.** 443 is the web server's rule; it
+existed before VPN55 and must outlive it, and a ledger row for it would make
+`_uninstall` close the operator's website. The loopback port needs no rule. Known edge,
+documented rather than special-cased: a front accepted on a *re-run* over an install
+that had itself opened tcp/443 earlier keeps that row, and uninstall closes it.
+
+**Order: daemon first, front last, and failure rolls back — with one stated exception.**
+`front443_install <local_port>` runs after the unit is up and after the adapter has
+itself seen `127.0.0.1:<local_port>` in `ss` by address. Anything but `ok` from
+`front443_check` afterwards fails the install; the engine has already reverted its own
+state, and the adapter goes back to "not installed" — **unless credentials exist**. An
+uninstall revokes every one of them, and a host where nginx took 443 out from under a
+running service is not a reason to do that: the service stays on its loopback port,
+unreachable from outside, and both the install's messages and `_status` say so.
+
+**Rollback has two scopes (S4).** A *fresh* install that fails goes back to nothing —
+`front443_remove` over the ledger written so far. A *re-run* — `front443_repair`, the
+adapter's second install — puts back only the vhost files that run rewrote, from a byte
+copy taken seconds earlier, and leaves the front that was already carrying traffic
+where it was; a `file` ledger row added for a file that ends up carrying no marker is
+dropped again. Before S4 every failure path ran `front443_remove`, so a certbot vhost
+nginx rejected during a *repair* would have taken the working tunnel's front down —
+the fix for drift becoming the outage. A byte copy is right within one call and wrong
+across an install and an uninstall, which is why remove restores by marker. A re-run on
+a host whose public address has moved is refused outright: the ledger holds one `bind`
+and every read takes the first row, so a silently recorded second address would leave
+the check verifying the old one for ever.
+
+**`_status` reports the front on every read, as `note` records, and moves nothing
+else.** One `info` always while the front is on (peers are `127.0.0.1`; the endpoint
+column shows loopback; the daemon listens on its loopback port), then one record per
+`broken` line from `front443_check`, naming the invariant, the detail and the repair.
+Severity is `crit` for every invariant — a front that silently stopped being one is an
+outage on the website and the tunnel at once — except the daemon's own port, `warn`
+while the service is stopped and `crit` while it claims to run. A front *recorded* but
+reporting `off` is `crit` with "re-run the install" as the repair. The `listen` field
+stays `tcp/443`. **The filtering level does not move**: the front is a way of sharing a
+port, not probe resistance. `_capabilities` does not declare the front and the contract
+was not widened — `option` describes what `_cred_add` accepts, and install-time state
+is the gap §6D already records; the front is its second instance there.
+
+**Both front ends show it.** The status screen printed `note` records already; the
+service screen's header and the pre-install notice now do too (`_adapter_notes_notice`,
+attributed, verbatim, by severity, an unknown severity at the loudest level). The panel
+needed nothing: `records.js` parses `note`, `app.js` renders every one on the service's
+card and every `warn`/`crit` one on the Overview, verbatim and attributed, since
+Phase 7. The panel has **no** repair path and gains none: `--front443-check` and
+`--front443-repair` sit below `distro_require_root`, the panel's sudo rule pins
+`--status` and nothing else (§6E.2), and repair rewrites files VPN55 does not own.
+
+**The portal deploy path exists and is front-aware.** There was none — the portal's
+vhost was a README step — so S3 built `portal_install <host>` following the template
+header's four steps exactly. With the front installed, the https block is rendered
+through `front443_render_vhost` and handed to `front443_adopt_file`, so it lands
+already in the tagged loopback form and remove restores its plain `listen 443` like
+every other vhost's. Writing the bare line and calling `front443_repair` was rejected
+because repair's failure path (then) rolled the whole front back. certbot is
+`certonly --webroot`, not `--nginx`: the latter writes a `listen 443 ssl` block into a
+port-80-only vhost and reloads, which is drift trap 1 committed by the installer
+itself. Deployed first and fronted later needs nothing new; the test asserts the
+template's two listen lines are spellings the scanner recognises.
+
+**Smaller departures.** The module package (`libnginx-mod-stream` /
+`nginx-mod-stream`), when VPN55 installed it, stays on remove; the ledger names it.
+The `nginx.service` retry drop-in is VPN55's own file (`vpn55-front443.conf`), not the
+panel's. Refusals added: a foreign top-level `stream {}`; a `conf.d` that `nginx.conf`
+does not include; a backend nobody listens on; a fresh install onto loopback ports
+something already holds; a re-run with different ports or a different public address
+than the ledger records; a public address that resolves to empty, `0.0.0.0` or `::`
+(the wildcard by another spelling — refused before it reaches a `listen` line).
+
+**What the review (S4) found and changed.** Beyond the rollback scope above: the
+scanner emitted an *empty* params field for `listen 443;`, and since a tab is IFS
+whitespace every `IFS=$'\t' read` collapsed it — the `real_ip_header` flag landed in
+the params variable and the trap-6 warning was silently lost for exactly the barest
+spelling (now `-`, and tested). The rewrite was one pass, so a bare 443 inserted
+*above* a block's tagged line produced a duplicate loopback listen. `server` with its
+brace on the next line was not a block. A failure in the module or SELinux step
+returned without rolling back a ledger that already had rows. The `selinux` row was
+written after the boolean flipped. Two `printf`s in the adapters carried a literal `\n`
+argument and emitted malformed `note` records (OpenVPN's was fixed in S2; WireGuard's
+in S4). One protocol name lived in `core_net.sh`'s operator text. None of these was
+reachable by a test that had already passed; each now has one.
+
+**Still owed to a socket (S5):** the two claims above; that the PROXY header crosses
+the strip hop; that installing the module package does not itself restart nginx;
+mawk vs gawk on the scanner; that `local 127.0.0.1` + `proto tcp` with `ccd-exclusive`
+and the management socket behaves as the public bind does on 2.4 and 2.6; that the
+daemon binds within `VPN55_OVPN_BIND_WAIT` on a slow host; the credentials-exist branch
+of `_ovpn_front_failed`; that a vhost written already in the tagged form is accepted
+by a reload with no wildcard ever bound; that the webroot challenge is served from
+behind the front's untouched port 80; that the panel's Services card renders the `crit`
+note in a browser; and — from the review — that a repair which fails `nginx -t` on a
+live host leaves the front serving exactly as the fake host says it does.
+
+##### What S5 must observe — the model behind the tests
+
+`tests/front443.sh`, `tests/front443-adapter.sh` and `tests/panel-deploy.sh` run against
+a fake host: `ss`, `nginx -t` / `-T` / `-V`, `systemctl reload`, `getenforce`, `setsebool`,
+`certbot` and the package manager are shell functions written by the same author as the
+code. The 394 assertions therefore prove that the code matches **the author's model of
+Linux, nginx, SELinux and certbot** — not those systems. Every row below is one fact
+about the real system that a fake encodes and the code leans on, with the command that
+settles it on a host and what production looks like if the model is wrong. The order is
+cheapest-to-check × worst-if-wrong first; rows 1–3 are settled on the *baseline* host
+before VPN55 writes a byte, because each one, wrong, is a design change rather than a
+fix. Line numbers are as of this revision; `\|` inside a command is a shell pipe.
+
+Two rows are not hypotheses but readings of the nginx source that the fake contradicts
+outright, and they are why this table exists. **Row 1:** the fake's `ss_recompute`
+gives the panel's `10.8.0.1:443` a socket of its own beside the wildcard, and nginx does
+not — with a wildcard configured it binds *only* the wildcard and serves the specific
+address through `getsockname()`, which is the documented reason the `bind` listen
+parameter exists — so on the section's own opening case reload 1 has to create that
+socket under the still-open wildcard, which is exactly the EADDRINUSE the two-reload
+argument at the top of the engine is built on. **Row 2:** `nginx -t` does bind (it
+tolerates only EADDRINUSE), so it fails whenever the panel's tunnel address is absent,
+and every reader of `nginx -T` in the engine then sees a broken configuration.
+
+| # | Assumption about the real system | Where the fake encodes it | Where the code depends on it | Confirm on a real host | If wrong, in production |
+|---|---|---|---|---|---|
+| 1 | **Wildcard vs specific, in the kernel and in nginx.** Linux refuses a bind to `<addr>:443` while `*:443` is in LISTEN and vice versa (SO_REUSEADDR does not lift it for a listening socket). nginx, when an http `listen 443` and an http `listen 10.8.0.1:443` are both configured, opens *only* the wildcard socket. On SIGHUP the master opens the new cycle's sockets **before** closing the old cycle's. So on a host with the panel and a public vhost the baseline `ss` shows one socket, `0.0.0.0:443`; reload 1 must create `10.8.0.1:443` under the still-open wildcard; and remove's phase B must create `*:443` under the panel's still-open specific socket. | `tests/front443.sh:147-164` (`ss_recompute`: every `listen` line is its own socket, the panel's beside the wildcard), `:353` (baseline hand-written with both), `:396-398` ("the panel's tunnel bind survived"), `:586-600` (remove: "the wildcard holds 443 again") | `lib/core_front443.sh:55-67` (the two-reload premise), `:1280-1288` (reload 1 + wait for the wildcard to close), `:1323-1341` (reload 2), `:1679-1690` (remove phase B + wait); §6C.8's claim 2 | Baseline (panel vhost + a public vhost, before VPN55 touches anything): `ss -Hlnt 'sport = :443'` — one line, `0.0.0.0:443`, and **no** `10.8.0.1:443` confirms the collapse. Then the transition by hand: `cp -a /etc/nginx/sites-enabled/<site>.conf /root/site.bak; sed -i 's/^\(\s*listen\s\+\)443 /\1127.0.0.1:8443 /' /etc/nginx/sites-enabled/<site>.conf; nginx -t && systemctl reload nginx; sleep 3; tail -n 5 /var/log/nginx/error.log; ss -Hlnt 'sport = :443'; cp -a /root/site.bak /etc/nginx/sites-enabled/<site>.conf; systemctl restart nginx` | error.log: `bind() to 10.8.0.1:443 failed (98: Address already in use)`, `ss` unchanged. Install: the wait times out ("something still holds the wildcard :443"), the fresh rollback restores the file, the site never went down — **the front cannot be installed on exactly the host §6C.8 opens with.** The reachable reverse is worse: front installed on a website-only host, panel deployed later (its specific bind lands fine beside the front's), then `front443_remove` — phase A closes `<pub4>:443`, phase B's `*:443` fails under the panel's live socket, and the running cycle keeps the vhosts on `127.0.0.1:8443` with nothing forwarding to them: **website down until `systemctl restart nginx`**, ledger kept. The candidate answers (`reuseport` on every 443 listener; a restart for that one cycle) are design decisions, not S5's. |
+| 2 | **`nginx -t` binds.** It calls `socket()`+`bind()` on every `listen` address and tolerates only EADDRINUSE; EADDRNOTAVAIL (address not on this host) and EACCES (SELinux) fail the test, and `nginx -T` then prints nothing. So `-t` is silent about the one error the two-reload sequence exists for — the fake is right there — but it **fails whenever the panel's tunnel address is absent** (tunnel service stopped, interface down). `nginx -s reload` (Debian's `ExecReload`) parses but never binds. | `tests/front443.sh:129` (`-t` passes unless a flag file; no address ever matters), `:120-128` (`-T` always dumps); `tests/panel-deploy.sh:234` | `lib/core_front443.sh:69-75` (header: "`nginx -t` never binds anything" — half right), `:1001-1005` (`front443_available` refuses on `-t`), `:1273`, `:1305`, `:1540-1542` (`front443_check` → "nginx -T fails"), `:1433-1439`, `:1649-1660`, `:1675`; `lib/panel_deploy.sh:986` | `printf 'server { listen 198.51.100.1:65000; }\n' > /etc/nginx/conf.d/zz-probe.conf; nginx -t; rm -f /etc/nginx/conf.d/zz-probe.conf` → expect `[emerg] bind() to 198.51.100.1:65000 failed (99: Cannot assign requested address)`. The case that matters, on the panel host: `systemctl stop <tunnel unit>; nginx -t; nginx -T 2>/dev/null \| wc -c; vpn55.sh --front443-check; systemctl start <tunnel unit>`. The tolerated case, front on: `printf 'server { listen 0.0.0.0:443; return 444; }\n' > /etc/nginx/conf.d/zz-probe.conf; nginx -t; rm -f /etc/nginx/conf.d/zz-probe.conf` → passes (never reload with the probe in place). | Every `_status` read while the tunnel is down reports `broken include — nginx -T fails` (the cause is an address, not the include), `--front443-repair` refuses, and a re-run's offer with the service stopped is refused with the `-t` output — none of it false, all of it misattributed. If `-t` did not bind at all, nothing changes. If it also failed on EADDRINUSE, `front443_available` would refuse every host already serving 443 — every host the front is for. |
+| 3 | **The default route's source address is where inbound 443 arrives** — the address the site's A record resolves to, or on a 1:1-NAT cloud the private address the provider delivers it to. | `tests/front443.sh:65,135` (`PUB4` fixed at `203.0.113.10`, the address site-b spells at `:102`) | `lib/core_front443.sh:133` → `lib/core_net.sh:245-256` (`net_wan_address`), `:1091-1097`, `:892` (`listen ${pub4}:443`), `:1375`, `:1579` | `ip -4 route get 1.1.1.1 \| grep -o 'src [0-9.]*'; ip -4 -o addr show scope global; getent ahostsv4 <site> \| head -1` — one address in all three, or (NAT cloud) the A record must be the provider's public IP for the `src` one (`curl -s https://ifconfig.me` from the box shows the mapping). | A host with two global addresses and the site on the one that is not the route's source (a floating IP, a second interface): the front binds the wrong one, `ss` shows it held, `front443_check` says `ok`, the vhosts sit on loopback — **website and tunnel down with every signal green**, and nothing in the engine can see it. On a NAT cloud it works and every message calls a `10.x` address "the public address" — cosmetic. |
+| 4 | **Reload semantics.** `systemctl reload nginx` exits 0 once the signal is delivered, whether or not the master then binds. After a successful reload the master closes the wildcard and the old workers drop their copies on SIGQUIT *before* draining, so the wildcard leaves `ss` within a few hundred ms and always inside 20 × 0.5 s. The master's bind failure is written to `error_log` (`/var/log/nginx/error.log`), **not the journal** — its stderr is detached. | `tests/front443.sh:165-168` (reload returns 0 and `ss` is the on-disk config at once), `:51` (`BIND_WAIT=1`), `:134` (no sleep); `tests/panel-deploy.sh:236` | `lib/core_front443.sh:106` (10 s), `:143`, `:289-302`, `:1281-1288`, `:1325-1341`, `:1434`; the "see journalctl -u nginx" messages at `:1285`, `:1334`, `:1337`, `:1434`, `:1653`, `:1688` | Front on: `systemctl reload nginx; echo rc=$?; for i in $(seq 20); do date +%T.%N; ss -Hlnt 'sport = :443'; sleep 0.5; done` — note when the set settles. Failure path, with row 2's `listen 0.0.0.0:443` probe file in place: `systemctl reload nginx; echo rc=$?; journalctl -u nginx -n 5 --no-pager; tail -n 3 /var/log/nginx/error.log; rm -f /etc/nginx/conf.d/zz-probe.conf` → rc 0, journal silent, error.log names the bind. | A reload slower than 10 s (hundreds of vhosts, OCSP, slow disk) makes the install roll back a front that would have bound a second later, and the rollback's reloads land on a master still mid-reload. An operator sent to `journalctl` finds nothing and concludes nginx is fine. |
+| 5 | **`ss` prints what the normaliser expects.** `ss -Hlnt 'sport = :443'` — one line per LISTEN socket, `$4` = `0.0.0.0:443`, `[::]:443` (nginx binds v6 `ipv6only=on` by default, so two sockets), `203.0.113.10:443`, `[2001:db8::10]:443`, `127.0.0.1:8443`; `-H` accepted; with `-p`, `users:(("nginx",pid=1200,fd=6),("nginx",pid=1201,fd=6),…)` naming master **and** workers; `/proc/<pid>/comm` is `nginx` for all of them. | `tests/front443.sh:169-170` (one synthetic row, `pid=4242`), `:353-376` (hand-written forms), `:378-383` (comm) | `lib/core_front443.sh:128-129`, `:144`, `:252-285`, `:309-324` (every pid must be nginx), `:1282`, `:1327-1329`; `lib/proto_openvpn.sh:632-671` (`_ovpn_port_conflict`: `ss -p` + MainPID) | `ss -Hlnt 'sport = :443'; ss -Hlntp 'sport = :443'; for p in $(ss -Hlntp 'sport = :443' \| grep -oE 'pid=[0-9]+' \| cut -d= -f2 \| sort -u); do printf '%s ' $p; cat /proc/$p/comm; done` — baseline, after install, and once with a client connected. | A spelling outside the normaliser reads as "unheld": the install's wait passes when it should not, or `front443_check` says `nothing holds …` on a healthy host. A `comm` that is not `nginx` (a host-network container's nginx; OpenResty's *is* `nginx`) removes the offer and leaves §6C.6's refusal. |
+| 6 | **`nginx -T` output shape.** The dump goes to stdout; one `# configuration file <path>:` line (trailing colon; the path exactly as the include glob resolved it — `/etc/nginx/sites-enabled/<name>` for a symlink, `/etc/nginx/vpn55-stream.d/front443.conf` for ours) precedes each file's verbatim bytes, in parse order, the file carrying `load_module …/ngx_stream_module.so;` among them; on a failing configuration it prints nothing and exits 1; it reads the **disk**, not the master's live cycle. | `tests/front443.sh:119-128`, `:123` (the modules-enabled file); scanner tests `:179-232` | `lib/core_front443.sh:121`, `:326-331`, `:388-392`, `:475-478`, `:1547` (`str_has_line … "# configuration file ${STREAM_CONF}:"`), `:1540-1542`, `:512-519` (`_front443_marked_files` parses the same header) | `nginx -T 2>/dev/null \| grep -n '^# configuration file '` (every included file; our two among them once installed); `nginx -T 2>/dev/null \| grep -n load_module`; broken: `printf 'garbage;\n' > /etc/nginx/conf.d/zz-broken.conf; nginx -T 2>/dev/null \| wc -c; echo rc=$?; rm -f /etc/nginx/conf.d/zz-broken.conf` (no reload in between). | A header spelled otherwise (a space, no colon, the symlink's target) puts every message's file:line off and makes `front443_check` say the stream file "is not read by nginx" where it is. A `-T` that dumped a partial config on failure would read an unparsable host as "no listeners". |
+| 7 | **Nothing listens on `127.0.0.1:443` afterwards.** The front binds the public address only; the vhosts moved to 8443; before the front the wildcard answered loopback too. | `tests/front443.sh:147-164` (no loopback 443 in the recomputed `ss`), `:317-318` (no wildcard in the stream conf) | `lib/core_front443.sh:881-892` ("never the wildcard"), `:1092-1097` | Before and after: `curl -skI https://127.0.0.1/ -H "Host: <site>"`. Who depends on it: `grep -rEl 'https?://(127\.0\.0\.1\|localhost)' /etc/cron* /var/spool/cron /etc/systemd/system 2>/dev/null; ss -Htn 'dport = :443 and dst 127.0.0.1'` on the baseline. | Not a defect — a cost the section does not state: every local health check, cron (`wp-cron`, cache warmers), monitoring agent and deploy hook that hits `https://localhost` gets *connection refused* from the install on, as does `curl --resolve <site>:443:127.0.0.1`. (A plain-HTTP probe to the public 443 now lands on the daemon and hangs instead of nginx's 400 — a fingerprint change, not an outage.) |
+| 8 | **`nginx -V` spellings.** Writes to stderr; the matrix spells `--with-stream=dynamic` (distro packages) or `--with-stream` (nginx.org), `--with-stream_ssl_preread_module` with no `=dynamic` (preread is compiled into `ngx_stream_module.so`), `--with-http_realip_module`. | `tests/front443.sh:131` | `lib/core_front443.sh:124`, `:552-586`, `:1007-1024` | `nginx -V 2>&1 \| tr ' ' '\n' \| grep -E '^--with-(stream\|stream_ssl_preread_module\|http_realip_module)'` on each box. | A spelling the whole-token compare misses (a custom `--add-dynamic-module=…`) → "this nginx lacks …" on a capable host; `static` reported for a dynamic build → `stream {}` fails `-t` as an unknown directive and the install rolls back with the wrong message. |
+| 9 | **Stock `nginx.conf` layout.** At the top, `include /etc/nginx/modules-enabled/*.conf;` (Debian) / `include /usr/share/nginx/modules/*.conf;` (RHEL); inside `http {}`, `include /etc/nginx/conf.d/*.conf;` (both) and `include /etc/nginx/sites-enabled/*;` (Debian only); no `stream {}`; ends in a newline; nginx parses a one-line `stream { include /etc/nginx/vpn55-stream.d/*.conf; } # vpn55-front443` appended after `http {}`'s closing brace, and a glob matching nothing is harmless. | `tests/front443.sh:70-75` (the fake nginx.conf), `:332-348`; `tests/panel-deploy.sh:92-108`, `:229` | `lib/core_front443.sh:114`, `:460-473`, `:956-990`, `:1035-1036`, `:1299-1303`; `lib/panel_deploy.sh:394-409` (`_pnl_vhost_layout`) | `grep -nE '^\s*(include\|stream\|http\|mail)\b' /etc/nginx/nginx.conf; tail -c1 /etc/nginx/nginx.conf \| od -An -c` on both boxes; after install `nginx -t; nginx -T 2>/dev/null \| grep -n 'vpn55-stream.d'`. | A host whose `conf.d` include lives in a file other than nginx.conf (some hosting panels) gets "does not include conf.d/" and no front; RHEL's `/etc/nginx/default.d/*.conf` is included inside the default `server {}` — not ours to read, but a place a server-level `real_ip_header` can hide; a module include placed below our appended line makes `stream` an unknown directive. |
+| 10 | **The module package.** `apt-get install libnginx-mod-stream` / `dnf install nginx-mod-stream` (a) exists in the default repos at the running nginx's version, (b) drops `/etc/nginx/modules-enabled/50-mod-stream.conf` = `load_module modules/ngx_stream_module.so;` / `/usr/share/nginx/modules/mod-stream.conf` = `load_module "/usr/lib64/nginx/modules/ngx_stream_module.so";`, (c) does **not** restart or reload nginx from its postinst/`%post`, and (d) a `reload` is enough for the running master to `dlopen` a newly listed module. | `tests/front443.sh:140-143` (`touch modload` = installed *and* loaded, no side effects), `:394` | `lib/core_front443.sh:588-628` (`:614-626`), `:1241`; the design's "a `reload` keeps live tunnels" | `apt-cache policy libnginx-mod-stream` / `dnf info nginx-mod-stream`; `systemctl show nginx -p MainPID -p ActiveEnterTimestamp -p NRestarts`, install the package, the same again plus `journalctl -u nginx --since -2min --no-pager`; `dpkg -L libnginx-mod-stream \| grep modules-enabled` / `rpm -ql nginx-mod-stream \| grep modules`; `nginx -T 2>/dev/null \| grep -n load_module`; after reload 2: `grep -iE 'emerg\|module' /var/log/nginx/error.log \| tail -n 5`. | (a) "no known package" or an apt error; (b) "installed but nginx.conf does not include its load_module line"; (c) every TCP session on the host — the website, and on a re-run the tunnel already fronted — dropped by a restart the install never announced; (d) reload 2 fails in error.log, the master keeps the old cycle, the wait times out and the fresh install rolls back saying "something still holds …" — a restart would have worked and nothing says so. |
+| 11 | **The daemon on loopback.** With `local 127.0.0.1` / `port 1194` / `proto tcp` (2.4 → `tcp-server`) OpenVPN starts, keeps its management socket and `ccd-exclusive`, and has exactly one LISTEN socket that `ss` prints as `127.0.0.1:1194` (never `[::ffff:127.0.0.1]`), within 10 s; `systemctl show -p MainPID --value <unit>` is that process and `ss -p` names it. | `tests/front443.sh:162,173` (`backend_up` → `127.0.0.1:1194`); `tests/front443-adapter.sh:86` (`_ovpn_active` by flag file), `:131-139` (render only). **`_ovpn_wait_loopback` and `_ovpn_port_conflict` are stubbed nowhere and tested nowhere.** | `lib/proto_openvpn.sh:755-773`, `:957-961`, `:632-671` (`:653` MainPID), `:1420-1434`; `lib/core_front443.sh:1159-1168`, `:1596-1599` | `systemctl show -p MainPID --value <unit>; ss -Hlntp 'sport = :1194'; journalctl -u <unit> -n 20 --no-pager \| grep -iE 'listen\|error\|ccd\|management'` — on a 2.4 host (Ubuntu 20.04) and a 2.6 host (Debian 12 / Rocky 9). | `_ovpn_wait_loopback` times out → "The daemon did not bind 127.0.0.1:1194" → `_ovpn_front_failed` → on a credential-less host the service is **uninstalled** while the daemon is up. A MainPID that is not the socket's holder makes every re-run refuse its own daemon as a conflict. |
+| 12 | **`ssl_preread` declines at once.** When byte 0 is not `0x16` it sets `$ssl_preread_protocol` to `""` and proceeds immediately — no `preread_timeout` (30 s), no waiting for more bytes; OpenVPN's client speaks first and its first TCP bytes are a 2-byte length whose high byte is never `0x16`; a ClientHello routes to the web port. | `tests/front443.sh:315-326` (the map's text only) | `lib/core_front443.sh:886-901` (`:898`) | `date +%T.%N; printf '\x00\x0e\x38\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00' \| nc -q 1 <pub4> 443; journalctl -u <unit> -n 3 --no-pager` — the daemon's "TCP connection established with [AF_INET]127.0.0.1:…" must be within 1 s of the `date`. Then a real client: time from `openvpn --config x.ovpn` to `Initialization Sequence Completed`. `curl -sI https://<site>` still 200. `nginx -T 2>/dev/null \| grep -n preread_timeout` (expect none). | Every connect stalls ~30 s before the tunnel is up — §6C.8's claim 1 fails; or a ClientHello split across two segments is misrouted to the daemon and the website is down for exactly those clients. |
+| 13 | **PROXY protocol end to end.** The stream server's `proxy_protocol on` emits a v1 header to both upstreams; the http listener with `proxy_protocol` parses it; `set_real_ip_from 127.0.0.1; real_ip_header proxy_protocol;` at http level rewrites `$remote_addr` — so `$binary_remote_addr`, `limit_req`, `allow`/`deny` and the access log see the client; the strip server consumes the header and forwards the daemon's bytes untouched; the snippet is inert on the panel's vhost (no `proxy_protocol` on its listen). | `tests/front443.sh:320-325` (text of the directives), `:404` | `lib/core_front443.sh:18-42`, `:886-908`, `:912-934`, `:1250` | From an **outside** host `curl -sI https://<site>/`; on the box `tail -n 1 /var/log/nginx/access.log` (the outside address, not 127.0.0.1); a vhost with `limit_req` hammered from two outside addresses fills two buckets; `tail -n 1 /var/log/nginx/vpn55-panel.access.log` after a tunnel visit still shows the `10.8.x` client. The strip hop is proven by row 11's client reaching "Initialization Sequence Completed" and passing traffic. | Every visitor is `127.0.0.1`: per-address limits collapse into one bucket and the site 429s everyone — the failure §6C.8 chose the stream module to avoid; or `broken header` in error.log and the site is down; or the daemon logs bad packets and no client connects. |
+| 14 | **Sessions survive a reload.** Old workers keep every established stream (tunnel) and http connection until it closes; only *new* connections to 443 are refused in the gap between reload 1 and reload 2. | None — the fake has no connections; `tests/front443.sh:165` models reload as instantaneous | `lib/core_front443.sh:62-67`; `front443_repair` on a live host (`:1446-1453`); the design's coupling row | A client connected and `ping -i 0.2 <tunnel gateway>` running through it; on the box `systemctl reload nginx`, then `vpn55.sh --front443-repair` after a harmless drift — no lost pings. During the install itself, in a second terminal: `while :; do curl -s -o /dev/null -w '%{http_code} ' --max-time 1 https://<site>; sleep 0.2; done` and count the `000`s (R1 expects a few seconds). | Every tunnel drops on every reload: the repair path is an outage, and certbot's post-renew reload (every ~60 days) kicks every client. |
+| 15 | **Symlinks survive the rewrite.** On Debian `sites-enabled/*` are symlinks into `sites-available/`; `nginx -T` names the symlink path; the rewrite writes *through* the link (`cat > "$dest"`) so link, inode, owner, mode and SELinux label survive and `sites-available` shows the same bytes. | `tests/front443.sh:79-111` (regular files written into the fake `sites-enabled`); `tests/panel-deploy.sh:242-243` (`fs_link` stubbed to `: > "$2"`) | `lib/core_front443.sh:829-840` → `lib/core_fs.sh:94-105` (`fs_replace_in_place`), `:1266`, `:1423`, `:1665`; `lib/panel_deploy.sh:866`, `:982` | `find /etc/nginx/sites-enabled -type l \| wc -l` before install, after, after remove; `for f in /etc/nginx/sites-enabled/*; do cmp "$f" "/etc/nginx/sites-available/$(basename "$f")" && echo same "$f"; done`; on RHEL `ls -Z /etc/nginx/conf.d/ /etc/nginx/vpn55-stream.d/` (all `httpd_config_t`). | A link replaced by a file: the operator edits `sites-available`, reloads, nothing changes, and `certbot --nginx` edits the copy nginx reads while the operator's diverges. A wrongly labelled file on RHEL fails `nginx -t` with *permission denied* and the install rolls back. |
+| 16 | **certbot.** (a) `certbot --nginx -d new.example` on a port-80-only block writes `listen 443 ssl; # managed by Certbot` and, when the block had `[::]:80`, `listen [::]:443 ssl ipv6only=on; # managed by Certbot`, each on its own line, plus the certificate lines; then `nginx -t` and `nginx -s reload`, and reports success although that reload fails at bind on a fronted host. (b) `certbot renew` for a moved vhost needs only port 80 and never touches the 443 line. (c) A re-run of `certbot --nginx` over a moved vhost sees `ssl` on the loopback listen and adds no second `listen 443`. (d) certbot's parser accepts the one-line `stream {}` include, the `map` with an empty-string key and the marker comments. (e) `certbot certonly --webroot -w /var/www/html -d <host>` creates `/etc/letsencrypt/live/<host>/{fullchain,privkey}.pem` and validates over the port-80 block the front never touched. | `tests/front443.sh:426-439` (hand-written `listen 443 ssl;`), `:504`; `tests/panel-deploy.sh:237` (`_pnl_certbot` creates the two files), `:296-317` | `lib/core_front443.sh:370-447` (the spellings), `:1529-1603`; `lib/panel_deploy.sh:838-849`, `:1044-1054`, `:1127-1134`; §6C.8's drift list | Fronted Debian box, a second DNS name: `certbot --nginx -d second.example --redirect --non-interactive --agree-tos -m you@example.com; grep -n listen /etc/nginx/sites-enabled/second.example; tail -n 5 /var/log/nginx/error.log; ss -Hlnt 'sport = :443'; vpn55.sh --front443-check; vpn55.sh --front443-repair`. (b) `certbot renew --dry-run`. (c) `certbot --nginx -d <first site> --reinstall --non-interactive; vpn55.sh --front443-check`. (d) `certbot plugins --prepare 2>&1 \| grep -iA3 nginx` (parses the whole configuration, needs no certificate). (e) is the portal step. | (a) A shape the scanner *refuses* is reported as by-hand drift — fine; a shape it *misses* leaves the new site never bound with `check` saying `ok`. (b)/(c) drift after every renewal or re-run — a repair after every certbot run. (d) certbot cannot parse → renewals stop and **every certificate on every fronted host expires within 90 days**. (e) the portal install stops at the certbot step. |
+| 17 | **Missing certificate vs empty glob.** `nginx -t` hard-fails on an `ssl_certificate` path that does not exist and on a non-glob `include` of a missing file, but accepts a glob include matching nothing (`options-ssl-nginx.conf*`; our `vpn55-stream.d/*.conf` after remove). | `tests/panel-deploy.sh:281` (the bootstrap stage carries no certificate path — the fake `-t` would not have noticed); `tests/front443.sh:129` | `lib/panel_deploy.sh:940-947`, `:1133`; `deploy/nginx/vpn55-portal.conf` (the `include …options-ssl-nginx.conf*;` line); `lib/core_front443.sh:1657-1660` (a restored vhost naming a certificate that is gone fails `-t` there) | `printf 'server { listen 127.0.0.1:65001 ssl; ssl_certificate /nonexistent.pem; ssl_certificate_key /nonexistent.pem; }\n' > /etc/nginx/conf.d/zz-probe.conf; nginx -t; printf 'include /etc/nginx/nothing-here-*.conf;\n' > /etc/nginx/conf.d/zz-probe.conf; nginx -t; rm -f /etc/nginx/conf.d/zz-probe.conf` | A tolerated missing certificate makes the two-stage portal write unnecessary but harmless. A fatal empty glob fails the portal template's `-t` on hosts without `options-ssl-nginx.conf`, and fails remove's phase-A `-t` between deleting the stream file and dropping the include. |
+| 18 | **SELinux (Rocky/Alma).** `getenforce` prints `Enforcing`/`Permissive`/`Disabled`; `getsebool httpd_can_network_connect` prints `httpd_can_network_connect --> off`; `setsebool -P` returns 0, persists across reboot, may take tens of seconds; `http_port_t` is tcp 80, 81, 443, 488, 8008, 8009, 8443, 9000 so `httpd_t` binds 8443/8008 with no boolean; 1194 is `openvpn_port_t`; `httpd_can_network_relay` lets `httpd_t` `name_connect` to `http_port_t` only, `httpd_can_network_connect` to any port; files VPN55 creates under `/etc/nginx` get `httpd_config_t`; no AVC after a client connects. | `tests/front443.sh:137-139`, `:389-390`, `:409-410`, `:601`, `:613-616` | `lib/core_front443.sh:39-42`, `:46-53`, `:130-132`, `:630-704` (`:664`, `:675-677`), `:1242`, `:1700-1704`; `lib/proto_openvpn.sh:693-735`, `:1732-1737` | `getenforce; getsebool httpd_can_network_connect; semanage port -l \| grep -E '^(http\|openvpn)_port_t'; sesearch -A -s httpd_t -t http_port_t -c tcp_socket -p name_bind; sesearch -A -s httpd_t -t openvpn_port_t -c tcp_socket -p name_connect -b httpd_can_network_relay; sesearch -A -s httpd_t -t openvpn_port_t -c tcp_socket -p name_connect -b httpd_can_network_connect` (setools-console). After install: `getsebool httpd_can_network_connect; ls -Z /etc/nginx/vpn55-stream.d/ /etc/nginx/conf.d/vpn55-front443-realip.conf`; after a client connect: `ausearch -m avc -ts recent` (empty); after remove: the boolean back to `off`; after reboot: still as set. | Another `getsebool` format → `cur` empty → read as `off`, ledger says `off`, remove flips a boolean that was on. 8443/8008 outside `http_port_t` → reload 2's bind denied (`(13: Permission denied)` in error.log + an AVC), wait times out, rollback — the 4443 failure the build moved away from. `relay` already covering `openvpn_port_t` → the boolean's cost paid for nothing. An AVC on connect → clients hang while the website works. |
+| 19 | **The drop-in at boot.** nginx can start before the public address (cloud DHCP) or the tunnel address exists; `ExecStartPre=nginx -t` / start then fails EADDRNOTAVAIL; `Restart=on-failure` + `RestartSec=10s` + `StartLimitIntervalSec=0` in `nginx.service.d/vpn55-front443.conf` retry until the address is there; `systemctl daemon-reload` makes it count; the panel's identical drop-in and ours merge. | `tests/front443.sh:133` (daemon-reload is a no-op), `:407` (the file's text only) | `lib/core_front443.sh:936-954`, `:1348-1354`, `:1694-1697`; `lib/panel_deploy.sh:492-528` | `systemctl cat nginx \| grep -nE 'Restart\|StartLimit\|vpn55'; systemctl show nginx -p Restart -p RestartUSec`; then `reboot`; after: `journalctl -b -u nginx --no-pager \| head -n 30; systemctl show nginx -p NRestarts; ss -Hlnt 'sport = :443'; curl -sI https://<site>`. | nginx `failed` after boot with `bind() to <pub4>:443 failed (99)` and no retry → **every site on the host down until someone logs in**; or an endless loop because the address never returns (a NAT cloud that renumbered) — the same outage with a busier journal. |
+| 20 | **The IPv6 source.** `ip -6 route get 2606:4700:4700::1111` prints `src <global v6>` that is stable (not a privacy/temporary address) and is the one the site's AAAA points at; on a v6-less host it fails; `listen [<v6>]:443` binds it. | `tests/front443.sh:66,136`, `:783-789` | `lib/core_front443.sh:134-142`, `:1226-1234`, `:895`, `:1376-1378`, `:1583-1585` | `ip -6 route get 2606:4700:4700::1111; ip -6 -o addr show scope global; sysctl net.ipv6.conf.all.use_tempaddr net.ipv6.conf.default.use_tempaddr; getent ahostsv6 <site> \| head -1` | A temporary address expires → at the next boot/restart nginx fails `bind() to [v6]:443 (99)` and the drop-in loops — **v4 down too, it is one process**. A `src` that is not the AAAA → v6 visitors reach the daemon or nothing while v4 is fine. |
+| 21 | **The toolbox.** `awk` is mawk on Debian/Ubuntu and gawk on RHEL, and both take the scanner's programs (`ENVIRON`, `match`/`RSTART`, `split` on a regex, `[^]:%]`, `\{`, `/dev/stderr`, dynamic regex, `exit !hit`); `cmp` (diffutils), `od`, `tail -c`, `ss`, `sleep 0.5`, `mktemp -d`, `sort -u`, `paste` exist; `printf 'a\r\n' \| awk '{print length($0)}'` is 2 on both. | The suites run under gawk in CI (`.github/workflows/ci.yml:86`) and MSYS gawk on the dev box (`tests/front443.sh:675-685`) | every awk program in `lib/core_front443.sh` (`:252-258`, `:372-445`, `:462-502`, `:678-775`) | On each box from a checkout: `awk -W version 2>&1 \| head -1; for c in cmp od tail ss sleep mktemp sort paste cut tr sed grep; do command -v $c \|\| echo MISSING $c; done; bash tests/front443.sh; bash tests/front443-adapter.sh; bash tests/panel-deploy.sh` — the suites need no nginx and exercise the host's own awk. Then, front on, `vpn55.sh --front443-check` runs the real scanner over the real dump. | A mawk difference makes the scanner miss a spelling (the silent EADDRINUSE trap) or refuse a good one (a refusal naming the wrong line). A missing `cmp` makes every rewrite report "changed" (a reload on every repair) and the scoped rollback rewrite files it should skip. |
+| 22 | **`nginx.conf` is a conffile.** dpkg conffile (Debian) / `%config(noreplace)` (RHEL): an upgrade keeps the operator's copy — our include line with it — and writes `.dpkg-dist`/`.rpmnew` beside it; only a forced `confnew`, a reinstall or a hand restore drops the line. | `tests/front443.sh:474-478` (`cp nginx.conf.orig` = "the upgrade replaced it") | `lib/core_front443.sh:961-978`, `:1544-1546`; §6C.8's drift item 2 | `dpkg-query -W -f='${Conffiles}\n' nginx-common \| grep nginx.conf` / `rpm -qc nginx \| grep nginx.conf`; with the front on, `apt-get install --reinstall nginx-common` (or `dnf reinstall nginx`) then `vpn55.sh --front443-check`. | Benign either way — the guard exists for it. Were the file replaced on ordinary upgrades, unattended-upgrades would break the front nightly and the `crit` note would be the first anyone hears of it. |
+| 23 | **SELinux is the only MAC.** Ubuntu ships no enforced AppArmor profile for nginx, so the new directory and the loopback connects need no profile change. | `tests/front443.sh:137-141` (only SELinux is modelled) | `lib/core_front443.sh:650-651` (`getenforce` absent → nothing to do) | `aa-status 2>/dev/null \| grep -i nginx; ls /etc/apparmor.d/ \| grep -i nginx` | An operator-installed profile denies the new directory or the proxy hop: `nginx -t` passes (root reads), the reload or the hop is denied, `DENIED` lines in `journalctl -k`, and nothing in the engine looks there. |
+| 24 | **8443 and 8008 are nobody's.** Plesk (8443), Tomcat (8443, 8009) and some panels (8008) hold them; the engine refuses, and the override then leaves `http_port_t` on RHEL. | `tests/front443.sh:147-164` (nothing on either port unless the configuration puts it there) | `lib/core_front443.sh:100-101`, `:1171-1176`, `:44-53` | `ss -Hlntp 'sport = :8443'; ss -Hlntp 'sport = :8008'` before the install. | "port 8443 is already in use; set VPN55_FRONT443_WEB_PORT" — and following it on RHEL lands on a port with no `http_port_t`, which is row 18's denied bind. |
+
+Rows 1, 2, 3, 5–9 and 20–24 cost a minute each on the baseline host and are the first
+thing S5 does; rows 10–19 need the install, a client, a second DNS name, a Rocky box and a
+reboot, in that order. The S5 step list (kept outside the repo with the other session
+plans) is numbered against this table so that no row is left unobserved.
+
+#### R1 review — 2026-09-12 (second, independent reviewer; nothing VPS-run)
+
+Ten hypotheses were put to the code, each checked against the line that implements
+it rather than against the prose above. Six were confirmed as defects and fixed, one
+was confirmed as a design cost and is stated here rather than changed, three were
+refuted — and a refuted one is recorded with the same care, because the next reader
+will have the same suspicion. Line numbers are as of this revision. `tests/front443.sh`
+went from 189 to 252 assertions; every fix below has one that fails on the line it
+replaced.
+
+**Found without being asked — the section's own opening case could not succeed.**
+`_ovpn_port_conflict` (`lib/proto_openvpn.sh:632`) treats *any* LISTEN on :443 as a
+conflict, the panel's `10.8.0.1:443` included, so on a host running only the panel the
+offer is made — the self-collision this section opens with. The scan then finds no
+public-443 vhost (the panel's bind is exactly the one it leaves alone), nothing moves to
+`127.0.0.1:8443`, nginx never binds that port, and `_front443_binds_ok` demanded it
+unconditionally — so the install rolled back on every such host, and the offer's own
+text ("the front would still take the port") was a promise the engine could not keep.
+The web port is now required when, and only when, the configuration shows a listener
+on it (`_front443_dump_expects_web`, `core_front443.sh:487`; `need_web` at `:1256`
+and `:1268`; the same predicate in `front443_check` at `:1505`). With none, the install
+says so and a TLS connection to the front is simply closed. `front443_remove` had the
+matching defect: its final wait was for *anything* on 443, which the panel satisfied
+before the reload was even sent, and on a host without the panel it timed out and kept
+the ledger for a "second run" that then succeeded, every time. It now waits only when a
+vhost line actually came back, and for the spellings a restored line can carry — the
+wildcard or the public address (`_front443_public_443_held`, `:1333`; `vhost_restored`
+at `:1608`).
+
+**1. PROXY spoofing from loopback — CONFIRMED, stated as a cost, not closed.**
+`listen 127.0.0.1:<web> … proxy_protocol` (the rewrite, `:720` onward) plus
+`set_real_ip_from 127.0.0.1; real_ip_header proxy_protocol;` (`:883`) means any local
+process, any UID, may connect to the web port and send a PROXY header naming any
+address, and nginx believes it: in the access log, in every `limit_req` bucket keyed on
+`$binary_remote_addr` (a local process can exhaust a stranger's budget or dodge its
+own), in `allow`/`deny` lists (an admin location allowed to an office range is open to
+any local user), and in anything fed by the log (fail2ban can be made to ban an address
+of the attacker's choosing). Before the front a local process was `127.0.0.1` and could
+claim nothing else. *What is not affected:* the panel's vhost carries no
+`proxy_protocol` on its listen, so `$proxy_protocol_addr` is empty there and the realip
+module does nothing — the http-level snippet is inert for every listener that does not
+accept the header, port 80 included. *The strip hop is harmless, and here is the proof:*
+`listen 127.0.0.1:<strip> proxy_protocol; proxy_pass 127.0.0.1:<backend>;` (`:858`)
+reads the header and discards it — no `proxy_protocol on` on that server, no realip in
+the stream block, no stream `access_log` — so a forged header buys a local process
+exactly what it already had: a connection to `127.0.0.1:<backend>`, which it could dial
+directly. The UNIX-socket alternative was weighed and rejected: (a) the socket must be
+connectable by the nginx worker user, which on the hosts this sits beside is
+`www-data`, the web application's own user — the most likely compromised process on
+the box keeps the forgery, so the narrowing is from "any local user" to "the web app",
+not to nothing; (b) nginx does not unlink a stale socket before bind, so a master
+killed uncleanly leaves the next start failing with EADDRINUSE and the retry drop-in
+looping on it — a new availability failure a TCP port cannot have; (c) SELinux: the
+socket file under `/run` needs `httpd_var_run_t` and `httpd_t` must be allowed
+`connectto` on it, one more label to be wrong about on an enforcing host, which is the
+argument the header already makes for the strip hop. The cost is now also written into
+the realip snippet the operator finds on the host (`:877`). A transparent-proxy front
+would close it and is out of this version, as the design says.
+
+**2. Reload 1 succeeds, reload 2 fails — CONFIRMED as behaviour, with one defect
+beside it.** Between reload 1 (`:1223`) and the restoring reload, nothing listens on the
+public 443 except the panel's tunnel bind: every new connection from outside is
+*refused*, not hung. A fresh install's rollback is `front443_remove`, which is two more
+reloads (a third and a fourth in total): phase A removes the stream file and reloads
+(the wait at `:1573` for the front to release 443 is met at once, it never bound), phase
+B restores the vhosts and reloads. So the outage window on a failed fresh install is:
+the phase-2 writes, `nginx -t`, reload 2, up to `VPN55_FRONT443_BIND_WAIT` (10 s) of
+polling, then remove's two reloads and its own polls — worst case roughly 15 s of
+refused connections before the site is back. Rollback does poll `ss` (both waits in
+remove); the *scoped* rollback (`:1353`) reloads once and does not poll, which is
+acceptable — it puts back bytes that were serving seconds earlier. The defect beside
+this was remove's vacuous final wait, above.
+
+**3. `nginx -T` on a host whose config fails `nginx -t` — REFUTED as a defect.** nginx
+dumps nothing when the parse fails (the dump runs only after `ngx_init_cycle`
+succeeds), so `_front443_nginx_dump` returns empty with exit 1, and `front443_check`
+tests exactly that (`:1482`): one `include` row saying the configuration cannot be read.
+The bind rows still run beneath it, so the kernel's view is reported even then. Repair
+on such a host is refused by `front443_available` with the `nginx -t` output, before any
+change. An empty dump never reads as "no listeners, all ok".
+
+**4. Marker round-trip — CONFIRMED for one-line-multiple-directives and the
+unterminated form; refuted for comments and tabs.** A trailing `# comment` rides in the
+marker and comes back (tested since S1); tab indentation and tabs inside the directive
+are handled (`[ \t]` throughout). But `listen 443 ssl; listen 80;` went live as
+`listen 127.0.0.1:8443 ssl proxy_protocol; # vpn55-front443: was listen 443 ssl; listen 80;`
+— the port-80 listener silently gone until remove — and `listen 443` continued on the
+next line produced a stray `ssl;` that failed `-t` *and* a marker whose original never
+parsed, so even the rollback could not restore the file. Both, plus `server { listen 443
+ssl; }` on one line and `listen 443 ssl; }`, are now `refuse` records from the scanner
+(`sole()` at `:385`, the segment walk at `:410`), refused by the install before anything
+is touched (`:1139`), shown in the offer before the question (`proto_openvpn.sh:858`),
+reported by `front443_check` as a `vhost` row whose repair is by hand first, and never
+rewritten by `_front443_rewrite_text` (`:720`). A CR line ending (a vhost pasted from
+Windows) is one terminated listen, as it is to nginx. Deliberately not built: rewriting
+a multi-directive line in place — it would need both awk programs to track several
+directives per line and a marker holding a partial line.
+
+**5. `ss` address forms — CONFIRMED.** `_front443_ss_locals` (`:251`) compared `$4`
+verbatim, so `[::ffff:0.0.0.0]:443` (the v4 wildcard on a v6 socket), `:::443`
+(pre-bracket iproute2), and any `%eth0` scope suffix — `*%eth0:443`, `0.0.0.0%eth0:443`,
+`[::]%eth0:443`, `[2001:db8::10%eth0]:443` — all read as "nobody holds 443". nginx
+emits none of these; another holder of 443, or the kernel on a host with a device-bound
+socket, can. Normalised once, at the one reader, and tested form by form. Not a defect
+found: the `-H` flag needs iproute2 ≥ 4.14, which every distribution in the matrix ships.
+
+**6. `front443_holder_is_nginx` via `/proc/<pid>/comm` — REFUTED for workers, CONFIRMED
+as a cost for namespaces and OpenResty.** `ss -p` names every pid sharing the listening
+socket — master and workers — and a worker's `comm` is `nginx` (the process *title*
+changes, `comm` does not), so the all-must-match loop (`:308`) is right. What it proves
+is the *name*, not the identity: an OpenResty binary is `nginx` by comm, and a
+host-network container's nginx shows a host pid with comm `nginx` while `nginx -T` on
+the host describes a different nginx or none. In both, the install rewrites the host's
+files, reload 1's wait for the wildcard to close times out because the real holder never
+moved, and the fresh rollback restores everything — loud, and the message names the
+holder from `ss`. The one-line guard that would close it — compare
+`readlink /proc/<pid>/exe` with `command -v nginx`'s realpath — was not added: an
+upgraded-but-not-restarted nginx shows `(deleted)` and would be refused with a message
+about something else. Stated, not solved.
+
+**7. `front443_adopt_file` ledger row before the rewrite — REFUTED.** A `file` row for a
+file that was not rewritten (`:1456` then a failed `:1457`) is harmless on every path:
+`_front443_restore_file` on a marker-less file prints it unchanged, `cmp` says so, and
+nothing is written; the next install's scan re-adds the row idempotently
+(`_front443_ledger_add` dedupes on the exact row). In the portal's case the file stays
+on its bare `listen 443`, `_pnl_portal_apply` returns before its reload, and the guard
+reports it as drift until repair rewrites it. Ledger-first is the right order.
+
+**8. Escaping of `note` text — REFUTED as a boundary, recorded as a property.** The
+panel builds every node with `createTextNode` (`panel/public/js/app.js:531`, via
+`fromService` at `:287` and `:497`; "NO innerHTML, ANYWHERE" is the file's second
+rule), and `records.js` re-joins any extra tabs into the message. The terminal path
+prints through `printf '%s'` (`lib/ui.sh:40`), so an ESC byte in a vhost *filename*
+would reach the terminal raw — but the filename comes from `nginx -T`, i.e. from a file
+root created under `/etc/nginx`; no privilege boundary is crossed. A tab in a vhost path
+is refused by the ledger (`_front443_ledger_add`) and so fails the install loudly at
+the rewrite; in a check row it shifts the repair column by one field — cosmetic, and
+root-only. A newline in a path truncates the `-T` header at the newline, so no second
+record can be forged. Nothing to fix.
+
+**9. `--front443-repair` in three states — one CONFIRMED, one improved, one behaviour
+recorded.** (a) *Service stopped:* the engine refuses on the dead backend (`:1106`)
+before any change, and `cli_front443` then prints the check, whose `backend` row and
+closing line (`lib/cli.sh:386`) say to start the service — actionable, but note the
+consequence: **drift cannot be repaired while the fronted service is stopped**, because
+the engine will not point the front at a dead port even on a re-run. Recorded, not
+changed. (b) *nginx stopped:* the repair "succeeds" (writes, no reload, a warning), and
+the check then printed four `nothing holds …` rows with the cause in none of them. Now
+one row — "nginx is not running … `systemctl start nginx`" (`:1513`) — and the backend
+row still stands alone. (c) *Ledger missing, markers present* — CONFIRMED, the worst
+of the ten. `front443_installed` is the ledger file, so this read as a fresh install;
+the scan found no public-443 listener (all tagged), saw the web port held by those very
+vhosts, and told the operator to *set `VPN55_FRONT443_WEB_PORT` to a free one*.
+Following that advice pointed a new front at a port nothing listened on, failed the
+bind wait, and rolled back through a ledger that held no `file` rows — restoring
+nothing, with the stream file now gone: website and tunnel both down. Refused
+(`_front443_dump_has_markers`, `:497`; the refusal at `:1091`) with the by-hand recipe.
+Owed at the time of this review, and built the same day — see "R1 follow-up" below: a
+ledger-less remove that reads the marked files from the host; `front443.state` in the
+backup's `reference/` area (`lib/core_backup.sh`) where `fw.state` — the same class of
+ledger — already rides for forensics; and a way to un-record `front=nginx` after a
+restore onto a fresh host short of an uninstall that revokes every credential.
+
+**10. Re-run after `VPN55_FRONT443_WEB_PORT` changed — CONFIRMED, message fixed; a
+second instance found.** The refusal said "run front443_remove", a bash function
+nobody has. It now names the override to unset and the remove-and-reinstall path
+(`:1061`). The second instance: `front443_repair` passed the ledger's *web* port but
+took *strip* from the environment, so a repair from a shell with
+`VPN55_FRONT443_STRIP_PORT` changed hit the same refusal; it now passes all three from
+the ledger (`:1387`; `front443_install` takes an optional third argument). The adapter's
+re-run (`proto_openvpn.sh:963`) still reads the environment and still refuses — by
+design, and now with a message that says what to do.
+
+#### R1 follow-up — 2026-09-12 (the four owed items, built)
+
+The R1 review left four things recorded as design decisions rather than defects. They
+were built the same day, each on the smallest rule that resolves the decision, and each
+with a test that fails on the line it exercises (`tests/front443.sh` 281,
+`tests/front443-adapter.sh` 91).
+
+**1. A ledger-less remove — `front443_remove` without a ledger, and `vpn55.sh
+--front443-remove`.** With the ledger present nothing changed. Without one, and with
+the front's traces present (`front443_traces_present`, `lib/core_front443.sh:534`),
+remove runs the same two phases from what the host itself says: the marked vhost lines
+are found in `nginx -T` *and* by a marker grep under nginx's directory
+(`_front443_marked_files`, `:512`) — the second because `-T` prints nothing on a broken
+configuration, and a half-removed host is where it may be broken; the stream file, the
+include, the snippet and the drop-in are at paths only VPN55 writes; the waits use the
+addresses the stream file binds while it is still there to read
+(`_front443_stream_conf_binds`, `:544`). Two things only the ledger knew are not done
+and are said: the SELinux boolean's prior value (left, with the `setsebool -P` line to
+put it back, printed only when the boolean is on — `:1724`), and the ledger itself.
+The install's ledger-less refusal now names the verb instead of the four-step recipe
+(`:1138`). The CLI verb (`lib/cli.sh:407`) says the consequence before asking — with a
+ledger, that the service on `127.0.0.1:<backend>` is unreachable until its install is
+re-run; without one, what the salvage will and will not do — and asks with
+`ask_proceed`, so no terminal declines and `VPN55_ASSUME_YES=1` proceeds unattended.
+Exit: `removed` 0, declined 1, `off` 0 when there is nothing to remove. It is root at
+the console like repair; the panel's sudo rule is unchanged. Tested: the ledger-less
+remove restores site-a, site-b and nginx.conf byte for byte with two reloads, a fresh
+install is accepted again after it; the same with `-T` returning nothing; the boolean
+untouched and the command printed under Enforcing; the CLI's decline, proceed and
+nothing-to-remove paths.
+
+**2. `front443.state` in the backup's `reference/` area** (`lib/core_backup.sh:402`).
+The same class of file as `fw.state`, for the same reason: it names files *this* host
+rewrote, the ports they moved to and a boolean's prior value, and remove trusts it the
+way uninstall trusts `fw.state` — placed by a restore it would send remove to put back
+files the new host never had rewritten. The path is spelled in `core_backup.sh` with
+the engine's default as fallback, so a backup made by a process that did not load the
+engine still carries it. `docs/backup.md` §1 lists it.
+
+**3. Off the record: `VPN55_OVPN_FRONT=no` on a re-run** (`lib/proto_openvpn.sh:1013`
+onward; the install flow at `:1653`). The rule: the variable that declines the offer is
+the same answer to the same question, so it needs no new verb; it is honoured only when
+the front is *not* on this host — with the ledger present the front is carrying the
+vhosts and forgetting that is not a way to take it down (the refusal names
+`--front443-remove`); with traces and no ledger, the same verb comes first — and the
+record is dropped only once the port check has passed. If 443 is held by nginx the
+offer is made again; declined, the install refuses with the record intact and says why
+(`:1667`); accepted at the prompt, the record stays `nginx`. Held by anything else it
+refuses as it always did. So on a host where nginx still wants the port the drop is
+never possible, which is correct: the service cannot have 443 there, and the message
+says so rather than leaving a record that no longer matches anything. Where the drop
+goes ahead the rest of the install is the plain tcp/443 path that existed before the
+front — SELinux label, `port 443` in the render, the firewall rule opened. The
+credentials-present failure text and the status note's "no front installed" record
+both name the variable now. Tested at the helper level (wanted / allowed / drop) with
+the engine stubbed; the flow itself is a re-run of the acceptance suite's `--install`,
+S5.
+
+**4. Repair while the fronted service is stopped** (`lib/core_front443.sh:1165`). A
+fresh install still refuses a dead backend — the front is never *put on* pointing at
+nothing. A re-run warns instead and goes ahead: what a re-run does is put the vhosts,
+the stream file and the include back, and nginx accepts a `proxy_pass` to a port
+nothing holds. The check then fails on the `backend` row alone, which `cli_front443`
+already says is not the front's to fix. Tested: drift repaired with the backend down,
+the check's single `backend` row, ok once the service is back.
+
+What this did not change: the adapter's own re-run still waits for the daemon's
+loopback bind before calling the engine (`_ovpn_front_apply`), so the relaxation is
+reachable through `--front443-repair` only, which is the operator's tool for exactly
+this.
+
+**Still owed to a socket, added by R1:** that a TLS ClientHello to a front with no web
+listener is closed promptly rather than after `proxy_connect_timeout`; that `ss` on the
+matrix prints v4-mapped and scoped forms as normalised here; the half-removed-host
+recipe on a real nginx.
 
 ---
 
@@ -840,6 +1493,16 @@ terminal is asked. It becomes one the moment Phase 6 offers an install button. T
 of the fix, when it is made, is a `mode <key> <label> <default 0|1> <description>` record
 in `_capabilities` that a caller can render before calling `_install` — the same pattern
 as `option`, one verb earlier.
+
+**A second instance of the same gap, found by S2 (2026-09-11) and left open the same
+way.** The shared-443 front (§6C.8) is install-time *state* — "this install shares its
+port through the web server" — and, like the transport mode above, no capability record
+can carry it: `option` describes what `_cred_add` accepts, and stretching it to mean
+"state" would leave every reader guessing which of the two it is looking at. So it is
+not declared in `_capabilities`. It is reported where install-time state already goes —
+as a `note` in `_status`, every read, while the front is on — and the contract was not
+widened for it. When the `mode` record above is added, the front's on/off is a second
+row of it, not a new shape.
 
 ---
 
@@ -1317,6 +1980,11 @@ strengths is marketing.
 
 | Date | Phase | Change |
 |---|---|---|
+| 2026-09-12 | 10 | §6C.8 **"What S5 must observe — the model behind the tests"** — a table of the 24 behaviours of the real system that the three fake-host suites encode (`ss` forms, `nginx -t`/`-T`/`-V`, reload timing and where the master logs, the module package's side effects, `ssl_preread`, PROXY protocol, SELinux port types and booleans, certbot's edits and parser, the drop-in at boot, symlinks, mawk), each with the fake's line, the code's line, the operator's command and the production symptom, ordered cheapest × worst first. Two are not hypotheses: nginx binds **only the wildcard** when a wildcard and a specific 443 are both configured (so the panel's `10.8.0.1:443` has no socket on the baseline host and reload 1 must create it under the still-open wildcard — the section's opening case cannot pass reload 1, and remove after a later panel deploy leaves the website down until a restart); and `nginx -t` **binds**, tolerating only EADDRINUSE, so a stopped tunnel makes every `-T` reader see a broken configuration. Code unchanged; the S5 plan outside the repo is renumbered against the table. |
+| 2026-09-12 | 10 | §6C.8 **R1 follow-up** — the four items R1 left owed, built: `front443_remove` works without a ledger from the marked files (found in `-T` and by grep, for a broken `-T`) and `vpn55.sh --front443-remove` exposes it with the consequence said before `ask_proceed`; `front443.state` rides in the backup's `reference/` area beside `fw.state`; `VPN55_OVPN_FRONT=no` on a re-run takes a service off the front's record — only when the front is not on the host, and only after the port check passes, so a refusal un-records nothing; a re-run no longer refuses a dead backend, so drift is repairable while the tunnel is stopped (a fresh install still refuses). `tests/front443.sh` 281, `tests/front443-adapter.sh` 91. |
+| 2026-09-12 | 10 | §6C.8 **R1 review** — second, independent review against the code. Found beside the ten hypotheses: the section's own opening case (a host whose only 443 holder is the panel) could not succeed, because the install demanded a bind on the web port that no vhost gives — now required only when the configuration shows a listener there; remove's final wait was satisfied by the panel's bind alone. Fixed: `ss` forms (v4-mapped, `:::`, `%scope`) read as "unheld"; a public-443 listen sharing its line or continued on the next one was rewritten into a silent listener loss or an unrestorable marker — now a `refuse` record; a ledger-less host carrying markers was sent to "pick another web port", whose rollback restored nothing; the re-run refusal named a bash function; repair took the strip port from the environment; nginx-stopped was four rows with the cause in none. Stated: PROXY spoofing from loopback (any local process may name any client address to the vhosts; the strip hop is proven harmless; UNIX socket rejected with reasons). Refuted and recorded: `nginx -T` on a broken config, `adopt_file`'s ledger-first order, `note` escaping, worker pids in `comm`. 252 assertions. |
+| 2026-09-11 | 10 | §6C.8 **built** (S1 engine, S2 adapter, S3 surfaces) and **reviewed as one system** (S4); the three session notes folded into one "As built". What shipped beside the design: PROXY protocol via two stream servers (the directive is per server); ports 8443/8008 rather than 4443 (both carry `http_port_t`); `httpd_can_network_connect` set, recorded first, reversed, cost stated; two reloads because a wildcard listener refuses a specific bind in the same cycle; a fourth invariant read from `ss` by address; restore by marker with the include line removed by shape; the offer takes the typed word `nginx`; the client file is byte-identical either way; the firewall opens nothing; failure rolls a fresh install back to nothing and a re-run back only to its own rewrites — the review found the old single scope would have taken a live tunnel down on a rejected repair. Also from the review: an empty scanner field that swallowed the trap-6 flag under tab IFS, a one-pass rewrite that duplicated a listen, the WireGuard `note` `printf` with a stray `\n` argument, and one protocol name in `core_net.sh`. Nothing VPS-run; §10 of circumvention.md stays unticked until S5. |
+| 2026-09-11 | 10 | §6C.8 added — **port 443 is shared, not surrendered; DESIGNED, not built.** §6C.6's refusal hits the normal operator (a VPS already serving a website), and VPN55's own portal collides with `tcp443` on the same host. The front is nginx's `stream` module, chosen over OpenVPN `port-share` on one question — who keeps the real client address — because the products this sits beside rate-limit per address and would collapse into one `127.0.0.1` bucket, while VPN55 does nothing with an OpenVPN peer's address. Routes on *is this a TLS ClientHello*, not on SNI, so a site added later needs no edit. Binds the PUBLIC address, never the wildcard, because a wildcard would collide with the panel's tunnel-address bind inside the same nginx — 443 is bound by address, never bare, host-wide. Offered only when the holder is nginx; the rewrite tags each `listen` line and uninstall reverses the tagged lines, never the files. Drift (certbot, a replaced nginx.conf, a pasted vhost) is a live risk, so `_status` checks three invariants on every read. Two claims await a socket. |
 | 2026-08-31 | 9 | **§6G added, and §3 rewritten to match — a second factor, a settings screen, alerts. None of the three widened the eight verbs.** TOTP gates SIGNING IN rather than each write, because a session opened on one factor still reads every user name, quota, endpoint and traffic total on the host, and a code demanded several times an hour trains the reflex phishing needs (§6G.1). Enrolling, clearing and password changes are root at the console, so the panel now READS the administrator file and never writes it; a stolen session can neither enrol a factor of its own nor remove the one that is there. A code is spent once, with the record held in memory rather than persisted — writing it would hand the HTTP-facing process a write path into the file holding every hash, on every login. There are deliberately NO recovery codes: a stack of single-use secrets that skip the factor, stored beside the hashes, is a bypass, and the break-glass path needs root, which grants nothing root did not already have. A wrong code costs the same as a wrong password against the same (username, IP) counter; a MISSING code costs nothing, because the normal sign-in passes through that branch exactly once. §6G.2: the settings screen writes to the panel's own state directory and not to /etc/vpn55/panel.conf, which stays root-owned and read-only, and no verb was added for it. The exposed keys are an allowlist built on one rule — a key is exposed if the worst an authenticated administrator can do with it is make the panel noisier, quieter, slower or stricter — so `allow_unauthenticated`, `require_totp`, `trust_proxy`, the bind addresses, both privileged program paths, `state_dir`, both revoke switches and the alert destination stay SSH-only. The overlay wins over the file, says so per key, and is DROPPED rather than fatal when it is unreadable or out of range. §6G.3: alerting is the panel's only outbound connection, off by default, and sends a condition type and a count — no user name, no administrator name, no address. Three layers against a storm: a transition rather than a state, N confirming readings in BOTH directions, and a per-condition cooldown under an hourly ceiling. Two operational traps recorded: the webhook URL is restricted to http/https at send time as well as at start-up, and an `IPAddressDeny=any` added as generic unit hardening silently kills delivery, because a blocked connect looks exactly like a webhook that did not answer. |
 | 2026-08-30 | 8 | **Review of the privileged path as one system.** §5 corrected: a compromised panel gains all EIGHT verbs, and `cred-config` returns the client private key of ANY user whose credential is still inside its hand-off window — the ownership check is (user, credential) consistency and a compromised panel supplies both halves. The response now says to reissue every credential named in a `cred-config` record, because those are legitimate users' keys, read without a trace anywhere but the helper's log. §3.1 rewritten from one deployment trap to THREE, all sharing one shape — the unit hardens the panel but binds the root process sudo starts, and none of them fails at start-up: `no_new_privs` set implicitly (unchanged), an emptied `CapabilityBoundingSet=` that leaves the helper at euid 0 with zero capabilities (the unit's comment claimed the opposite of how execve works), and `ProtectSystem=strict` with no `ReadWritePaths=`, which makes every write verb fail and silently prevents the root audit log from ever being created. §6E.2: the writability backstop now covers the shell libraries each program SOURCES as root — `lib/` is a sibling of `helper/`, not an ancestor, so walking the target's parents never reached it and a group-writable install tree passed. Seven/eight verb drift fixed in §5, §6E.1 and §6E.2. |
 | 2026-08-30 | 8 | §6F added — the self-serve portal. It is a SECOND EXPRESS APPLICATION on a second socket rather than the admin app with a role check, so an admin route is not registered on the portal's listener at all and no token, session or header can reach one (§6F.1); the cost of the two sharing one process is stated rather than buried, along with what buys it and what would be needed to split them (§6F.2). §3's one-line summary now reads eight verbs, seven of which write: `cred-config` was added deliberately, takes the USER as an argument and lets the register decide ownership — the only verb here that does not trust the panel about who may ask — and it needed no sudoers change because that rule pins the program rather than the arguments (§6F.3). Access codes are 256-bit, shown once, stored only as SHA-256, and carried in a URL fragment so they never reach a server log; withdrawing one ends its sessions at the next request (§6F.4). Rotation issues before it revokes, so a half-failure leaves two working credentials rather than none, and says so (§6F.5). `portal_trust_proxy` is refused unless the bind is loopback (§6F.7). CI runs both acceptance criteria on every push. |

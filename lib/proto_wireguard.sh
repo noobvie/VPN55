@@ -792,7 +792,7 @@ _wg_settings_bootstrap() {
     # same error again. This is the only path an unattended install has on a host
     # behind provider NAT, where the detected address is deliberately discarded.
     if [[ -z "$endpoint" ]]; then
-        endpoint="${VPN55_WG_ENDPOINT:-}"
+        endpoint="${VPN55_WG_ENDPOINT:-${VPN55_ENDPOINT:-}}"
     fi
 
     # The endpoint clients dial. net_public_endpoint returns 2 and a private
@@ -847,7 +847,7 @@ _wg_settings_bootstrap() {
     local dns_choice dns_custom dns
     dns_choice="$(_wg_conf_get dns_choice 2>/dev/null || printf '')"
     if [[ -z "$dns_choice" ]]; then
-        dns_choice="${VPN55_WG_DNS_CHOICE:-system}"
+        dns_choice="${VPN55_WG_DNS_CHOICE:-${VPN55_DNS_CHOICE:-system}}"
         net_resolvers_explain
         ask_value dns_choice "DNS (system/cloudflare/quad9/custom)" "$dns_choice" || return 1
         if [[ "$dns_choice" == "custom" ]]; then
@@ -2032,8 +2032,13 @@ _wg_notes() {
     local _extra
     _extra="$(net_endpoints_count)"
     if [[ "$_extra" != "0" ]]; then
-        printf 'note	%s	info	%s
-' "$tag" \n            "Credentials issued from now on come with ${_extra} extra configuration file(s), one per additional address. This protocol has no way to change address on its own, so hand them over together and tell the user to switch tunnels in the app if the first stops connecting."
+        # ⚠ A literal `\n` sat where the line continuation belongs — a third
+        # argument of one letter, so this emitted `note <tag> info n` and then
+        # a second record with the sentence in the TAG field. The same slip
+        # was fixed in the other adapter's endpoints note; the stream-shape
+        # test there asserts four fields per note, and this one now passes it.
+        printf 'note\t%s\tinfo\t%s\n' "$tag" \
+            "Credentials issued from now on come with ${_extra} extra configuration file(s), one per additional address. This protocol has no way to change address on its own, so hand them over together and tell the user to switch tunnels in the app if the first stops connecting."
     fi
 
     # Which transport mode is running, and what it costs. The stock mode is the

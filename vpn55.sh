@@ -290,6 +290,8 @@ readonly VPN55_VERSION VPN55_ROOT
 . "$VPN55_ROOT/lib/core_distro.sh"
 # shellcheck source=lib/core_net.sh
 . "$VPN55_ROOT/lib/core_net.sh"
+# shellcheck source=lib/core_front443.sh
+. "$VPN55_ROOT/lib/core_front443.sh"
 # shellcheck source=lib/core_users.sh
 . "$VPN55_ROOT/lib/core_users.sh"
 # shellcheck source=lib/core_pki.sh
@@ -300,6 +302,10 @@ readonly VPN55_VERSION VPN55_ROOT
 . "$VPN55_ROOT/lib/core_backup.sh"
 # shellcheck source=lib/ui_adapter.sh
 . "$VPN55_ROOT/lib/ui_adapter.sh"
+# shellcheck source=lib/panel_deploy.sh
+. "$VPN55_ROOT/lib/panel_deploy.sh"
+# shellcheck source=lib/core_setup.sh
+. "$VPN55_ROOT/lib/core_setup.sh"
 # shellcheck source=lib/ui_screens.sh
 . "$VPN55_ROOT/lib/ui_screens.sh"
 # shellcheck source=lib/cli.sh
@@ -366,24 +372,27 @@ main_menu() {
     while true; do
         main_banner
         cat >&2 <<'MENU'
-  1) Host report          — OS, container, firewall, pools
-  2) Network setup        — IP forwarding, NAT, firewall backend
-  3) Users                — the identity registry
-  4) Tunnel services      — install and manage protocols
-  5) Admin panel
+  1) Set up this server   — everything, in one pass (start here)
+
+  2) Host report          — OS, container, firewall, pools
+  3) Network setup        — IP forwarding, NAT, firewall backend
+  4) Users                — the identity registry
+  5) Tunnel services      — install and manage protocols
+  6) Admin panel
 
   S) Update VPN55 itself
   U) Remove VPN55 network state
   0) Quit
 MENU
         local key=""
-        ask_key key "Select [0-5 / S / U]" || return 0
+        ask_key key "Select [0-6 / S / U]" || return 0
         case "$key" in
-            1)     screen_doctor    || true; press_enter || true ;;
-            2)     screen_network   || true; press_enter || true ;;
-            3)     screen_users     || true ;;
-            4)     screen_protocols || true; press_enter || true ;;
-            5)     screen_panel     || true; press_enter || true ;;
+            1)     setup_run        || true; press_enter || true ;;
+            2)     screen_doctor    || true; press_enter || true ;;
+            3)     screen_network   || true; press_enter || true ;;
+            4)     screen_users     || true ;;
+            5)     screen_protocols || true; press_enter || true ;;
+            6)     screen_panel     || true; press_enter || true ;;
             s|S)   screen_update    || true; press_enter || true ;;
             u|U)   screen_uninstall || true; press_enter || true ;;
             0|q|Q) return 0 ;;
@@ -400,6 +409,9 @@ VPN55 ${VPN55_VERSION} — self-hosted multi-protocol VPN manager
 
   -h, --help        This text
   -V, --version     Version, revision and source base URL
+      --setup       Set this server up in one pass: check the host, install
+                    every tunnel service it can run, deploy the admin panel,
+                    register you as the first user and print a URL
       --doctor      Print a host report and exit; changes nothing
       --list-users  The user registry, one TAB-separated record per line
       --status      Every adapter's state, machine-readable; changes nothing
@@ -423,6 +435,18 @@ VPN55 ${VPN55_VERSION} — self-hosted multi-protocol VPN manager
                     Add one, so new client configs list it as a fallback
       --endpoint-remove <host>
                     Drop one. Configs already issued keep it
+      --front443-check
+                    The shared-443 front (a tunnel service sharing port 443
+                    with nginx): one row per invariant. Exit 1 if any is
+                    broken, 2 if no front is installed. Changes nothing
+      --front443-repair
+                    Re-apply the front — the same idempotent rewrite its
+                    install ran — then run the check; exits as the check does
+      --front443-remove
+                    Take the front down and put the web server's files back,
+                    without uninstalling the service that shared the port
+                    (it is unreachable until its install is re-run). Works
+                    from the front's own files when its ledger is missing
 
 With no option, the interactive menu is shown. Every action runs as root on the
 local host. The only thing fetched over the network is VPN55 itself, and only by
@@ -436,6 +460,11 @@ Environment:
   VPN55_HOME        Where an installed copy lives. Defaults to
                     /usr/local/lib/vpn55 — the path the panel's sudo rules name.
   VPN55_ASSUME_YES  Set to 1 to answer every confirmation with yes.
+  VPN55_ENDPOINT    Public address or hostname clients dial, for every
+                    protocol at once. A per-protocol setting already stored
+                    wins over it; a per-protocol variable overrides it.
+  VPN55_DNS_CHOICE  Resolver preset handed to clients by every protocol at
+                    once: system, cloudflare or quad9.
   VPN55_ETC         State directory. Defaults to /etc/vpn55.
   VPN55_NET_PARENT  Tunnel parent range, an x.y.0.0/16. Defaults to 10.8.0.0/16.
   VPN55_ARTIFACT_LOCALE
@@ -487,6 +516,9 @@ main() {
         --endpoints)       cli_endpoints list          || return $? ;;
         --endpoint-add)    cli_endpoints add "${2:-}"    || return $? ;;
         --endpoint-remove) cli_endpoints remove "${2:-}" || return $? ;;
+        --front443-check)  cli_front443 check  || return $? ;;
+        --front443-repair) cli_front443 repair || return $? ;;
+        --front443-remove) cli_front443 remove || return $? ;;
         --backup)      shift; cli_backup  "$@" || return $? ;;
         --backup-list) bak_list || return 1 ;;
         --restore)     shift; cli_restore "$@" || return $? ;;
@@ -498,6 +530,7 @@ main() {
                 10) info "Run vpn55.sh again to use it."; return 0 ;;
                 *)  return 1 ;;
             esac ;;
+        --setup)      setup_run || return 1 ;;
         "")           main_menu || return 1 ;;
         *)
             error "Unknown option '${1}'."

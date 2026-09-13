@@ -88,11 +88,14 @@ What the three in-tree adapters currently answer:
   - **`/etc/vpn55/pki/reqs/*`** — transient CSR and extension files.
   - **`/etc/vpn55/pki/refresh.d/*`** — the CRL refresh hooks are executables
     that name paths on *this* host and are recreated by each adapter's install.
-  - **`/etc/vpn55/fw.state` and `/etc/vpn55/net.conf`** — carried in a
-    `reference/` area of the archive and **never placed by a restore**. They
-    describe rules on *that* host; replaying them onto a replacement claims
-    rules it never had, and the ledger is what an uninstall trusts when deciding
-    what it may remove.
+  - **`/etc/vpn55/fw.state`, `/etc/vpn55/net.conf` and `/etc/vpn55/front443.state`**
+    — carried in a `reference/` area of the archive and **never placed by a
+    restore**. They describe rules on *that* host; replaying them onto a
+    replacement claims rules it never had, and a ledger is what an uninstall (or
+    the shared-443 front's remove) trusts when deciding what it may put back. A
+    restored host that carries `front=nginx` in an adapter's settings re-runs
+    that adapter's install to put the front on again — or, where the new host is
+    not to share the port, runs it with `VPN55_OVPN_FRONT=no`.
   - **The backup passphrase.** See §2.
 
 ## 2. Encrypted at rest, and the passphrase is not on the host

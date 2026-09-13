@@ -252,6 +252,190 @@ cli_endpoints() {
     esac
 }
 
+# ─── The shared-443 front: check and repair, at the console ───────────────────
+# docs/security-model.md §6C.8. The engine (lib/core_front443.sh) is
+# protocol-neutral and so is this: it prints what the front carries by PORT,
+# never by what listens there.
+#
+# `--front443-check` is the operator's half of the drift guard. The adapter that
+# uses the front already runs front443_check on every status read and emits a
+# `note` per broken invariant naming this command as the repair; this prints
+# the same answer as a table, one row per invariant, and exits 1 on any broken
+# one so a cron line or a monitor can act on it. `--front443-repair` runs the
+# same idempotent apply the install ran and then the check, so its exit status
+# is the check's — a repair that "succeeded" on a front still broken would be
+# the one signal here that lies.
+#
+# `--front443-remove` takes the front down and puts the web server's files
+# back — the same removal the fronted service's uninstall runs, without the
+# uninstall. Two hosts need it. One where the front's ledger is gone but its
+# files are not (a hand `rm`, a restore that did not carry /etc/vpn55): the
+# engine then removes by what the files themselves say, and the install of
+# the fronted service refuses until that is done (R1, hypothesis 9c). And one
+# where the operator wants the port back for the web server alone: the front
+# comes off, and the service recorded as sharing the port is unreachable
+# until its install is re-run — which puts the front back, or, with
+# VPN55_OVPN_FRONT=no, takes the service off the front's record where nginx
+# no longer wants the port. That consequence is said before the question, and
+# the question is ask_proceed: no terminal declines, VPN55_ASSUME_YES=1
+# proceeds unattended.
+#
+# ⚠ Root at the console only, like every other flag below distro_require_root.
+# The panel's sudo rule pins `--status` and nothing else, and it must stay that
+# way: repair rewrites files VPN55 does not own and reloads the web server,
+# which is not something a panel compromise may be able to do (§6G.2 — the
+# panel writes to its own directory and nowhere else). The panel SHOWS the
+# adapter's note; a person runs this.
+_cli_front443_row() {
+    local state="${1:-}" which="${2:-}" detail="${3:-}"
+    case "$state" in
+        ok) printf '  %s[ ok ]%s  %-8s %s\n' "$GREEN" "$RESET" "$which" "$detail" >&2 ;;
+        *)  printf '  %s[FAIL]%s  %-8s %s\n' "$RED"   "$RESET" "$which" "$detail" >&2 ;;
+    esac
+}
+
+cli_front443() {
+    local action="${1:-check}" out rc=0 k v backend="" web="" strip="" bind="" bind6=""
+    local rtype rwhich rdetail rrepair
+    local -a broken_include=() broken_vhost=() broken_bind=() broken_backend=()
+
+    case "$action" in
+        check|repair) ;;
+        remove) _cli_front443_remove; return $? ;;
+        *) error "unknown front443 action '${action}'."; return 2 ;;
+    esac
+
+    if [[ "$action" == "repair" ]]; then
+        if ! front443_installed; then
+            error "The shared front is not installed on this host, so there is nothing to repair."
+            error "It is put on by the install of the service that shares port 443 — re-run that."
+            return 1
+        fi
+        section "Shared 443 — repair"
+        front443_repair || { error "The repair did not complete; the check below says where it stands."; rc=1; }
+        ui_rule
+    fi
+
+    if ! front443_installed; then
+        printf 'off\n'
+        info "The shared front is not installed on this host. Port 443 is whatever holds it."
+        return 2
+    fi
+
+    while IFS=$'\t' read -r k v; do
+        case "$k" in
+            backend) backend="$v" ;;
+            web)     web="$v" ;;
+            strip)   strip="$v" ;;
+            bind)    bind="$v" ;;
+            bind6)   bind6="$v" ;;
+        esac
+    done < <(front443_info || true)
+    [[ "$bind6" == "-" ]] && bind6=""
+
+    section "Shared 443 — check"
+    info "nginx's stream front holds ${bind}:443${bind6:+ and [${bind6}]:443}. TLS goes to the"
+    info "web listener on 127.0.0.1:${web} (with the PROXY protocol header); everything"
+    info "else goes through 127.0.0.1:${strip} to the service on 127.0.0.1:${backend}."
+    info ""
+
+    # ⚠ The engine returns 2 for "no front installed", and that is not a broken
+    # invariant — a bare `|| rc=1` here would print four ok rows and then say the
+    # front is broken, which is the one output on this screen that could be read
+    # two ways. It can only happen if the ledger went away between the check at
+    # the top of this function and this line, but "unlikely" is not a reason to
+    # render a contradiction.
+    local crc=0
+    out="$(front443_check)" || crc=$?
+    if [[ "$crc" -eq 2 ]]; then
+        printf 'off\n'
+        warn "The front's ledger went away while this ran; there is nothing to check."
+        return 2
+    fi
+    [[ "$crc" -eq 0 ]] || rc=1
+    while IFS=$'\t' read -r rtype rwhich rdetail rrepair; do
+        [[ "$rtype" == "broken" ]] || continue
+        case "$rwhich" in
+            include) broken_include+=("${rdetail} — repair: ${rrepair}") ;;
+            vhost)   broken_vhost+=("${rdetail} — repair: ${rrepair}") ;;
+            bind)    broken_bind+=("${rdetail} — repair: ${rrepair}") ;;
+            backend) broken_backend+=("${rdetail} — repair: ${rrepair}") ;;
+            *)       broken_bind+=("(${rwhich}) ${rdetail} — repair: ${rrepair}") ;;
+        esac
+    done <<< "$out"
+
+    # The design's three invariants, then the kernel's (S1 added it: what the
+    # configuration says and what ss says are two different questions).
+    if [[ ${#broken_include[@]} -eq 0 ]]; then
+        _cli_front443_row ok include "the stream include is in nginx.conf and the front's file is read"
+    else
+        for v in "${broken_include[@]}"; do _cli_front443_row fail include "$v"; done
+    fi
+    if [[ ${#broken_vhost[@]} -eq 0 ]]; then
+        _cli_front443_row ok vhost "no http listener holds the public 443"
+    else
+        for v in "${broken_vhost[@]}"; do _cli_front443_row fail vhost "$v"; done
+    fi
+    if [[ ${#broken_backend[@]} -eq 0 ]]; then
+        _cli_front443_row ok backend "the service is bound on 127.0.0.1:${backend}"
+    else
+        for v in "${broken_backend[@]}"; do _cli_front443_row fail backend "$v"; done
+    fi
+    if [[ ${#broken_bind[@]} -eq 0 ]]; then
+        _cli_front443_row ok bind "the kernel agrees with all of that, and no wildcard holds :443"
+    else
+        for v in "${broken_bind[@]}"; do _cli_front443_row fail bind "$v"; done
+    fi
+    ui_rule
+
+    if [[ "$rc" -eq 0 ]]; then
+        printf 'ok\n'
+        success "Every invariant holds."
+    else
+        printf '%s\n' "$out"
+        if [[ "$action" == "check" ]]; then
+            error "The shared front is broken. Until it is repaired the website and the tunnel"
+            error "behind it are both affected. Repair: ${VPN55_FRONT443_REPAIR_CMD}"
+        else
+            error "The shared front is still broken after the repair — read the rows above."
+            error "A 'backend' failure is not the front's to fix: start the service that listens there."
+        fi
+    fi
+    return "$rc"
+}
+
+_cli_front443_remove() {
+    local backend
+    section "Shared 443 — remove"
+    if front443_installed; then
+        backend="$(front443_info | awk -F'\t' '$1 == "backend" { print $2 }')"
+        warn "This takes nginx's stream front off port ${VPN55_FRONT443_PORT} and puts the web server's"
+        warn "vhosts back on their original listen lines (two reloads). The service the front"
+        warn "carries — on 127.0.0.1:${backend:-?} — is then UNREACHABLE from outside until its"
+        warn "install is re-run: that puts the front back, or, run with the front declined,"
+        warn "takes the service off the front's record where nginx no longer wants the port."
+    elif front443_traces_present; then
+        warn "The front's ledger is missing but its files are still here. They are removed by"
+        warn "what they themselves say: marked vhost lines go back to their originals, the"
+        warn "stream file, the include, the snippet and the drop-in are deleted, nginx is"
+        warn "reloaded. A SELinux boolean the front may have set is left as it is, and said."
+    else
+        printf 'off\n'
+        info "The shared front is not installed on this host, and none of its files are here."
+        return 0
+    fi
+    if ! ask_proceed "Remove the shared front now"; then
+        info "Nothing was changed."
+        return 1
+    fi
+    if ! front443_remove; then
+        error "The removal did not complete — read the messages above and run it again."
+        return 1
+    fi
+    printf 'removed\n'
+    return 0
+}
+
 _cli_require_tag() {
     local tag="${1:-}"
     if [[ -z "$tag" ]]; then
@@ -381,6 +565,7 @@ cli_restore() {
         case "$1" in
             --passfile)
                 if [[ -z "${2:-}" ]]; then error "--passfile needs a path."; return 2; fi
+                # shellcheck disable=SC2034  # read by lib/core_backup.sh
                 VPN55_BACKUP_PASSFILE="$2"; shift 2 ;;
             --force) force=1; shift ;;
             -*)

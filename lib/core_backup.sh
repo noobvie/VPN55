@@ -390,9 +390,18 @@ _bak_adapter_members() {
 # never had, and the ledger is what an uninstall trusts when deciding what it
 # may remove. So they travel for forensics — "what did the lost host look like"
 # is a real question — in a part of the archive the restore path never places.
+#
+# The shared-443 front's ledger (lib/core_front443.sh) is the same class of
+# file for the same reason: it names the web server's files THIS host had
+# rewritten, the ports they were moved to and a SELinux boolean's prior value,
+# none of which a replacement host shares — and remove trusts it the way
+# uninstall trusts fw.state. Placed by a restore it would send remove to put
+# back files the new host never had rewritten. The path is spelled here rather
+# than taken from that library so a backup made by a process that did not load
+# it still carries the file (R1, hypothesis 9c).
 _bak_reference_members() {
     local p
-    for p in "$VPN55_NET_CONF" "$VPN55_FW_STATE"; do
+    for p in "$VPN55_NET_CONF" "$VPN55_FW_STATE" "${VPN55_FRONT443_STATE:-${VPN55_ETC}/front443.state}"; do
         [[ -f "$p" ]] && printf '%s\n' "$p"
     done
     return 0

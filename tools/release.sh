@@ -254,7 +254,7 @@ Before publishing:
      README lives on the host that cannot be blocked; the website can.
   3. Commit MANIFEST.sha256.minisig, then push the tag and the artifacts and
      update every mirror listed in the README. That signature is what every
-     `--update` checks before it parses the file list, so a mirror serving the
+     \`--update\` checks before it parses the file list, so a mirror serving the
      manifest without it is a mirror that will be refused. The README is the
      root of trust, not the site.
   4. Post the release and the current working mirror to the announcement
