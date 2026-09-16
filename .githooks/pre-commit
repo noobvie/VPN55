@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+#
+# .githooks/pre-commit — keep MANIFEST.sha256 in step with the commit.
+#
+# Twice in three commits a shipped file was edited AFTER tools/manifest.sh had
+# been run and before the commit, so main carried a manifest describing a file
+# it no longer had. The bootstrap then correctly refused to install from the
+# official mirror ("digest mismatch: docs/security-model.md"). CI's --check
+# step goes red, but only after the push — too late for whoever runs the
+# one-liner in between.
+#
+# So this hook regenerates the manifest and stages it on every commit. It is
+# a no-op when nothing shipped changed (the rewrite is byte-identical).
+#
+# Activate once per clone (hooks are not versioned; the path setting is local):
+#
+#   git config core.hooksPath .githooks
+#
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel)"
+cd "$ROOT"
+
+# tools/manifest.sh hashes the WORKING TREE. If a shipped file has changes that
+# are not staged, the manifest it writes would describe a file this commit does
+# not contain — the exact bug this hook exists to prevent, just moved. Refuse.
+unstaged="$(git diff --name-only -- vpn55.sh LICENSE README.md DISCLAIMER.md ATTRIBUTIONS.md \
+                lib helper panel deploy docs tests)"
+if [ -n "$unstaged" ]; then
+    printf 'pre-commit: shipped files have unstaged changes; stage or stash them first:\n' >&2
+    printf '  %s\n' $unstaged >&2
+    exit 1
+fi
+
+./tools/manifest.sh >/dev/null
+git add MANIFEST.sha256
+./tools/manifest.sh --check >/dev/null

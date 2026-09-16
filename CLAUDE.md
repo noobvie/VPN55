@@ -484,7 +484,12 @@ now installs a whole tree through it on every push. Three rules come with it:
   changing any shipped file; CI fails on a stale one. It is what a mirror install
   fetches *and* what `src_revision` hashes, so a stale manifest is two bugs at once:
   files that never reach a server, and a self-update that reports "already current"
-  after downloading new code.
+  after downloading new code. ⚠ A third bug is the visible one: the official mirror IS
+  `main`, so a stale manifest on `main` makes the install one-liner fail for everyone
+  with `digest mismatch: <file>` — that shipped twice (launch.md, security-model.md),
+  both times by editing a file *after* running the script and *before* committing.
+  `.githooks/pre-commit` now regenerates and stages it on every commit; activate it
+  once per clone with `git config core.hooksPath .githooks` (hooks are not versioned).
 - **Never let `vpn55.sh` continue after updating itself.** Bash runs the copy it
   parsed at launch, including every lib sourced then. `src_update` returns **10** to
   mean *new code is on disk and this process is still the old one*; the only correct
@@ -649,6 +654,7 @@ node .github/scripts/check-fonts.mjs --probe C:/Windows/Fonts
 # Distribution — after changing any shipped file
 tools/manifest.sh                 # rewrite MANIFEST.sha256
 tools/manifest.sh --check         # what CI runs
+git config core.hooksPath .githooks   # once per clone: pre-commit regenerates it
 
 # Release (dev machine, clean tree, minisign key present)
 tools/release.sh 2026.09.09 --tag
