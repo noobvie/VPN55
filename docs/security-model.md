@@ -5,7 +5,10 @@ this document rather than the document written to excuse the code. Anything belo
 marked **OPEN** is a decision that has not been made yet; anything marked **DECIDED**
 is binding on every later phase.
 
-Last revised: 2026-09-12 (§6C.8 "What S5 must observe" — the 24 facts about Linux,
+Last revised: 2026-09-17 (§6C.8 "The offer through the guided setup" — the first VPS run
+found the port-443 offer unanswerable from `setup_run`, which closes stdin for every
+install; the optional `setup_ask` adapter verb asks it with the terminal first).
+Before that: 2026-09-12 (§6C.8 "What S5 must observe" — the 24 facts about Linux,
 nginx, SELinux and certbot that the three fake-host test suites encode, each with the
 command that settles it on a real host; two of them are readings of the nginx source the
 fakes contradict — the wildcard-collapse rule that breaks reload 1 on the section's own
@@ -1055,6 +1058,24 @@ arrangement, and anything *else* holding it with the front recorded refuses by n
 The one way off the record without an uninstall is `VPN55_OVPN_FRONT=no` on a re-run
 (R1 follow-up): honoured only when the front is not on the host, and dropped only after
 the port check has passed — a refusal un-records nothing.
+
+**The offer through the guided setup (first VPS run, 2026-09-17).** `setup_run` installs
+every adapter with stdin closed, so each takes the default it would have offered — and
+this offer's default is a refusal. Asked of `/dev/null` it was "declined" without ever
+being shown: the operator read "Answer 'nginx' to share the port" and then "Declined
+('no')" with no question between them, and OpenVPN did not install. The fix is a
+contract addition, not a special case in setup: an **optional** adapter verb,
+`vpn_<proto>_setup_ask`, which setup calls for every available adapter that implements
+it, with the terminal, after its own questions and before the first install. The
+OpenVPN one asks exactly this question — only when the transport it will settle on is
+tcp/443 (`_ovpn_transport_expected`, a no-prompt preview of the bootstrap that honours
+`VPN55_OVPN_PORT`), the port is held, the holder is nginx, no front is recorded and
+`VPN55_OVPN_FRONT` is not already in the environment — with the same text
+(`_ovpn_front_explain`, split out of the offer), and hands the typed answer to the
+install through `VPN55_OVPN_FRONT` plus `VPN55_OVPN_FRONT_ASKED=1`, on which the offer
+states the answer in one line instead of replaying the costs at a closed stdin. The
+host checks still run there; a declined answer still refuses. `tests/front443-adapter.sh`
+group 6c (114 assertions total).
 
 **`port` is untouched; `local_port` is the new record.** The client file is rendered
 from `port` and the adapter test asserts it is **byte-identical** with and without the

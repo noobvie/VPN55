@@ -31,7 +31,19 @@ vpn_<proto>_client_config  # <cred_id> [artifact] [locale] → that artifact on 
 vpn_<proto>_status         # service state + per-cred rx/tx + last handshake
 vpn_<proto>_restart        # cycle the daemon; NOT _install re-run
 vpn_<proto>_backup_paths   # absolute paths this protocol cannot be rebuilt without
+vpn_<proto>_setup_ask      # OPTIONAL: questions whose default is a refusal, asked with
+                           # the terminal by the guided setup BEFORE it closes stdin
 ```
+
+**`_setup_ask` is optional, and it exists for one class of question.** `setup_run`
+installs every adapter with stdin closed so each takes its own defaults — right for
+transport or key custody, wrong for a prompt whose default is a *refusal* that fails the
+install: asked of `/dev/null` it is "declined" without ever being shown (the OpenVPN
+port-443 offer, first VPS run 2026-09-17). An adapter with such a question implements
+the verb, asks there, and hands the answer to its own `_install` through the same
+variable an unattended run would set. Setup probes with `declare -F` and skips an
+adapter without it, the way `core_backup.sh` does for `_backup_paths` — minus the
+warning, because having nothing to ask is the normal case.
 
 **`_backup_paths` is how `lib/core_backup.sh` stays protocol-blind.** It prints one
 absolute path per line — the files that cannot be regenerated on a replacement host,

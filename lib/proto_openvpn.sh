@@ -807,22 +807,19 @@ _ovpn_local_port_settle() {
     return 0
 }
 
-# _ovpn_front_offer <holder> <transport> <port> — the offer §6C.8 makes in place
-# of §6C.6's refusal. Returns 0 when the operator accepted and the choice is
-# recorded; 1 in every other case, and the caller then refuses exactly as it
-# always did. Nothing here installs anything: the front goes on AFTER the
-# daemon is up on its loopback port (_ovpn_front_apply), so it never points at
-# a dead one.
+# _ovpn_front_explain <holder> <port> — everything the offer says BEFORE its
+# question: what sharing is, what it costs, and the nginx files it would edit,
+# listed by name. Returns 0 when the offer can be made on this host and 1 when
+# it cannot (no front lib, the holder is not nginx, or the host cannot carry
+# the front — that last one says why). Prints nothing on the silent refusals.
 #
-# Precedence is the adapter's usual: VPN55_OVPN_FRONT is the prompt's default
-# and, with no terminal, its answer — so `VPN55_OVPN_FRONT=nginx` accepts
-# unattended and anything else refuses unattended. The interactive default is
-# `no`: what is being accepted is an edit to configuration VPN55 does not own,
-# and that takes a typed answer rather than a bare Enter.
-_ovpn_front_offer() {
-    local holder="${1:-}" transport="${2:-}" port="${3:-}"
+# Split out of _ovpn_front_offer so the guided setup can put the SAME text in
+# front of the operator while it still has their terminal (vpn_openvpn_setup_ask)
+# — the install itself runs with stdin closed there, and a question asked of
+# /dev/null is answered "no" without ever being shown.
+_ovpn_front_explain() {
+    local holder="${1:-}" port="${2:-}"
 
-    [[ "$transport" == "tcp" && "$port" == "443" ]] || return 1
     _ovpn_front_lib_loaded || {
         debug "front: lib/core_front443.sh is not loaded, so the shared front cannot be offered"
         return 1
@@ -898,6 +895,39 @@ _ovpn_front_offer() {
     info ""
     info "Answer 'nginx' to share the port; anything else keeps today's refusal."
     info "Unattended: VPN55_OVPN_FRONT=nginx."
+    return 0
+}
+
+# _ovpn_front_offer <holder> <transport> <port> — the offer §6C.8 makes in place
+# of §6C.6's refusal. Returns 0 when the operator accepted and the choice is
+# recorded; 1 in every other case, and the caller then refuses exactly as it
+# always did. Nothing here installs anything: the front goes on AFTER the
+# daemon is up on its loopback port (_ovpn_front_apply), so it never points at
+# a dead one.
+#
+# Precedence is the adapter's usual: VPN55_OVPN_FRONT is the prompt's default
+# and, with no terminal, its answer — so `VPN55_OVPN_FRONT=nginx` accepts
+# unattended and anything else refuses unattended. The interactive default is
+# `no`: what is being accepted is an edit to configuration VPN55 does not own,
+# and that takes a typed answer rather than a bare Enter.
+#
+# VPN55_OVPN_FRONT_ASKED=1 means the guided setup already put the explanation
+# and the question to the operator (vpn_openvpn_setup_ask) and VPN55_OVPN_FRONT
+# carries their typed answer: the offer then states the answer in one line
+# rather than replaying the whole text at a closed stdin. The eligibility
+# checks still run — they are about the host, not the operator.
+_ovpn_front_offer() {
+    local holder="${1:-}" transport="${2:-}" port="${3:-}"
+
+    [[ "$transport" == "tcp" && "$port" == "443" ]] || return 1
+    if [[ "${VPN55_OVPN_FRONT_ASKED:-}" == "1" ]]; then
+        _ovpn_front_lib_loaded || return 1
+        front443_holder_is_nginx tcp "$port" || return 1
+        front443_available || return 1
+        info "Port ${port} is held by nginx (${holder}); sharing it was answered at setup."
+    else
+        _ovpn_front_explain "$holder" "$port" || return 1
+    fi
 
     local choice
     choice="${VPN55_OVPN_FRONT:-no}"
@@ -1605,6 +1635,79 @@ _ovpn_log_dir_ensure() {
 }
 
 # ─── Install ──────────────────────────────────────────────────────────────────
+# ─── setup_ask — the one question with no safe default ───────────────────────
+# The guided setup (lib/core_setup.sh) runs every install with stdin closed, so
+# each adapter takes the default it would have offered. That is right for every
+# choice here but one: the port-443 offer, whose default is a REFUSAL that fails
+# the install. Asked of /dev/null it is "declined" without ever being shown, and
+# the operator reads "Answer 'nginx' to share the port" followed by "Declined
+# ('no')" with no question in between — which is what a first-run operator
+# hit on 2026-09-17.
+#
+# So setup calls this verb first, while it still has the terminal, and the
+# answer travels to the install the way an unattended answer always has:
+# VPN55_OVPN_FRONT. VPN55_OVPN_FRONT_ASKED=1 tells _ovpn_front_offer the text
+# was already shown. Everything the install decides on its own stays with the
+# install; this only settles what a closed stdin cannot.
+#
+# Returns 0 whenever there was nothing to ask or the question was answered —
+# a declined offer is an answer, and the install then refuses exactly as it
+# would have. 1 only when the prompt itself failed.
+vpn_openvpn_setup_ask() {
+    distro_require_root || return 1
+
+    # An answer already given out loud is the unattended contract; honour it.
+    [[ -z "${VPN55_OVPN_FRONT:-}" ]] || return 0
+    # A recorded front is never re-asked (design note 7); install handles it.
+    ! _ovpn_front_on || return 0
+
+    local line transport port holder
+    line="$(_ovpn_transport_expected)" || return 0    # install refuses the bad value itself
+    transport="${line%%$'	'*}"
+    port="${line#*$'	'}"
+    [[ "$transport" == "tcp" && "$port" == "443" ]] || return 0
+    holder="$(_ovpn_port_conflict "$transport" "$port")" || return 0   # free, or ours
+
+    section "OpenVPN — port ${port}"
+    _ovpn_front_explain "$holder" "$port" || return 0    # not offerable: install refuses, with its own text
+
+    local choice="no"
+    ask_value choice "Share port ${port} through nginx? (nginx/no)" "$choice" || return 1
+    export VPN55_OVPN_FRONT="$choice" VPN55_OVPN_FRONT_ASKED=1
+    if [[ "$choice" == "nginx" ]]; then
+        success "Port ${port} will be shared through nginx; it is recorded when the service installs."
+    else
+        info "Declined ('${choice}'). OpenVPN will refuse tcp/${port} and not install; the"
+        info "other services are unaffected. Re-run setup with VPN55_OVPN_PORT set to a"
+        info "free port, or answer 'nginx', to install it."
+    fi
+    return 0
+}
+
+# _ovpn_transport_expected — "<transport>	<port>", what _ovpn_transport_bootstrap
+# will settle on without asking anything: the stored values when there are
+# any, else the VPN55_OVPN_TRANSPORT default the bootstrap offers, with
+# VPN55_OVPN_PORT applied the way the bootstrap applies it. A preview only —
+# the bootstrap's refusals (a transport switch, a port move under issued
+# credentials) stay the bootstrap's. 1 when the environment names a transport
+# it would refuse.
+_ovpn_transport_expected() {
+    local transport port choice
+    transport="$(fs_conf_default "$VPN55_OVPN_CONF" transport "")"
+    if [[ -n "$transport" ]]; then
+        port="$(fs_conf_default "$VPN55_OVPN_CONF" port "")"
+    else
+        choice="${VPN55_OVPN_TRANSPORT:-tcp443}"
+        case "$choice" in
+            tcp443|tcp) transport="tcp"; port="$VPN55_OVPN_TCP_PORT" ;;
+            udp)        transport="udp"; port="$VPN55_OVPN_UDP_PORT" ;;
+            *)          return 1 ;;
+        esac
+    fi
+    [[ -z "${VPN55_OVPN_PORT:-}" ]] || port="$VPN55_OVPN_PORT"
+    printf '%s	%s' "$transport" "$port"
+}
+
 vpn_openvpn_install() {
     distro_require_root || return 1
     vpn_openvpn_available || return 1

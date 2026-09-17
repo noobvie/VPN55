@@ -3,11 +3,12 @@ Audit adapter-contract conformance for the adapter(s) in $ARGUMENTS, or all of
 
 ## 1. The surface is complete and named exactly
 
-Ten verbs, no more and no fewer, each as `vpn_<tag>_<verb>`:
+Twelve verbs, each as `vpn_<tag>_<verb>`, plus one optional:
 
 ```
 available  capabilities  install  uninstall  cred_add  cred_remove
-cred_list  artifacts  client_config  status
+cred_list  artifacts  client_config  status  restart  backup_paths
+setup_ask   (optional — see CLAUDE.md; only for a prompt whose default refuses)
 ```
 
 - `<tag>` must match the tag passed to `vpn_adapter_register` in the adapter's own

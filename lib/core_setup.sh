@@ -31,9 +31,19 @@
 #      still PRINTS its explanation of a choice like transport or key custody,
 #      and then takes the default it would have offered.
 #
+#   3. The optional `setup_ask` verb, called with the terminal BEFORE #2 closes
+#      it. For the one class of question #2 cannot carry: a default that is a
+#      refusal. An adapter with such a question asks it here and hands the
+#      answer to its own install through the same variable an unattended run
+#      would set. An adapter without one simply does not implement the verb.
+#
 # The consequence worth stating: a prompt whose default is EMPTY fails loudly
 # under #2 rather than hanging. That is why the endpoint is settled here, before
-# any adapter runs, and why an empty answer to it is refused.
+# any adapter runs, and why an empty answer to it is refused. And a prompt whose
+# default REFUSES is answered "no" under #2 without ever being shown — the
+# operator reads the offer's text and then "Declined" with no question between
+# them, which is what the OpenVPN port-443 offer did on the first VPS run
+# (2026-09-17). That is what #3 is for.
 #
 # ── Partial success is a real outcome, and is reported as one ─────────────────
 #
@@ -213,6 +223,21 @@ _setup_ask() {
     return 0
 }
 
+# ─── The adapters' own questions ─────────────────────────────────────────────
+# Mechanism #3 above. Iterated, never named: an adapter that implements
+# `setup_ask` is asked, one that does not is skipped. It runs after setup's own
+# questions and before the first install, and it is the last thing that reads
+# the terminal until the operator's configuration is delivered.
+_setup_ask_adapters() {
+    local tag
+    for tag in ${VPN55_ADAPTER_TAGS[@]+"${VPN55_ADAPTER_TAGS[@]}"}; do
+        vpn_adapter_call "$tag" available >/dev/null 2>&1 || continue
+        declare -F "vpn_${tag}_setup_ask" >/dev/null 2>&1 || continue
+        vpn_adapter_call "$tag" setup_ask || return 1
+    done
+    return 0
+}
+
 # ─── Installing every adapter ─────────────────────────────────────────────────
 # Stdin is closed per call rather than for the whole function: the operator is
 # still at a terminal, and a later step — delivering their configuration — has
@@ -339,6 +364,7 @@ setup_run() {
     fi
 
     _setup_ask || return 1
+    _setup_ask_adapters || return 1
 
     if ! _setup_install_all; then
         error "No tunnel service installed, so there is nothing for the panel to"

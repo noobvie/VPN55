@@ -287,6 +287,98 @@ chk "  the loopback port record is left (harmless, and re-usable)" 1194 "$(_ovpn
 chk "  the failure text names the way off" 1 "$(_ovpn_set front nginx; _ovpn_cred_ids() { printf 'c1\n'; }; _ovpn_front_failed 2>&1 | grep -c 'VPN55_OVPN_FRONT=no'; unset -f _ovpn_cred_ids)"
 _ovpn_set front nginx
 
+# ─── 6c. The offer through the guided setup: setup_ask ───────────────────────
+# Setup runs every install with stdin closed, so the offer above would be
+# answered "no" by /dev/null without ever being shown. The verb asks the same
+# question WITH the terminal, before the installs, and hands the answer on
+# through VPN55_OVPN_FRONT — after which the offer must not replay the text at
+# a closed stdin, and must still record the accepted choice.
+group "the offer through setup (setup_ask)"
+distro_require_root() { return 0; }
+_ovpn_port_conflict() { [ -f "$WORK/conflict" ] || return 1; printf 'nginx'; }
+printf 'listen	/etc/nginx/sites-enabled/site-b	3	*:443	ssl	0
+' > "$WORK/scan"
+_ovpn_set front ''
+_ovpn_set local_port ''
+: > "$WORK/holder_nginx"
+: > "$WORK/conflict"
+unset VPN55_OVPN_FRONT VPN55_OVPN_FRONT_ASKED
+
+chk "expected transport reads the stored tcp/443" "$(printf 'tcp	443')" "$(_ovpn_transport_expected)"
+chk "  VPN55_OVPN_PORT moves the expected port" "$(printf 'tcp	8443')" "$(VPN55_OVPN_PORT=8443 _ovpn_transport_expected)"
+_ovpn_set transport ''; _ovpn_set port ''
+chk "  unstored → the bootstrap's tcp443 default" "$(printf 'tcp	443')" "$(_ovpn_transport_expected)"
+chk "  unstored + VPN55_OVPN_TRANSPORT=udp → udp/1194" "$(printf 'udp	1194')" "$(VPN55_OVPN_TRANSPORT=udp _ovpn_transport_expected)"
+chk "  a transport the bootstrap refuses → 1" 1 "$(VPN55_OVPN_TRANSPORT=sctp _ovpn_transport_expected >/dev/null; printf '%s' $?)"
+_ovpn_set transport tcp; _ovpn_set port 443
+
+# The terminal, simulated: ask_value reads stdin only when ui_interactive says
+# there is one, so say so and feed the answer on stdin.
+ui_interactive() { return 0; }
+
+out="$(VPN55_OVPN_FRONT=nginx vpn_openvpn_setup_ask <<< "no" 2>&1)"; rc=$?
+chk "an answer already in the environment is not re-asked" "0 0" "$rc $(printf '%s
+' "$out" | grep -c 'Share port')"
+_ovpn_set front nginx
+out="$(vpn_openvpn_setup_ask <<< "no" 2>&1)"; rc=$?
+chk "a recorded front is not re-asked" "0 0" "$rc $(printf '%s
+' "$out" | grep -c 'Share port')"
+_ovpn_set front ''
+rm -f "$WORK/conflict"
+out="$(vpn_openvpn_setup_ask <<< "no" 2>&1)"; rc=$?
+chk "a free port asks nothing" "0 0" "$rc $(printf '%s
+' "$out" | grep -c 'Share port')"
+: > "$WORK/conflict"
+out="$(VPN55_OVPN_PORT=8443 vpn_openvpn_setup_ask <<< "no" 2>&1)"; rc=$?
+chk "a run moved off 443 asks nothing" "0 0" "$rc $(printf '%s
+' "$out" | grep -c 'Share port')"
+rm -f "$WORK/holder_nginx"
+out="$(vpn_openvpn_setup_ask <<< "no" 2>&1)"; rc=$?
+chk "a holder that is not nginx asks nothing (install refuses, as before)" "0 0" "$rc $(printf '%s
+' "$out" | grep -c 'Share port')"
+: > "$WORK/holder_nginx"
+
+# Asked, and typed 'nginx'. The verb runs in THIS shell so its exports land here.
+out="$(vpn_openvpn_setup_ask <<< "nginx" 2>&1; printf 'rc=%s front=%s asked=%s' "$?" "${VPN55_OVPN_FRONT:-}" "${VPN55_OVPN_FRONT_ASKED:-}")"
+chk "asked with a terminal, 'nginx' typed → handed on" 1 "$(printf '%s
+' "$out" | grep -c 'rc=0 front=nginx asked=1')"
+chk "  the costs were shown first" 1 "$(printf '%s
+' "$out" | grep -c 'sites-enabled/site-b')"
+chk "  the question itself was shown" 1 "$(printf '%s
+' "$out" | grep -c 'Share port 443 through nginx')"
+chk "  nothing recorded yet — that is the install's job" "" "$(_ovpn_front)"
+
+out="$(vpn_openvpn_setup_ask <<< "" 2>&1; printf 'rc=%s front=%s asked=%s' "$?" "${VPN55_OVPN_FRONT:-}" "${VPN55_OVPN_FRONT_ASKED:-}")"
+chk "a bare Enter declines — sharing takes a typed answer" 1 "$(printf '%s
+' "$out" | grep -c 'rc=0 front=no asked=1')"
+chk "  and says what the install will now do" 1 "$(printf '%s
+' "$out" | grep -c 'will refuse tcp/443')"
+
+ui_interactive() { [[ -t 0 ]]; }
+
+# Then the install's offer, at the closed stdin setup gives it.
+export VPN55_OVPN_FRONT=nginx VPN55_OVPN_FRONT_ASKED=1
+out="$(_ovpn_front_offer nginx tcp 443 </dev/null 2>&1)"; rc=$?
+chk "the offer accepts the setup answer unattended" 0 "$rc"
+chk "  and records it" nginx "$(_ovpn_front)"
+chk "  without replaying the cost list" 0 "$(printf '%s
+' "$out" | grep -c 'sites-enabled/site-b')"
+chk "  saying where the answer came from" 1 "$(printf '%s
+' "$out" | grep -c 'answered at setup')"
+_ovpn_set front ''
+rm -f "$WORK/holder_nginx"
+_ovpn_front_offer nginx tcp 443 </dev/null >/dev/null 2>&1; rc=$?
+chk "  the host checks still run under an asked answer" 1 "$rc"
+chk "  nothing recorded" "" "$(_ovpn_front)"
+: > "$WORK/holder_nginx"
+export VPN55_OVPN_FRONT=no
+_ovpn_front_offer nginx tcp 443 </dev/null >/dev/null 2>&1; rc=$?
+chk "a declined setup answer is declined by the offer" 1 "$rc"
+unset VPN55_OVPN_FRONT VPN55_OVPN_FRONT_ASKED
+rm -f "$WORK/conflict"
+_ovpn_set front nginx
+_ovpn_set local_port 1194
+
 # ─── 7. Status notes ─────────────────────────────────────────────────────────
 group "status notes"
 _ovpn_set front ''
