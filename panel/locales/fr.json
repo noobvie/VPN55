@@ -7,7 +7,7 @@
   "app.waiting": "En attente de la première lecture des services.",
   "app.readonly": "Cette version ne fait que lire. Rien sur cette page ne modifie quoi que ce soit sur le serveur.",
   "app.source": "La configuration du serveur fait foi. Tout ce qui figure ici est relu depuis les services à chaque rafraîchissement, et non conservé par cette console.",
-  "app.madewith": "❤️ Depuis Saïgon bien-aimée",
+  "app.madewith": "De Saïgon avec ❤️",
   "app.unreachable.title": "La console elle-même ne répond pas",
   "app.unreachable.body": "Le navigateur n'a pas pu joindre cette console. Ce qui suit provient de la dernière lecture reçue et n'est plus mis à jour.",
 

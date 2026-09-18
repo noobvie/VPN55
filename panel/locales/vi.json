@@ -7,7 +7,7 @@
   "app.waiting": "Đang chờ lần đọc đầu tiên từ các dịch vụ.",
   "app.readonly": "Bản này chỉ đọc. Không thao tác nào trên trang này thay đổi máy chủ.",
   "app.source": "Cấu hình trên máy chủ mới là nguồn dữ liệu gốc. Mọi thứ ở đây được đọc lại từ các dịch vụ sau mỗi lần làm mới, bảng điều khiển này không lưu.",
-  "app.madewith": "❤️ Từ Sài Gòn thân yêu",
+  "app.madewith": "From Saigon with ❤️",
   "app.unreachable.title": "Bảng điều khiển không phản hồi",
   "app.unreachable.body": "Trình duyệt không kết nối được tới bảng điều khiển này. Nội dung bên dưới là lần đọc gần nhất và đang không được cập nhật.",
 

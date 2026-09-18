@@ -7,7 +7,7 @@
   "app.waiting": "Waiting for the first reading from the services.",
   "app.readonly": "This build can only read. Nothing on this page changes anything on the server.",
   "app.source": "The server's own configuration is the source of truth. Everything here is read from the services on each refresh, not stored by this panel.",
-  "app.madewith": "❤️ From beloved Saigon",
+  "app.madewith": "From Saigon with ❤️",
   "app.unreachable.title": "The panel itself is not answering",
   "app.unreachable.body": "The browser could not reach this panel. What is shown below is the last reading it received, and it is not being updated.",
 
